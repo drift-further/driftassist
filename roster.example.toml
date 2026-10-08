@@ -1,0 +1,20 @@
+updated = "2026-09-29"
+note = "Choose which family implements; the judge is always the competing family."
+
+[roles.plan]
+claude = 'claude --model fable --effort high'
+codex = 'codex -m gpt-6-astra -c model_reasoning_effort="medium" --yolo'
+
+[roles.implement]
+claude = 'claude --model opus --effort medium'
+codex = 'codex -m gpt-5.6-sol -c model_reasoning_effort="medium" --yolo'
+
+[roles.ticket]
+codex = 'codex -m gpt-5.6-luna -c model_reasoning_effort="max" --yolo'
+
+[roles.judge]
+claude = 'claude --model fable --effort high'
+codex = 'codex -m gpt-6-astra -c model_reasoning_effort="high" --yolo'
+
+[roles.oneshot]
+codex = 'codex -m gpt-6-astra -c model_reasoning_effort="low" --yolo'

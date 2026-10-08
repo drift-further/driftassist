@@ -1,0 +1,1528 @@
+"""routes/autoyes.py — Server-side auto-yes: scan prompts, countdown, fire."""
+
+import hashlib
+import logging
+import re
+import subprocess
+import time
+
+from flask import Blueprint, jsonify, request
+
+import shared.state as state
+from shared import execution_park as park
+from shared.agent_identity import (
+    _ANSI_ESCAPE_RE,
+    AGENT_KINDS,
+    refine_with_content,
+    resolve_process,
+)
+from shared.tmux import (
+    DeliveryResult,
+    expected_target_identity,
+    generation_bound_delivery,
+    tmux_exact_target,
+)
+from routes.streaming import broadcast_autoyes_event
+
+log = logging.getLogger(__name__)
+
+autoyes_bp = Blueprint("autoyes_bp", __name__)
+
+# Prompt patterns (server-side mirrors of JS SMART_PATTERNS)
+#
+# The y/n/a branch is split in two because its four original alternatives are
+# not equally trustworthy, and only the weak half needs the anchor.
+#
+# `(y/n/a)` and `[Y/n/a]` are seven characters. They appear in READMEs, in help
+# text, in `--help` output, and — the case that actually bit — in the source of
+# this very file, so an agent asked to read routes/autoyes.py printed a line
+# that made the scanner answer itself. A displayed marker is quoted INSIDE a
+# line; a live prompt is the last thing written before the cursor waits. So the
+# bare markers must end their line. `\s*$` is the same rule the package-manager
+# and ssh-host-key matchers below already use, and MULTILINE keeps it per-line
+# rather than per-window, so the whole `detection_depth` window still counts.
+#
+# NOT the last non-empty line, which is what confirm-yn requires: measured on
+# three live Claude Code panes on this host, the last non-empty rows are always
+# the status bar (context %, model, mode), so that rule would silently disable
+# this branch entirely — the exact failure mode that costs hours to notice.
+_PERMISSION_YNA_MARKER_RE = re.compile(
+    r"(?:\(y/n/a\)|\[Y/n/a\])\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+# The other two are whole option rows — three labelled choices in order on one
+# line. That shape does not occur by accident, so it keeps the wide window and
+# fires wherever in it a TUI chooses to draw its button row.
+#
+# The labels are joined with \s+, not .*, and that is the whole point: `.*`
+# also matched `Allow once.*Always allow.*Deny` — the regex source of this very
+# pattern, as printed by any agent asked to read this file. A rendered button
+# row separates its options with whitespace. _OPENCODE_PERMISSION_RE below has
+# always been written this way against a live capture; this is the same rule.
+_PERMISSION_YNA_DIALOG_RE = re.compile(
+    r"Allow once\s+Always allow\s+Deny" r"|Yes.*\(y\).*Always.*\(a\).*No.*\(n\)",
+    re.IGNORECASE,
+)
+_CONFIRM_YN_RE = re.compile(r"\(y/n\)|\[Y/n\]|\[y/N\]|\(yes/no\)", re.IGNORECASE)
+_PACKAGE_CONFIRM_RE = re.compile(
+    r"(?:Do you want to continue\?\s*\[Y/n\]|Is this ok\s*\[y/N\]:?)\s*$",
+    re.IGNORECASE,
+)
+_SSH_HOST_KEY_RE = re.compile(
+    r"Are you sure you want to continue connecting "
+    r"\(yes/no(?:/\[fingerprint\])?\)\?\s*$",
+    re.IGNORECASE,
+)
+# OpenCode's TUI permission dialog (verified live on 1.18.4): a
+# "△ Permission required" header with an "Allow once  Allow always  Reject"
+# button row. The dialog opens with "Allow once" selected; Left/Right cycle
+# the selection WITH WRAPAROUND and Enter confirms it. It does NOT react to
+# y/n keys (and Tab does nothing despite the ⇆ hint) — so the answer is a
+# bare Enter, never "y". Require the header too: the button row alone could
+# appear in displayed code/docs.
+_OPENCODE_PERMISSION_RE = re.compile(r"Allow once\s+Allow always\s+Reject")
+# Cursor CLI (cursor-agent, verified live on 2026.07.23-e383d2b). Its TUI gates
+# exactly two things: a one-time workspace-trust dialog and a per-command shell
+# approval. File edits/writes/reads are NOT gated, so these are the only two
+# prompts Assist ever sees from a cursor pane.
+#
+# Shell approval:
+#     ────────────────────────────────────────────
+#      $  cat /etc/os-release | head -3 in .
+#
+#      Run this command?
+#      Not in allowlist: cat, head
+#       → Run (once) (y)
+#         Add Shell(cat), Shell(head) to allowlist? (tab)
+#         Run Everything (shift+tab)
+#         Skip & tell the agent what to do instead (esc or n)
+#
+#                              ctrl+r to review changed files   (only after edits)
+#
+# Require BOTH the header and the option row: either alone could plausibly show
+# up in displayed code/docs, together they cannot. Answered with a bare "y"
+# (no Enter); the dialog is erased on answer, so it never lingers.
+_CURSOR_PERMISSION_HDR_RE = re.compile(r"Run this command\?")
+_CURSOR_PERMISSION_OPT_RE = re.compile(r"Run \(once\)\s*\(y\)")
+# The dialog is 8-11 rows tall and the optional "ctrl+r" hint pushes its header
+# past the default detection depth of 8. Its height is fixed and known, so the
+# window gets a fixed floor rather than scaling with the user's depth setting.
+_CURSOR_PERMISSION_LINES = 14
+# Workspace trust gate (blocks the session until answered), answered with "a":
+#     │  ⚠ Workspace Trust Required
+#     │  ▶ [a] Trust this workspace
+#     │    [q] Quit
+#     │  Use arrow keys to navigate, Enter to select, or press the key shown
+#
+# Unlike every other prompt handled here, cursor does NOT erase this dialog when
+# it is answered — the box stays on screen with the ▶ marker gone and the footer
+# replaced by "⏳ Trusting workspace...". So the FOOTER is the liveness signal:
+# matching the option row alone would keep firing "a" into the TUI afterwards.
+_CURSOR_TRUST_OPT_RE = re.compile(r"\[a\] Trust this workspace")
+_CURSOR_TRUST_FOOTER_RE = re.compile(r"Use arrow keys to navigate")
+_CURSOR_TRUST_LINES = 8
+# Bracket/word-style prompts ([Y/n], [y/N], (yes/no)) are readline prompts
+# that wait for Enter — a bare "y" just echoes and re-triggers a fresh
+# countdown each tick (yyy…). TUI-style (y/n) prompts react to the bare key.
+_CONFIRM_NEEDS_ENTER_RE = re.compile(r"\[Y/n\]|\[y/N\]|\(yes/no\)", re.IGNORECASE)
+_NUMBERED_YES_RE = re.compile(
+    r"(?:^|\n)\s*(?:[^\d\s]\s*)?1[\.\)]\s*Yes\b", re.IGNORECASE
+)
+# Detect highlighted/selected "Yes" option (arrow-key style, no number)
+# Matches lines like: ❯ Yes, ❯ Yes   (with optional trailing comma/text)
+_SELECTED_YES_RE = re.compile(r"(?:^|\n)\s*❯\s*Yes\b", re.IGNORECASE)
+# Footer line that closes an arrow/number selection menu. Claude Code uses
+# "Enter to select · Esc to cancel"; Antigravity (Gemini) CLI uses
+# "↑/↓ Navigate · tab Amend · e edit command · ctrl+r Review". Both end the
+# interactive option block, with the volatile status/cost line sitting below.
+# OpenAI's codex CLI closes its approval block with "Press enter to confirm or
+# esc to cancel" — no separator glyph and different wording, so the three forms
+# above all miss it and the whole numbered branch was skipped. Its option 1 is
+# already marked selected ("› 1. Yes, proceed (y)"), so bare Enter confirms,
+# which is exactly what numbered-yes sends.
+# "Press enter to continue" is codex's DIRECTORY-TRUST dialog, verified live on
+# codex 0.147.0 (2026-08-12): "Do you trust the contents of this directory?" over
+# "› 1. Yes, continue / 2. No, quit". Older codex closed it with the same
+# "Press enter to confirm" as its approval block, so this was covered by
+# accident; 0.147 reworded it and every delegate launch started stalling on
+# trust with auto-yes armed.
+_NUMBERED_FOOTER_RE = re.compile(
+    r"(?:Enter to select|Esc to cancel|Navigate)\s*[·•]"
+    r"|Press enter to (?:confirm|continue)"
+)
+# How far above the footer to look for option 1 when there is no ──── anchor.
+# codex's second option is "Yes, and don't ask again for commands that start
+# with `<the entire command>`" — it embeds the command verbatim, so a one-line
+# command still wraps 25-30 rows on a wide pane and pushes option 1 way up.
+# This was 14, which covers only short options; on any wrapped prompt option 1
+# fell outside the region, _NUMBERED_YES_RE missed, and auto-yes silently never
+# fired. The footer-distance gate below (depth*4) is what keeps stale prompts
+# out, so widening this window does not resurrect answered prompts.
+# Luna kill-switch. A Codex pane running Luna is never auto-answered, however
+# the session's auto-yes toggle is set. Whenever the model name appears,
+# auto-yes stays disabled for that Codex pane.
+#
+# Deliberately matched against the whole captured tail rather than the resolved
+# model, and deliberately word-boundaried rather than a bare substring: the
+# resolved model can lag a mid-session switch by a poll or two (shared/agent_model.py
+# gates publication on _MIN_CONFIRM_SECONDS of agreement), and the failure this
+# guards against is answering ONE prompt during that window. Suppressing is the
+# safe direction — the human can always answer by hand — so it errs wide, while
+# the word boundary keeps it off substrings like "lunar".
+_LUNA_RE = re.compile(r"\bluna\b", re.IGNORECASE)
+
+# Codex's two model-DOWNGRADE menus, which _LUNA_RE above cannot see because
+# neither of them prints the model it is about to switch you to.
+#
+# Slow-request menu, verbatim from the codex 0.153.4 binary:
+#     Our systems are thinking a bit more about this request before responding.
+#     Hang tight or retry with a faster model for a quicker response, though it
+#     may be less capable of handling complex requests.
+#     › 1. Retry with a faster model
+#       2. Dismiss and keep waiting
+# Quota menu, recorded live on 2026-08-10:
+#     Approaching rate limits — Switch to gpt-5.6-luna for lower credit usage?
+#
+# Neither is a permission gate, so the numbered branch above correctly refuses
+# to *answer* them: option 1 is "Retry with a faster model", not "Yes". The
+# danger is the other direction — both are Enter-activated with the downgrade
+# preselected, so ANY Enter that arrives while one is on screen takes it,
+# including the bare Enter auto-yes sends for numbered-yes/selected-yes on a
+# prompt that was live one tick ago. Measured 2026-09-05: an `assist send
+# --enter` into a codex pane landed on the slow-request menu instead of the
+# composer and swapped gpt-6-astra max for gpt-5.6-luna low mid-effort, with
+# nothing on screen or in the log to say so.
+#
+# So this is a veto, not a matcher: while either menu is visible the pane is not
+# auto-answered at all. Suppression rather than "select the safe option"
+# deliberately — sending Down+Enter to land on "Dismiss and keep waiting" would
+# be one more blind write into a TUI whose layout we are inferring, which is
+# exactly how a recovery Enter once landed in a model picker. It errs wide for
+# the same reason _LUNA_RE does: a pane the human has to answer by hand costs a
+# minute, a silent tier downgrade costs the effort's provenance. A pane merely
+# *displaying* this text (an agent reading this file) is therefore also
+# suppressed.
+_CODEX_DOWNGRADE_RE = re.compile(
+    r"Retry with a faster model"
+    r"|Dismiss and keep waiting"
+    r"|thinking a bit more about this request"
+    r"|Approaching rate limits"
+    r"|for lower credit usage",
+    re.IGNORECASE,
+)
+
+_OPTION_REGION_LOOKBACK = 60
+_OPTION_SEP_RE = re.compile(r"^\s*─{10,}")
+_OPTION_LINE_RE = re.compile(r"^\s*(?:[^\d\s]\s*)?\d+[.)]\s+\S")
+
+
+def _has_internal_divider(lines, start, end):
+    """True if a ──── rule sits INSIDE the option block.
+
+    That rule is what tells a long-form AskUserQuestion apart from a yes/no
+    permission gate: the question splits its "Chat about this" escape hatch off
+    with a second separator. Those are design questions put to the human, and
+    auto-yes must never answer one however much the first option reads
+    "1. Yes: …". js/actions.js already withholds its one-tap buttons on this
+    signal (_hasInternalDivider); the server scanner never got the same guard,
+    so it answered them.
+    """
+    return any(_OPTION_SEP_RE.match(ln) for ln in lines[start:end])
+
+
+def _has_unanchored_divider(lines, start, end):
+    """True if a ──── rule sits below a numbered option, in a block with no top.
+
+    Only used when _option_region_start found no anchor, so every rule in the
+    window has fewer than two numbered options below it (two would have made it
+    the anchor). A rule with an option ABOVE it is therefore inside the block:
+    a question's divider whose top rule has scrolled away. A rule with no option
+    above it is the block's own top, as in a selected-yes menu whose "❯ Yes" row
+    carries no number, or earlier output; neither is a divider. codex draws no
+    rule at all.
+    """
+    seen_option = False
+    for ln in lines[start:end]:
+        if _OPTION_SEP_RE.match(ln):
+            if seen_option:
+                return True
+        elif _OPTION_LINE_RE.match(ln):
+            seen_option = True
+    return False
+
+
+def _option_region_start(lines, footer_line, search_floor):
+    """Top of the numbered-option block above `footer_line`, or None.
+
+    The block is bounded above by a ──── separator, but Claude Code's
+    AskUserQuestion menu draws a SECOND separator between the last real option
+    and the trailing "Chat about this" row. Stopping at the separator nearest
+    the footer leaves a single option in the region, so "1. Yes" above the
+    divider falls outside it and auto-yes silently never fires. Keep walking up
+    until the region holds at least two options.
+    Mirrors _optionRegionStart() in js/actions.js.
+    """
+    for i in range(footer_line - 1, search_floor - 1, -1):
+        if not _OPTION_SEP_RE.match(lines[i]):
+            continue
+        count = sum(1 for ln in lines[i + 1 : footer_line] if _OPTION_LINE_RE.match(ln))
+        if count >= 2:
+            return i + 1
+    return None
+
+
+def detection_depth():
+    """The Settings detection depth, as an int in the Settings panel's range.
+
+    /poll ships this same number to the browser, so both detectors window the
+    pane identically. A junk value falls back to the default rather than
+    raising inside every scanner tick.
+    """
+    try:
+        depth = int(state.get_setting("autoyes", "detection_depth"))
+    except (TypeError, ValueError):
+        return int(state.DEFAULT_SETTINGS["autoyes"]["detection_depth"])
+    return max(2, min(30, depth))
+
+
+def detection_window_lines(depth=None):
+    """How many rows of a pane BOTH detectors read: the input-window contract.
+
+    The numbered branch looks up to max(depth*4, 60) rows above a footer for
+    option 1 or its top rule, and accepts a footer up to depth*4 rows above the
+    bottom, so the window is the sum plus the footer row. Every input is cut to
+    it: this detector (via detection_window), the scanner's and /poll's
+    captures (which reach back at least this far), the tails /poll serializes,
+    and js/poll-sync.js:detectionTail for poll tails and stream frames alike.
+    Before, the server read `-S -60` plus the whole visible screen and the
+    browser the last 60 rows, so a long wrapped option was answered by one and
+    not offered by the other (judge #6). /poll ships the number;
+    js/actions.js:_detectionWindowFor is the same formula.
+    """
+    if depth is None:
+        depth = detection_depth()
+    return max(depth * 4, _OPTION_REGION_LOOKBACK) + depth * 4 + 1
+
+
+def detection_window(text, depth=None):
+    """`text` as the detectors read it: escapes stripped, the blank rows under
+    the last output dropped, then the last detection_window_lines() rows."""
+    lines = _ANSI_ESCAPE_RE.sub("", text or "").rstrip("\n").split("\n")
+    return "\n".join(lines[-detection_window_lines(depth):])
+
+
+def _detect_autoyes_prompt(tail, agent_kind):
+    """Detect prompts that auto-yes should answer. Returns (type, send_text, with_enter, summary) or None."""
+    depth = detection_depth()
+    # The shared input window first (detection_window_lines), so every caller
+    # detects on exactly what the browser does.
+    tail = detection_window(tail, depth)
+    # Only check last N lines for y/n prompts — avoids false positives from
+    # answered prompts still in scrollback
+    lines = tail.split("\n")
+    bottom = "\n".join(lines[-depth:])
+    if agent_kind == "claude" and (
+        _PERMISSION_YNA_MARKER_RE.search(bottom)
+        or _PERMISSION_YNA_DIALOG_RE.search(bottom)
+    ):
+        return ("permission-yna", "y", False, _extract_summary(tail, "permission"))
+    if (
+        agent_kind == "opencode"
+        and _OPENCODE_PERMISSION_RE.search(bottom)
+        and "Permission required" in tail
+    ):
+        # Enter confirms the default "Allow once" — no text to type.
+        return ("opencode-permission", "", True, _extract_summary(tail, "opencode"))
+    # Cursor CLI dialogs use their own bottom windows — both are taller than the
+    # generic detection depth (see the pattern definitions above).
+    cursor_bottom = "\n".join(lines[-max(depth, _CURSOR_PERMISSION_LINES) :])
+    if (
+        agent_kind == "cursor"
+        and _CURSOR_PERMISSION_HDR_RE.search(cursor_bottom)
+        and _CURSOR_PERMISSION_OPT_RE.search(cursor_bottom)
+    ):
+        # "y" runs once, no Enter. (Tab would also allowlist the binary — that
+        # is a smart-action choice, never an automatic one.)
+        return ("cursor-permission", "y", False, _extract_summary(tail, "cursor"))
+    trust_bottom = "\n".join(lines[-max(depth, _CURSOR_TRUST_LINES) :])
+    if (
+        agent_kind == "cursor"
+        and _CURSOR_TRUST_OPT_RE.search(trust_bottom)
+        and _CURSOR_TRUST_FOOTER_RE.search(trust_bottom)
+    ):
+        return ("cursor-trust", "a", False, "Trust workspace")
+    # confirm-yn must sit on the LAST non-empty line — a real interactive
+    # prompt waits at the bottom of the pane. A (y/n) merely *displayed*
+    # mid-screen (e.g. Claude printing code containing prompts) is not one.
+    last_line = ""
+    for ln in reversed(lines):
+        if ln.strip():
+            last_line = ln
+            break
+    # Shell-layer matchers stay eligible inside agent panes. Package managers
+    # and ssh are readline prompts, so their affirmative answer needs Enter.
+    # Mirrors the package-confirm and ssh-host-key patterns in js/actions.js.
+    if _PACKAGE_CONFIRM_RE.search(last_line):
+        return ("package-confirm", "y", True, _extract_summary(tail, "confirm"))
+    if _SSH_HOST_KEY_RE.search(last_line):
+        return ("ssh-host-key", "yes", True, _extract_summary(tail, "confirm"))
+    if _CONFIRM_YN_RE.search(last_line):
+        if not re.search(r"\(y/n/a\)|\[Y/n/a\]", last_line, re.IGNORECASE):
+            with_enter = bool(_CONFIRM_NEEDS_ENTER_RE.search(last_line))
+            return ("confirm-yn", "y", with_enter, _extract_summary(tail, "confirm"))
+    # Numbered prompts: Claude Code renders its TodoWrite/status panel BELOW
+    # the "Esc to cancel · …" footer when tasks are active, pushing the
+    # footer out of `bottom`. Anchor on the LAST footer in the tail and
+    # require the Yes option just above it. Bound the footer's distance from
+    # the bottom (depth*4) to ignore stale footers buried in scrollback.
+    last_footer = None
+    for m in _NUMBERED_FOOTER_RE.finditer(tail):
+        last_footer = m
+    if agent_kind in ("claude", "codex", "gemini") and last_footer:
+        footer_line = tail.count("\n", 0, last_footer.start())
+        if (len(lines) - 1 - footer_line) <= depth * 4:
+            # Bound the option region by the last ──── separator above the
+            # footer (Antigravity prints one under its "Command" header).
+            # Long options ("Yes, and always allow…") wrap across several rows
+            # on narrow phone panes, so a fixed lookback can push option 1 out
+            # of view; the separator is a stable top anchor. Fall back to a
+            # generous fixed window when there is no separator.
+            search_floor = max(0, footer_line - max(depth * 4, _OPTION_REGION_LOOKBACK))
+            region_start = max(0, footer_line - _OPTION_REGION_LOOKBACK)
+            anchored = _option_region_start(lines, footer_line, search_floor)
+            if anchored is not None:
+                region_start = anchored
+                if _has_internal_divider(lines, region_start, footer_line):
+                    return None
+            # Checked without an anchor too (js/actions.js does the same). That
+            # is a question whose top rule has scrolled out of view, leaving
+            # only its "Chat about this" divider, and it used to be answered
+            # "1. Yes" while the browser showed a question. See
+            # _has_unanchored_divider for why it cannot catch a real gate.
+            elif _has_unanchored_divider(lines, region_start, footer_line):
+                return None
+            region = "\n".join(lines[region_start : footer_line + 1])
+            if _NUMBERED_YES_RE.search(region):
+                return ("numbered-yes", "", True, _extract_summary(tail, "numbered"))
+            if _SELECTED_YES_RE.search(region):
+                return ("selected-yes", "", True, _extract_summary(tail, "numbered"))
+    return None
+
+
+def detect_answerable_prompt(tail, agent_kind, target=None):
+    """What the scanner may actually act on: a detection minus the codex vetoes.
+
+    Detection and veto are kept as two steps rather than folded into
+    _detect_autoyes_prompt's branches so a countdown already ticking when the
+    vetoed text appears is cancelled by the scanner's `if not detected` branch
+    rather than left to fire. Pure and side-effect-free apart from the log line,
+    so the vetoes are testable without a tmux server (see
+    tests/test_autoyes_downgrade_menu.py).
+    """
+    detected = _detect_autoyes_prompt(tail, agent_kind)
+    if not detected or agent_kind != "codex":
+        return detected
+    if _LUNA_RE.search(tail):
+        log.info("autoyes: luna on %s — suppressed %s", target, detected[0])
+        return None
+    if _CODEX_DOWNGRADE_RE.search(tail):
+        log.info(
+            "autoyes: codex downgrade menu on %s — suppressed %s", target, detected[0]
+        )
+        return None
+    return detected
+
+
+# Patterns for extracting the tool/action being approved
+_TOOL_LINE_RE = re.compile(
+    r"[●○◉]\s*((?:Bash|Read|Edit|Write|Glob|Grep|Agent|Skill|WebFetch|WebSearch"
+    r"|MultiEdit|NotebookEdit|ToolSearch|SendMessage|TaskCreate|TaskUpdate"
+    r"|mcp\S+)\s*\(.*)",
+    re.IGNORECASE,
+)
+
+
+def _extract_summary(tail, prompt_type):
+    """Extract a short description of what's being approved."""
+    lines = tail.split("\n")
+    if prompt_type == "permission":
+        # Look for tool invocation line: ● Bash(command) or ● Read(path)
+        for line in reversed(lines):
+            m = _TOOL_LINE_RE.search(line)
+            if m:
+                text = m.group(1).strip()
+                return text[:80] if len(text) > 80 else text
+        # Fallback: look for "Allow" line
+        for line in reversed(lines):
+            if "Allow" in line and ("once" in line or "always" in line):
+                continue  # skip the "Allow once / Always allow" footer
+            if "Allow" in line:
+                text = line.strip()
+                return text[:80] if len(text) > 80 else text
+    elif prompt_type == "opencode":
+        # The line after the LAST "Permission required" header describes the
+        # request, e.g. "←  Access external directory ~/.cargo" (behind the ┃
+        # message-block gutter). OpenCode's two-column layout can append
+        # right-sidebar text after a wide gap — keep only the left column.
+        header_idx = None
+        for i in range(len(lines) - 1, -1, -1):
+            if "Permission required" in lines[i]:
+                header_idx = i
+                break
+        if header_idx is not None:
+            for j in range(header_idx + 1, min(header_idx + 4, len(lines))):
+                text = re.sub(r"^[\s┃│]*[←→]?\s*", "", lines[j])
+                text = re.split(r"\s{4,}", text)[0].strip()
+                if text:
+                    return text[:80]
+    elif prompt_type == "cursor":
+        # The command sits on the " $  <cmd> … in <dir>" line just above the
+        # "Run this command?" header. Long commands hard-wrap onto indented
+        # continuation rows, breaking MID-TOKEN — so the rows are joined with
+        # no separator, not with a space.
+        hdr = None
+        for i in range(len(lines) - 1, -1, -1):
+            if _CURSOR_PERMISSION_HDR_RE.search(lines[i]):
+                hdr = i
+                break
+        if hdr is not None:
+            start = None
+            for i in range(hdr - 1, max(hdr - 8, -1), -1):
+                if re.match(r"\s*\$\s", lines[i]):
+                    start = i
+                    break
+            if start is not None:
+                parts = [re.sub(r"^\s*\$\s*", "", lines[start]).rstrip()]
+                for j in range(start + 1, hdr):
+                    if not lines[j].strip():
+                        break
+                    parts.append(lines[j].strip())
+                text = re.sub(
+                    r"\s+in\s+(?:current dir|\S+)$", "", "".join(parts)
+                ).strip()
+                if text:
+                    return text[:80]
+        # Fallback: the "Not in allowlist: cat, head" line names the binaries.
+        for line in reversed(lines):
+            m = re.search(r"Not in allowlist:\s*(.+)", line)
+            if m:
+                return m.group(1).strip()[:80]
+    elif prompt_type == "confirm":
+        # The live prompt is the LAST matching line. Searching from the top found
+        # the shell's echo of the command that asked, or an answered prompt still
+        # in the scrollback.
+        for line in reversed(lines):
+            if re.search(r"\(y/n\)|\[Y/n\]|\(yes/no\)", line, re.IGNORECASE):
+                text = line.strip()
+                # Remove the (y/n) suffix
+                text = re.sub(r"\s*\(y/n\)|\[Y/n\]|\(yes/no\)\s*", "", text).strip()
+                return text[:80] if len(text) > 80 else text
+    elif prompt_type == "numbered":
+        # Antigravity (Gemini) CLI prints "Requesting permission for: <cmd>"
+        # just above its proceed prompt — the command is the clearest summary.
+        for line in reversed(lines):
+            m = re.search(r"Requesting permission for:\s*(.+)", line)
+            if m:
+                text = m.group(1).strip()
+                return text[:80] if len(text) > 80 else text
+        # Look for tool invocation above the numbered options (prefer over generic question)
+        for i in range(len(lines) - 1, -1, -1):
+            if re.match(r"\s*(?:[^\d\s]\s*)?1[\.\)]\s", lines[i]):
+                # Found option 1 — search upward for a tool line first
+                for j in range(i - 1, max(i - 8, -1), -1):
+                    m = _TOOL_LINE_RE.search(lines[j])
+                    if m:
+                        text = m.group(1).strip()
+                        return text[:80] if len(text) > 80 else text
+                # Fallback: first non-generic line above options
+                for j in range(i - 1, max(i - 4, -1), -1):
+                    candidate = lines[j].strip()
+                    if (
+                        not candidate
+                        or candidate.startswith("─")
+                        or len(candidate) <= 3
+                    ):
+                        continue
+                    # Skip generic questions
+                    if re.match(
+                        r"Do you want to proceed\??$", candidate, re.IGNORECASE
+                    ):
+                        continue
+                    return candidate[:80] if len(candidate) > 80 else candidate
+                break
+    return None
+
+
+# Patterns that mark the end of an interactive prompt block. Whatever sits
+# *below* one of these in the captured pane is Claude Code's status bar
+# (Vibing… timer, token counts, tips) which animates every second — hashing
+# it would reset the countdown each tick and the prompt would never fire.
+_PROMPT_TERMINATOR_RE = re.compile(
+    r"(?:Enter to select|Esc to cancel|Navigate)\s*[·•]"
+    r"|Press enter to (?:confirm|continue)"
+    r"|Allow once\s+Allow always\s+Reject"
+    # Claude's two y/a/n permission rows (js/actions.js permission-yna).
+    r"|Allow once\s+Always allow\s+Deny"
+    r"|Yes[^\n]*\(y\)[^\n]*Always[^\n]*\(a\)[^\n]*No[^\n]*\(n\)"
+    r"|Skip & tell the agent what to do instead"
+    r"|Use arrow keys to navigate"
+    r"|\(y/n(?:/a)?\)"
+    r"|\[Y/n(?:/a)?\]"
+    r"|\[y/N\]"
+    r"|\(yes/no(?:/\[fingerprint\])?\)",
+    re.IGNORECASE,
+)
+
+
+# Lines of dialog the notification fingerprint keeps, counted up from the
+# terminator. Above any real Claude/codex/opencode prompt's height, and below the
+# 60-line -60 capture, so the fingerprint holds the whole dialog but no scrollback.
+_FINGERPRINT_LINES = 40
+
+
+def _prompt_region(tail, size=500):
+    """`size` chars ending at the prompt's terminator line (the footer or y/n
+    marker), so the animated status bar below the prompt is left out. The last
+    `size` chars when no terminator is found. size=None keeps everything up to
+    the terminator line.
+    """
+    matches = list(_PROMPT_TERMINATOR_RE.finditer(tail))
+    if matches:
+        end = tail.find("\n", matches[-1].end())
+        if end < 0:
+            end = len(tail)
+        return tail[max(0, end - size) if size else 0:end]
+    return tail[-size:] if size else tail
+
+
+# Where a request's dialog begins, for _prompt_identity. codex heads every
+# approval with one question (the four "Would you like to …?" forms in the
+# 0.156 binary: run a command, make edits, grant permissions, send input to a
+# terminal) and its directory-trust dialog with its own. Matched at the start
+# of rows joined by _joined, since a narrow pane wraps the question.
+_CODEX_HEADER_RE = re.compile(
+    r"\s*(?:Would you like to .+?\?|Do you trust the contents of .+?\?)"
+)
+# A Claude transcript entry: the tool call a y/n/a permission row is for.
+_TRANSCRIPT_ENTRY_RE = re.compile(r"^\s*[●○◉]\s*\S")
+_OPTION_ONE_RE = re.compile(r"^\s*(?:[^\d\s]\s*)?1[\.\)]\s*Yes\b", re.IGNORECASE)
+_SELECTED_YES_LINE_RE = re.compile(r"^\s*❯\s*Yes\b", re.IGNORECASE)
+
+
+def _joined(rows):
+    """Rows as one line: each newline and the whitespace around it becomes one
+    space, so a question wrapped across rows reads as it was written."""
+    return re.sub(r"\s*\n\s*", " ", "\n".join(rows))
+
+
+def _request_start(lines, term, prompt_type, agent_kind):
+    """Index of the first row of the request's dialog, or None if not in view.
+
+    Each prompt shape has a real top edge, found by content and never by a row
+    or character count:
+      * a numbered menu: codex's question header, or the ──── rule Claude and
+        Gemini draw across the top of their dialogs (a live Claude dialog is a
+        rule directly under the transcript);
+      * Claude's y/n/a row: the ● tool call it asks about;
+      * opencode: its "Permission required" header;
+      * cursor: the `$ <command>` row above "Run this command?", or its trust
+        dialog's header;
+      * ssh: "The authenticity of host …", which names the host and key;
+      * apt/dnf: the contiguous block of output that ends in the question;
+      * a bare (y/n): the question line itself, which is all it says.
+    """
+    def up(pred, frm):
+        for i in range(frm, -1, -1):
+            if pred(lines[i]):
+                return i
+        return None
+
+    if prompt_type in ("numbered-yes", "selected-yes"):
+        first = up((_OPTION_ONE_RE if prompt_type == "numbered-yes" else _SELECTED_YES_LINE_RE).match, term)
+        if first is None:
+            return None
+        if agent_kind == "codex":
+            # The nearest row above option 1 where the header STARTS, reading
+            # the rows below it joined (judge3 #2: at 40 columns the question
+            # wraps mid-word). A header whose first row has scrolled away does
+            # not match, and the request is withheld.
+            for i in range(first - 1, -1, -1):
+                if _CODEX_HEADER_RE.match(_joined(lines[i:first])):
+                    return i
+            return None
+        return up(_OPTION_SEP_RE.match, first)
+    if prompt_type == "permission-yna":
+        return up(_TRANSCRIPT_ENTRY_RE.match, term)
+    if prompt_type == "opencode-permission":
+        return up(lambda ln: "Permission required" in ln, term)
+    if prompt_type == "cursor-permission":
+        header = up(_CURSOR_PERMISSION_HDR_RE.search, term)
+        return None if header is None else up(lambda ln: re.match(r"\s*\$\s", ln), header)
+    if prompt_type == "cursor-trust":
+        return up(lambda ln: "Workspace Trust Required" in ln, term)
+    if prompt_type == "ssh-host-key":
+        return up(lambda ln: "The authenticity of host" in ln, term)
+    if prompt_type == "package-confirm":
+        start = term
+        while start > 0 and lines[start - 1].strip():
+            start -= 1
+        # A block running into the top of the window may have lost its head.
+        return start if start > 0 else None
+    if prompt_type == "confirm-yn":
+        return term
+    return None
+
+
+def _prompt_identity(tail, prompt_type, agent_kind):
+    """Which request is on screen: a digest of its dialog, from the dialog's
+    real top edge (_request_start) through the prompt's terminator line, or None
+    when that span cannot be established.
+
+    The countdown, its reuse and the send-time check compare this. The last
+    500 characters before the terminator let a different long codex approval
+    with the same wrapped tail through (judge #3). The whole capture above the
+    terminator then pulled in a moving slice of history: a row appended below
+    the footer, or a resize, slid it and changed the identity of an unchanged
+    approval (judge2 #1). The dialog's own span has neither problem: it holds
+    the question, command and options in full, and nothing above or below it.
+    Escapes and trailing spaces are dropped so a colour-only redraw is the same
+    request. None, and the caller withholds, when the terminator or the top
+    edge is not within the detection window.
+    """
+    lines = detection_window(tail).split("\n")
+    term = None
+    for i in range(len(lines) - 1, -1, -1):
+        if _PROMPT_TERMINATOR_RE.search(lines[i]):
+            term = i
+            break
+    if term is None:
+        return None
+    start = _request_start(lines, term, prompt_type, agent_kind)
+    if start is None:
+        return None
+    normalized = "\n".join(ln.rstrip() for ln in lines[start : term + 1])
+    return hashlib.sha256(
+        f"{prompt_type}\n{normalized}".encode("utf-8", "replace")
+    ).hexdigest()
+
+
+def prompt_fingerprint(tail):
+    """A stable identity for the prompt on screen.
+
+    /poll sends it with every pane and the question popup keys on it: one popup
+    per prompt, and a new prompt in the same pane pops again. Escapes are
+    stripped first so a colour change alone does not count, and md5 rather than
+    hash() so the value is the same from one request to the next.
+
+    The region ends at the terminator and reaches back at most _FINGERPRINT_LINES
+    lines. Ending at the terminator drops the animated status bar below it; the
+    line cap drops scrollback far above the dialog, which /poll's -60 capture
+    otherwise includes and which shifts every time a line is appended below,
+    re-popping a dismissed card. The cap is well above any real dialog's height,
+    so two prompts that differ anywhere within the dialog — a path in the middle
+    of a wrapped command included — still hash apart.
+    """
+    region = _prompt_region(_ANSI_ESCAPE_RE.sub("", tail or ""), size=None)
+    region = "\n".join(region.split("\n")[-_FINGERPRINT_LINES:])
+    return hashlib.md5(region.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def prompt_popup_info(tail, agent_kind, autoyes_armed):
+    """What the question popup needs from the server about one pane's prompt.
+
+    The browser decides whether a prompt is showing, with the detection the
+    action bar uses. The server adds what only it has: a fingerprint to key
+    the popup on, a summary, and whether Auto-Yes is about to answer this prompt
+    itself, in which case the popup stays away. Takes an escape-free tail. No
+    logging, unlike detect_answerable_prompt: /poll runs this for every pane on
+    every cycle.
+    """
+    detected = _detect_autoyes_prompt(tail, agent_kind)
+    vetoed = agent_kind == "codex" and bool(
+        _LUNA_RE.search(tail) or _CODEX_DOWNGRADE_RE.search(tail)
+    )
+    summary = detected[3] if detected else None
+    if not summary:
+        summary = _extract_summary(tail, "numbered") or _extract_summary(tail, "confirm")
+    return {
+        "fp": prompt_fingerprint(tail),
+        "summary": summary,
+        "autoyes": bool(autoyes_armed and detected and not vetoed),
+    }
+
+
+def autoyes_will_consider(target, enabled, source, process_kind, agent_kind):
+    """Whether the scanner would act on this pane's prompt at all.
+
+    The same scope rule as _autoyes_scan_tick: agent panes only, judged by the
+    process (a shell) AND by content (a non-agent program such as apt in the
+    foreground), unless the session is shell-ok (_shell_ok). And once the human
+    cancels a countdown, the scanner leaves that prompt alone for as long as it
+    stays on screen, so the question popup must not be suppressed for it either.
+    """
+    if not enabled:
+        return False
+    if (process_kind == "shell" or agent_kind not in AGENT_KINDS) and not _shell_ok(
+        target.rsplit(":", 1)[0], source
+    ):
+        return False
+    with state.autoyes_lock:
+        return not state.autoyes_cancelled.get(target)
+
+
+# Consecutive scans with no prompt at all that release a human cancel.
+_CANCEL_RELEASE_SCANS = 2
+
+
+def _shell_ok(session, source):
+    """Whether this session's Auto-Yes may answer plain shell panes.
+
+    Text a shell prints is whatever the command in it prints, so `curl … | sh`
+    or `cat` of a hostile file can draw a (y/n) line for Auto-Yes to answer
+    (review sec F8). The all-sessions switch has always left shells alone; a
+    session armed by hand now does too, unless its project settings say
+    `autoyes.shell_ok: true`. Only a real True counts, and never under the
+    switch alone.
+    """
+    return (
+        source == "explicit"
+        and state.get_project_setting(session, "autoyes", "shell_ok") is True
+    )
+
+
+def _clamp_delay(value):
+    """Clamp a requested auto-yes delay to [0.1, 30]s at 0.1s resolution.
+
+    Raises on junk, which is what the HTTP setters want: they answer 400.
+    """
+    return max(0.1, min(30.0, round(float(value), 1)))
+
+
+def _safe_delay(value):
+    """The same clamp, for a value read out of a settings file.
+
+    Every HTTP and CLI path into the delay is clamped, but the SCANNER reads
+    settings.json and project_settings.json directly, and those are edited by
+    hand and reachable through PATCH /api/settings, which validates key names
+    and never values. Two failures follow from trusting them:
+
+      * `0` (or a negative) means the countdown deadline is already in the past
+        when it is set, so the prompt is answered on the first tick with no
+        window to see it or cancel it. Arming auto-yes is a decision; removing
+        the chance to stop it is not part of that decision.
+      * a string or null raises inside the scan tick. The scanner catches and
+        logs, so auto-yes stops answering ANYTHING for the life of the process
+        while every pane still reports itself armed and idle.
+
+    Falling back to the shipped default is the safe direction for both: it
+    keeps answering, and it keeps a countdown.
+    """
+    try:
+        return _clamp_delay(value)
+    except (TypeError, ValueError):
+        return float(state.DEFAULT_SETTINGS["autoyes"]["default_delay"])
+
+
+def _scan_interval():
+    """Seconds to sleep between scan ticks.
+
+    Fixed at 1s because each tick runs expected_target_identity() — a
+    full `tmux -C attach-session` open/close — per prompt-bearing pane, and
+    overlapping control clients are what crashed the tmux 3.4 server on
+    2026-08-31. Ticking at a sub-second delay multiplied that churn 10x, so a
+    sub-second delay now means "answer on the next 1s tick", not "tick at that
+    resolution".
+    """
+    return 1.0
+
+
+def autoyes_scanner():
+    """Background thread: scans tmux panes, managing countdowns.
+
+    Tick interval adapts to the smallest active delay (see _scan_interval) so
+    sub-second delays fire promptly without a fixed 100ms scan when only
+    second-scale delays are configured.
+    """
+    while True:
+        try:
+            _autoyes_scan_tick()
+        except Exception:
+            # Was a bare `pass`. A tick that dies half-way leaves the previously
+            # published effective map in place, so the failure presents as
+            # stale/wrong state rather than as an error — log it once per cause.
+            log.exception("autoyes: scan tick failed")
+        time.sleep(_scan_interval())
+
+
+def _prompt_still_on_screen(expected, agent_kind, prompt_type, ident):
+    """True while the pane still shows the prompt the countdown was started for.
+
+    A countdown is decided seconds before its answer lands, and in that gap the
+    prompt can be answered by hand or replaced, for example by codex's "Retry
+    with a faster model" menu, which a bare Enter accepts (review rel #3). So the
+    pane is captured again, by its pane id, and must still detect as the same
+    type with the same _prompt_identity, codex vetoes included. The same idea as the sudo
+    popup's prompt_owner_waiting. Any failure to tell is a no.
+    """
+    pane_id = expected.get("pane_id") if isinstance(expected, dict) else None
+    if not pane_id:
+        return False
+    try:
+        cap = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-t", tmux_exact_target(pane_id), "-S", f"-{detection_window_lines()}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if cap.returncode != 0:
+        return False
+    tail = cap.stdout.rstrip("\n")
+    detected = detect_answerable_prompt(tail, agent_kind, pane_id)
+    return (
+        bool(detected)
+        and detected[0] == prompt_type
+        and ident is not None
+        and _prompt_identity(tail, prompt_type, agent_kind) == ident
+    )
+
+
+def _deliver_autoyes_answer(expected, send_text, with_enter, still_on_screen=None):
+    """Deliver one detected AutoYes answer with fixed subsystem provenance.
+
+    `still_on_screen`, when given, is asked inside the effect, right before the
+    keys go, and a False refuses the send as "prompt_changed".
+    """
+
+    def effect():
+        if still_on_screen is not None and not still_on_screen():
+            return DeliveryResult("prompt_changed")
+        return generation_bound_delivery(
+            expected,
+            text=send_text,
+            enter=with_enter,
+        )
+
+    return park.perform(park.Intent.AUTOYES_ANSWER, effect)
+
+
+def _autoyes_scan_tick():
+    """One scan cycle for auto-yes."""
+    global_on = state.get_setting("autoyes", "all_sessions") == "on"
+    if not global_on:
+        # Fast path: nothing armed and no global switch means no work, and no
+        # reason to shell out to tmux. With the switch on, enablement is
+        # resolved per session below, once we know which sessions are live.
+        with state.autoyes_lock:
+            if not any(state.autoyes_sessions.values()):
+                state.autoyes_effective = {}
+                return
+
+    proc = subprocess.run(
+        [
+            "tmux",
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name}\t#{window_index}\t#{pane_index}\t"
+            "#{pane_pid}\t#{pane_current_command}",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if proc.returncode != 0:
+        # tmux server gone — every session is dead; drop all auto-yes state
+        # so ghost countdowns/toggles aren't served for the process lifetime.
+        if "no server" in (proc.stderr or "").lower():
+            # Cancellations are kept: only two quiet scans release one.
+            with state.autoyes_lock:
+                state.autoyes_countdowns.clear()
+                state.autoyes_answered.clear()
+                state.autoyes_sessions.clear()
+                state.autoyes_delays.clear()
+        return
+
+    now = time.time()
+
+    # Build live session/pane sets, then prune state for dead sessions and
+    # dead panes BEFORE scanning (killed sessions otherwise leak countdown/
+    # answered/sessions/delays entries forever).
+    live_sessions = set()
+    live_targets = set()
+    pane_rows = []
+    for line in proc.stdout.strip().split("\n"):
+        if not line:
+            continue
+        parts = line.split("\t")
+        if len(parts) < 5:
+            continue
+        live_sessions.add(parts[0])
+        live_targets.add(f"{parts[0]}:{parts[1]}.{parts[2]}")
+        pane_rows.append(parts)
+
+    with state.autoyes_lock:
+        for sess in list(state.autoyes_sessions):
+            if sess not in live_sessions:
+                state.autoyes_sessions.pop(sess, None)
+                state.autoyes_delays.pop(sess, None)
+        for t in list(state.autoyes_countdowns):
+            if t not in live_targets:
+                state.autoyes_countdowns.pop(t, None)
+        for t in list(state.autoyes_answered):
+            if t not in live_targets:
+                state.autoyes_answered.pop(t, None)
+        # autoyes_cancelled is NOT pruned here: nothing but two quiet scans of
+        # the target releases a cancel (judge3 #1). A dead pane's entry waits
+        # for its name to be reused and seen quiet, which fails safe.
+
+    # Resolve once per session rather than once per pane, then publish the
+    # result: /autoyes/status has no live session list of its own. Outside the
+    # lock — autoyes_enabled_for takes it itself, then _project_settings_lock.
+    # Published once, AFTER the pane sweep — see the tail of this function. An
+    # earlier version also published here, before the filter had run, so any
+    # request landing mid-tick read the unfiltered value and a shell-only
+    # session showed as armed for most of every tick.
+    enabled_by_session = {s: state.autoyes_enabled_for(s) for s in live_sessions}
+    if not any(enabled for enabled, _source in enabled_by_session.values()):
+        with state.autoyes_lock:
+            state.autoyes_effective = dict.fromkeys(enabled_by_session, False)
+        return
+
+    # Sessions holding at least one pane the scan will actually act on. A
+    # globally-armed session whose panes are all plain shells is in scope but
+    # can never fire, and reporting it as enabled would light its Auto-Yes
+    # button for a session that does nothing. Explicitly-armed sessions are not
+    # filtered, so they are added unconditionally below.
+    qualified = set()
+
+    for parts in pane_rows:
+        session_name = parts[0]
+        enabled, source = enabled_by_session.get(session_name, (False, "explicit"))
+        if not enabled:
+            continue
+
+        target = f"{parts[0]}:{parts[1]}.{parts[2]}"
+
+        # Resolve identity BEFORE capturing. resolve_process walks the pane's
+        # process tree from /proc behind a cache and needs no pane content, so a
+        # globally-armed session skips the capture entirely on a plain shell.
+        # That is both the scope rule and what keeps the tick cheap once every
+        # pane on the host is in scope.
+        process_kind = resolve_process(target, parts[3], parts[4])
+        if process_kind == "shell" and not _shell_ok(session_name, source):
+            continue
+
+        cap = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-t", tmux_exact_target(target), "-S", f"-{detection_window_lines()}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if cap.returncode != 0:
+            continue
+        tail = cap.stdout.rstrip("\n")
+        if not tail:
+            continue
+
+        agent_kind = refine_with_content(process_kind, tail)
+        # Agent panes only: apt, ssh host-key and stray (y/n) prompts in a plain
+        # shell stay manual. A session armed by hand can opt back in with
+        # shell_ok; the global switch never does (see _shell_ok).
+        if agent_kind not in AGENT_KINDS and not _shell_ok(session_name, source):
+            continue
+        qualified.add(session_name)
+        # Two questions, kept apart (judge3 #1). Is a prompt PRESENT? That is
+        # raw detection, vetoes ignored, and only it can release a cancel. Is
+        # it ELIGIBLE to answer? That is detection minus the codex vetoes
+        # (_LUNA_RE, _CODEX_DOWNGRADE_RE), and a veto only clears a pending
+        # countdown: a resize that brings an old "luna" row into the capture
+        # leaves the approval on screen, and used to read as "prompt gone".
+        present = _detect_autoyes_prompt(tail, agent_kind)
+        detected = detect_answerable_prompt(tail, agent_kind, target) if present else None
+        pident = _prompt_identity(tail, detected[0], agent_kind) if detected else None
+
+        # Collect broadcast event to fire AFTER releasing the lock
+        # (broadcast_autoyes_event also acquires autoyes_lock — avoid deadlock).
+        # Likewise collect the keystrokes to send: tmux subprocesses + sleep
+        # must not run under the lock.
+        broadcast_event = None
+        fire_action = None  # (identity, send_text, with_enter, prompt_type)
+
+        if not present:
+            with state.autoyes_lock:
+                state.autoyes_countdowns.pop(target, None)
+                # No prompt visible: forget what was answered, so a NEW prompt
+                # with the same request as a previous one (consecutive edits to
+                # the same file, say) is not skipped.
+                state.autoyes_answered.pop(target, None)
+                # The ONLY way a cancel ends: no prompt on two consecutive
+                # scans, so one odd capture cannot release it.
+                if target in state.autoyes_cancelled:
+                    quiet = state.autoyes_cancel_quiet.get(target, 0) + 1
+                    if quiet >= _CANCEL_RELEASE_SCANS:
+                        state.autoyes_cancelled.pop(target, None)
+                        state.autoyes_cancel_quiet.pop(target, None)
+                    else:
+                        state.autoyes_cancel_quiet[target] = quiet
+            continue
+
+        with state.autoyes_lock:
+            # A prompt is present: a release has to start counting again.
+            state.autoyes_cancel_quiet.pop(target, None)
+
+        if not detected:
+            # Vetoed: drop any pending countdown and nothing else.
+            with state.autoyes_lock:
+                state.autoyes_countdowns.pop(target, None)
+            continue
+
+        # A prompt is detected but its request's dialog cannot be placed
+        # (see _prompt_identity): withhold. Any countdown goes, since it cannot
+        # be shown to be for this request; a cancellation stays.
+        if pident is None:
+            with state.autoyes_lock:
+                state.autoyes_countdowns.pop(target, None)
+            continue
+
+        # A prompt is up but its pane could not be identified (the control
+        # attach timed out under load, say). Skip the tick and leave the
+        # countdown and any cancellation exactly as they are. Popping here is
+        # what used to lose a cancel and answer on the next tick (rel #2).
+        detected_identity = expected_target_identity(target)
+        if detected_identity is None:
+            continue
+
+        with state.autoyes_lock:
+            # A cancel holds for the whole pane until two consecutive scans see
+            # no prompt, whatever the identity or a veto does meanwhile. Keyed by identity, a resize
+            # or a row below the footer revived it (judge2 #1); leaving a prompt
+            # to the human is the safe way to be wrong.
+            if state.autoyes_cancelled.get(target):
+                continue
+
+            log.info("autoyes: detected %s on %s", detected[0], target)
+
+            answered = state.autoyes_answered.get(target)
+            if answered and answered[0] == pident:
+                if now - answered[1] < 3.0:
+                    # Recently fired — y is still being processed
+                    state.autoyes_countdowns.pop(target, None)
+                    continue
+                else:
+                    # Same hash but too old — new prompt or send failed
+                    log.info(
+                        "autoyes: answered-cache expired for %s (%.1fs old)",
+                        target,
+                        now - answered[1],
+                    )
+                    del state.autoyes_answered[target]
+
+            existing = state.autoyes_countdowns.get(target)
+            # The same prompt means the same request (_prompt_identity) AND the
+            # same detected type. An old prompt's terminator can stay in the
+            # capture above a new prompt whose own line is not one, and must not
+            # hand it the old countdown.
+            same_prompt = bool(
+                existing
+                and existing["prompt_hash"] == pident
+                and existing.get("prompt_type") == detected[0]
+            )
+
+            if existing and same_prompt:
+                if now >= existing["deadline"]:
+                    prompt_type, send_text, with_enter, _summary = detected
+                    state.autoyes_countdowns.pop(target, None)
+                    fire_action = (
+                        existing.get("expected_target_identity"),
+                        send_text,
+                        with_enter,
+                        prompt_type,
+                    )
+            else:
+                # Re-check enablement: a toggle-off mid-tick must not recreate a
+                # phantom countdown that's never cleaned up. Every toggle writes
+                # the runtime map synchronously in both regimes, so an explicit
+                # False there is the whole signal — `not …get()` would also fire
+                # on a globally-armed session simply absent from the map.
+                if state.autoyes_sessions.get(session_name) is False:
+                    state.autoyes_countdowns.pop(target, None)
+                    continue
+                # _safe_delay, not the raw value: this is the one delay read
+                # that comes straight off disk (see its docstring).
+                if global_on:
+                    delay = _safe_delay(state.get_setting("autoyes", "default_delay"))
+                else:
+                    proj_delay = state.get_project_setting(
+                        session_name, "autoyes", "delay"
+                    )
+                    delay = _safe_delay(
+                        state.autoyes_delays.get(session_name, proj_delay)
+                    )
+                summary = detected[3] if len(detected) > 3 else None
+                state.autoyes_countdowns[target] = {
+                    # _prompt_identity, not a hash of a fixed-size suffix.
+                    "prompt_hash": pident,
+                    "deadline": now + delay,
+                    "delay": delay,
+                    "prompt_type": detected[0],
+                    "summary": summary,
+                    "expected_target_identity": detected_identity.as_dict(),
+                }
+                broadcast_event = (target, "countdown", detected[0])
+
+        # Send keystrokes outside the lock (subprocess + sleep)
+        if fire_action:
+            expected, send_text, with_enter, prompt_type = fire_action
+            result = _deliver_autoyes_answer(
+                expected,
+                send_text,
+                with_enter,
+                still_on_screen=lambda: _prompt_still_on_screen(
+                    expected, agent_kind, prompt_type, pident
+                ),
+            )
+            if result.ok:
+                with state.autoyes_lock:
+                    state.autoyes_answered[target] = (pident, now)
+                broadcast_event = (target, "fired", prompt_type)
+                log.info(
+                    "autoyes: FIRED %s on %s (send=%r enter=%r)",
+                    prompt_type,
+                    target,
+                    send_text,
+                    with_enter,
+                )
+            else:
+                broadcast_event = (target, result.status, prompt_type)
+                log.info("autoyes: %s on %s", result.status, target)
+
+        # Broadcast outside the lock
+        if broadcast_event:
+            broadcast_autoyes_event(*broadcast_event)
+
+    # Publish only now that the pane sweep knows which sessions it can act on,
+    # so /autoyes/status never reports a globally-armed shell-only session as on.
+    with state.autoyes_lock:
+        state.autoyes_effective = {
+            s: enabled and (source != "global" or s in qualified)
+            for s, (enabled, source) in enabled_by_session.items()
+        }
+        state.autoyes_sources = {
+            s: source for s, (_enabled, source) in enabled_by_session.items()
+        }
+
+
+@autoyes_bp.route("/autoyes/status")
+def autoyes_status():
+    """Return auto-yes state for all sessions."""
+    global_on = state.get_setting("autoyes", "all_sessions") == "on"
+    global_delay = _safe_delay(state.get_setting("autoyes", "default_delay"))
+    with state.autoyes_lock:
+        countdowns = {}
+        now = time.time()
+        for target, cd in state.autoyes_countdowns.items():
+            countdowns[target] = {
+                "remaining": max(0, round(cd["deadline"] - now, 1)),
+                "prompt_type": cd["prompt_type"],
+                "delay": cd.get("delay", state.AUTOYES_DELAY),
+                "summary": cd.get("summary"),
+            }
+        # The runtime map is the pre-first-tick answer; the scanner's effective
+        # map covers sessions nobody ever toggled, so it wins where it has one.
+        sessions = dict(state.autoyes_sessions)
+        sessions.update(state.autoyes_effective)
+        return jsonify(
+            {
+                "global": {"enabled": global_on, "delay": global_delay},
+                "sessions": sessions,
+                # session -> "explicit" | "global": whether a session's state
+                # survives the switch being turned off.
+                "sources": dict(state.autoyes_sources),
+                "countdowns": countdowns,
+                # Per-session delays do not apply while the global switch owns
+                # the delay; reporting them would have the UI show a number the
+                # scanner ignores.
+                "delays": {} if global_on else dict(state.autoyes_delays),
+            }
+        )
+
+
+def rename_autoyes_session(old, new):
+    """Re-key the runtime Auto-Yes maps after a session rename.
+
+    Per-session maps move by name; countdowns, answered prompts and cancelled
+    prompts move by target prefix, so a cancelled countdown stays cancelled
+    under the new name.
+    The persisted side is state.rename_project_settings. Both are called from
+    routes/terminal.py:on_session_renamed.
+    """
+    old_prefix = old + ":"
+    new_prefix = new + ":"
+    with state.autoyes_lock:
+        for by_session in (
+            state.autoyes_sessions,
+            state.autoyes_delays,
+            state.autoyes_effective,
+            state.autoyes_sources,
+        ):
+            if old in by_session:
+                by_session[new] = by_session.pop(old)
+        for by_target in (
+            state.autoyes_countdowns,
+            state.autoyes_answered,
+            state.autoyes_cancelled,
+            state.autoyes_cancel_quiet,
+        ):
+            for target in [t for t in by_target if t.startswith(old_prefix)]:
+                by_target[new_prefix + target[len(old_prefix):]] = by_target.pop(target)
+
+
+def _set_session_autoyes(session, enabled, delay=None):
+    """Arm or disarm one session, and persist it in the regime's own flag."""
+    global_on = state.get_setting("autoyes", "all_sessions") == "on"
+    with state.autoyes_lock:
+        state.autoyes_sessions[session] = enabled
+        state.autoyes_effective[session] = enabled
+        if enabled and delay is not None and not global_on:
+            # Enabling — store per-session delay
+            try:
+                delay = _clamp_delay(delay)
+            except (ValueError, TypeError):
+                delay = state.AUTOYES_DELAY
+            state.autoyes_delays[session] = delay
+        if not enabled:
+            to_remove = [
+                t for t in state.autoyes_countdowns if t.startswith(session + ":")
+            ]
+            for t in to_remove:
+                state.autoyes_countdowns.pop(t, None)
+                state.autoyes_answered.pop(t, None)
+            state.autoyes_delays.pop(session, None)
+    # Persist into whichever flag is authoritative in the current regime.
+    if global_on:
+        state.patch_project_settings(
+            session, {"autoyes": {"global_opt_out": not enabled}}
+        )
+    else:
+        persist = {"autoyes": {"enabled_default": enabled}}
+        if enabled and delay is not None:
+            persist["autoyes"]["delay"] = delay
+        state.patch_project_settings(session, persist)
+    return jsonify({"ok": True, "session": session, "enabled": enabled})
+
+
+@autoyes_bp.route("/autoyes/set", methods=["POST"])
+def autoyes_set():
+    """Set auto-yes on or off for a session: {"session", "enabled", "delay"?}.
+
+    Absolute, so a caller whose view of the state is stale still gets what it
+    asked for. A toggle computed from a stale view turned Auto-Yes OFF when the
+    browser meant ON (review rel #4).
+    """
+    data = request.get_json(silent=True) or {}
+    session = (data.get("session") or "").strip()
+    if not session:
+        return jsonify({"ok": False, "error": "No session"}), 400
+    enabled = data.get("enabled")
+    if not isinstance(enabled, bool):
+        return jsonify({"ok": False, "error": "enabled must be true or false"}), 400
+    return _set_session_autoyes(session, enabled, data.get("delay"))
+
+
+@autoyes_bp.route("/autoyes/toggle", methods=["POST"])
+def autoyes_toggle():
+    """Flip auto-yes for a session. Kept for pages cached before /autoyes/set;
+    nothing in this repo calls it."""
+    data = request.get_json(silent=True) or {}
+    session = (data.get("session") or "").strip()
+    if not session:
+        return jsonify({"ok": False, "error": "No session"}), 400
+    # Toggle against the EFFECTIVE state: under the global switch a session
+    # nobody touched is already on.
+    current, _source = state.autoyes_enabled_for(session)
+    return _set_session_autoyes(session, not current, data.get("delay"))
+
+
+def cancel_countdown(target):
+    """Cancel the countdown running on `target`. False if none was running.
+
+    The cancellation is recorded apart from the countdown and outlives it: the
+    scanner answers nothing on that pane until two consecutive scans see no
+    prompt there, vetoes ignored (review rel #2, judge2 #1, judge3 #1). The (identity, type) pairs are kept for the log only.
+    """
+    with state.autoyes_lock:
+        cd = state.autoyes_countdowns.pop(target, None)
+        if cd is None:
+            return False
+        state.autoyes_cancelled.setdefault(target, set()).add(
+            (cd["prompt_hash"], cd["prompt_type"])
+        )
+    # Outside the lock: broadcast_autoyes_event takes autoyes_lock itself.
+    broadcast_autoyes_event(target, "cancelled", cd["prompt_type"])
+    return True
+
+
+@autoyes_bp.route("/autoyes/cancel", methods=["POST"])
+def autoyes_cancel():
+    """Cancel an active auto-yes countdown for a target."""
+    data = request.get_json(silent=True) or {}
+    target = (data.get("target") or "").strip()
+    if not target:
+        return jsonify({"ok": False, "error": "No target"}), 400
+    return jsonify({"ok": True, "cancelled": cancel_countdown(target)})
+
+
+@autoyes_bp.route("/autoyes/set-delay", methods=["POST"])
+def autoyes_set_delay():
+    """Update the auto-yes delay for an already-enabled session.
+
+    Applies to future prompts and recomputes any in-flight countdown so the
+    new delay takes effect immediately (e.g. 5s -> 2s while a countdown runs).
+    """
+    if state.get_setting("autoyes", "all_sessions") == "on":
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "Global Auto-Yes owns the delay — change it in Settings",
+                }
+            ),
+            409,
+        )
+    data = request.get_json(silent=True) or {}
+    session = (data.get("session") or "").strip()
+    if not session:
+        return jsonify({"ok": False, "error": "No session"}), 400
+    try:
+        delay = _clamp_delay(data.get("delay"))
+    except (ValueError, TypeError):
+        return jsonify({"ok": False, "error": "Invalid delay"}), 400
+
+    # Collect targets to re-broadcast AFTER releasing the lock
+    # (broadcast_autoyes_event also acquires autoyes_lock — avoid deadlock).
+    rebroadcast = []
+    with state.autoyes_lock:
+        if not state.autoyes_sessions.get(session, False):
+            return jsonify({"ok": False, "error": "Auto-Yes not enabled"}), 409
+        state.autoyes_delays[session] = delay
+        # Recompute any active countdown for this session against the new delay,
+        # anchored to the prompt's original start time.
+        for target, cd in state.autoyes_countdowns.items():
+            if target.startswith(session + ":"):
+                start = cd["deadline"] - cd["delay"]
+                cd["delay"] = delay
+                cd["deadline"] = start + delay
+                rebroadcast.append((target, cd["prompt_type"]))
+
+    # Persist for restoration after restart
+    state.patch_project_settings(session, {"autoyes": {"delay": delay}})
+
+    for target, prompt_type in rebroadcast:
+        broadcast_autoyes_event(target, "countdown", prompt_type)
+
+    log.info("autoyes: delay updated for %s -> %ss", session, delay)
+    return jsonify({"ok": True, "session": session, "delay": delay})
+
+
+@autoyes_bp.route("/autoyes/global", methods=["POST"])
+def autoyes_global():
+    """Set the all-sessions switch, and optionally the delay it applies.
+
+    A convenience over PATCH /api/settings so the CLI needs no PATCH verb: both
+    write the same two keys, and the settings panel keeps using PATCH.
+    """
+    data = request.get_json(silent=True) or {}
+    patch = {}
+    if "enabled" in data:
+        patch["all_sessions"] = "on" if data["enabled"] else "off"
+    if data.get("delay") is not None:
+        try:
+            patch["default_delay"] = _clamp_delay(data["delay"])
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "error": "Invalid delay"}), 400
+    if not patch:
+        return jsonify({"ok": False, "error": "Nothing to set"}), 400
+    updated = state.patch_settings({"autoyes": patch})
+    log.info("autoyes: global switch -> %s", updated["autoyes"]["all_sessions"])
+    return jsonify(
+        {
+            "ok": True,
+            "global": {
+                "enabled": updated["autoyes"]["all_sessions"] == "on",
+                "delay": updated["autoyes"]["default_delay"],
+            },
+        }
+    )
+
+
+def announce_posture():
+    """Say out loud, at every start, what auto-yes is armed with.
+
+    The all-sessions switch is the most consequential setting Assist has: it
+    hands a `y` to every agent pane on the machine, including sessions created
+    later. It is also invisible unless you go looking — it lives in
+    settings.json and in one settings-panel toggle, so an install can sit in
+    that posture for weeks without anything ever saying so. The startup log is
+    already where the operator is told the auth token; this belongs beside it.
+
+    print(), not log.info(): this must reach the startup log even when
+    ASSIST_LOG_LEVEL is raised above INFO, and a line that exists only in
+    theory would be worse than not writing it at all.
+    """
+    delay = _safe_delay(state.get_setting("autoyes", "default_delay"))
+    if state.get_setting("autoyes", "all_sessions") != "on":
+        print(
+            "[assist] auto-yes: all-sessions switch OFF (per-session only)", flush=True
+        )
+        return
+    print(
+        f"[assist] auto-yes: ALL SESSIONS ARMED at {delay}s — every agent pane "
+        "on this host (claude, codex, opencode, cursor, gemini), including "
+        "sessions created later, has permission prompts answered automatically",
+        flush=True,
+    )
+    if delay < 1:
+        print(
+            f"[assist] auto-yes: {delay}s leaves effectively no window to see a "
+            "prompt or cancel it from the UI",
+            flush=True,
+        )
+
+
+def restore_autoyes_from_settings():
+    """Restore auto-yes for running tmux sessions that had it enabled before restart."""
+    announce_posture()
+    try:
+        proc = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if proc.returncode != 0:
+            return
+    except Exception:
+        return
+    global_on = state.get_setting("autoyes", "all_sessions") == "on"
+    for session_name in proc.stdout.strip().split("\n"):
+        if not session_name:
+            continue
+        autoyes_cfg = state.get_project_settings(session_name).get("autoyes", {})
+        # The runtime map wins in autoyes_enabled_for, so seeding it from a
+        # stale enabled_default would override an opt-out taken under the global
+        # switch and bring the session back on after a restart.
+        if global_on and autoyes_cfg.get("global_opt_out", False):
+            with state.autoyes_lock:
+                state.autoyes_sessions[session_name] = False
+            log.info("autoyes: restored opt-out for session %s", session_name)
+            continue
+        if autoyes_cfg.get("enabled_default", False):
+            delay = autoyes_cfg.get("delay", state.AUTOYES_DELAY)
+            with state.autoyes_lock:
+                state.autoyes_sessions[session_name] = True
+                state.autoyes_delays[session_name] = delay
+            log.info(
+                "autoyes: restored for session %s (delay=%ss)", session_name, delay
+            )

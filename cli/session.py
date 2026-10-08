@@ -1,0 +1,492 @@
+"""Session discovery and pane capture commands for the Assist CLI."""
+
+import json
+import os
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+from urllib.parse import urlencode
+
+from cli import http, roster as roster_cli, wait as wait_cli
+
+
+NEXT_COMMANDS = {
+    "launch": (
+        'assist send {session} "continue" --enter',
+        "assist send {session} --enter",
+        "assist wait {session}",
+        "assist view {session}",
+    ),
+    "send": (
+        "assist wait {session}",
+        'assist send {session} "continue" --enter',
+        "assist send {session} --enter",
+        "assist view {session}",
+    ),
+    "view": (
+        "assist view {session}",
+        "assist wait {session}",
+        'assist send {session} "continue" --enter',
+        "assist kill {session}",
+    ),
+    "wait": (
+        "assist view {session}",
+        "assist wait {session}",
+        'assist send {session} "continue" --enter',
+        "assist kill {session}",
+    ),
+    "ls": (
+        "assist launch --session {session} --cwd . --wait",
+        "assist view {session}",
+        "assist ls",
+    ),
+}
+
+
+CALLBACK_HINT = (
+    "callback: to be told instead of polling, send this too —\n"
+    "  when you are done, or if you hit an issue or question, run: "
+    'assist send {reply_to} "<status>" --enter'
+)
+
+
+def print_next_hint(verb: str, session: str | None) -> None:
+    """Print the measured next commands for a successful session verb."""
+    if os.environ.get("ASSIST_NO_HINTS") == "1" or not session:
+        return
+    commands = NEXT_COMMANDS.get(verb)
+    if commands is None:
+        return
+    rendered = (command.format(session=session) for command in commands)
+    print("next: " + "  ·  ".join(rendered), file=sys.stderr)
+
+
+def print_role_launch_hint(session: str | None) -> None:
+    if os.environ.get("ASSIST_NO_HINTS") == "1" or not session:
+        return
+    print(
+        f"next: assist autoyes {session} --on --delay 0.1  ·  "
+        f"assist view {session}  ·  assist wait {session}",
+        file=sys.stderr,
+    )
+
+
+def reply_address() -> str | None:
+    """Return the caller's own tmux session — the address a delegate replies to."""
+    override = os.environ.get("ASSIST_REPLY_TO")
+    if override:
+        return override.strip() or None
+    if not os.environ.get("TMUX"):
+        return None
+    command = ["tmux", "display-message", "-p"]
+    pane_id = os.environ.get("TMUX_PANE")
+    if pane_id:
+        command += ["-t", pane_id]
+    command.append("#S")
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def print_callback_hint(target_session: str | None) -> None:
+    """Offer the sender a callback, so it can stop polling the pane it just wrote to."""
+    if os.environ.get("ASSIST_NO_HINTS") == "1":
+        return
+    reply_to = reply_address()
+    if not reply_to or reply_to == target_session:
+        return
+    print(CALLBACK_HINT.format(reply_to=shlex.quote(reply_to)), file=sys.stderr)
+
+
+def resolve_target(session: str | None, pane: str = "0.0") -> str:
+    """Return an explicit tmux target, refusing the server-side fallback."""
+    if not session:
+        print("assist: no session given", file=sys.stderr)
+        raise SystemExit(2)
+    return f"{session}:{pane}"
+
+
+def _merged_sessions(include_cwd: bool = False) -> dict:
+    sessions_response = http.get("/terminal/sessions")
+    poll_response = http.get("/poll")
+    states = poll_response.get("states") or {}
+
+    panes = []
+    for pane in sessions_response.get("sessions") or []:
+        merged = dict(pane)
+        pane_state = states.get(pane.get("target")) or {}
+        merged.update(pane_state)
+        if include_cwd:
+            cwd_target = merged.get("target") or merged.get("session")
+            if cwd_target:
+                path = "/terminal/cwd?" + urlencode({"session": cwd_target})
+                merged["cwd"] = http.get(path).get("cwd")
+            else:
+                merged["cwd"] = None
+        panes.append(merged)
+
+    merged_response = dict(sessions_response)
+    merged_response["sessions"] = panes
+    return merged_response
+
+
+def _text(value: object) -> str:
+    if value is None or value == "":
+        return "-"
+    if isinstance(value, bool):
+        return str(value).lower()
+    return str(value)
+
+
+def _idle_text(value: object) -> str:
+    if value is None or value == "":
+        return "-"
+    try:
+        return f"{int(float(value))}s"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _display_rows(panes: list[dict], include_cwd: bool) -> list[list[str]]:
+    rows = []
+    for pane in panes:
+        name = pane.get("target") if pane.get("is_subpane") else pane.get("session")
+        row = [
+            _text(name),
+            _text(pane.get("state")),
+            _text(pane.get("agent_kind")),
+            _idle_text(pane.get("idle_seconds")),
+            _text(pane.get("command_display")),
+        ]
+        if include_cwd:
+            row.append(_text(pane.get("cwd")))
+        rows.append(row)
+    return rows
+
+
+def _print_aligned(rows: list[list[str]]) -> None:
+    if not rows:
+        return
+    widths = [max(len(row[index]) for row in rows) for index in range(len(rows[0]) - 1)]
+    for row in rows:
+        columns = [
+            value.ljust(widths[index]) if index < len(widths) else value
+            for index, value in enumerate(row)
+        ]
+        print("  ".join(columns))
+
+
+def list_sessions(json_output: bool = False, include_cwd: bool = False) -> int:
+    response = _merged_sessions(include_cwd=include_cwd)
+    if json_output:
+        print(json.dumps(response, indent=4))
+        return 0
+
+    rows = _display_rows(response.get("sessions") or [], include_cwd)
+    _print_aligned(rows)
+    if rows:
+        print_next_hint("ls", rows[0][0])
+    return 0
+
+
+def view(session: str | None, pane: str = "0.0", lines: int | None = None) -> int:
+    target = resolve_target(session, pane)
+    query = {"target": target}
+    if lines is not None:
+        query["lines"] = lines
+    response = http.get("/terminal/capture?" + urlencode(query))
+    content = response.get("content")
+    if content is not None:
+        sys.stdout.write(str(content))
+    print_next_hint("view", session)
+    return 0
+
+
+def launch(
+    session: str | None,
+    cwd: str | None = None,
+    cols: int | None = None,
+    rows: int | None = None,
+    wait_for_completion: bool = False,
+    timeout: float = wait_cli.DEFAULT_TIMEOUT,
+    role: str | None = None,
+    family: str | None = None,
+    against: str | None = None,
+    roster_path: Path | None = None,
+) -> int:
+    if not session:
+        resolve_target(session)
+    if role is None and (family is not None or against is not None):
+        print("assist: --family and --against require --role", file=sys.stderr)
+        raise SystemExit(2)
+
+    launch_command = None
+    if role is not None:
+        if roster_path is None:
+            raise ValueError("roster_path is required with role")
+        launch_command = roster_cli.resolve_command(
+            roster_cli.load(roster_path), role, family=family, against=against
+        )
+
+    payload: dict[str, object] = {
+        "project": session,
+        "skip_init": True,
+    }
+    if cwd is not None:
+        payload["cwd"] = cwd
+    if cols is not None:
+        payload["cols"] = cols
+    if rows is not None:
+        payload["rows"] = rows
+
+    response = http.post("/terminal/launch", payload)
+    for key in ("session", "target", "venv", "venv_activated", "existed"):
+        print(f"{key}: {_text(response.get(key))}")
+
+    if launch_command is not None and response.get("existed"):
+        print(
+            f"assist: session {response['session']} already exists "
+            f"(target {response['target']}); role command not sent — use assist send",
+            file=sys.stderr,
+        )
+        return 2
+
+    if wait_for_completion:
+        exit_code = wait_cli.run_wait(
+            response["session"],
+            response["target"],
+            timeout,
+            baseline_hash=None,
+        )
+        if exit_code != 0:
+            if launch_command is not None:
+                print(
+                    "assist: role command not sent (pane not idle after launch)",
+                    file=sys.stderr,
+                )
+            return exit_code
+    if launch_command is not None:
+        print(f"command: {launch_command}")
+        target = str(response["target"])
+        pane = target.split(":", 1)[1] if ":" in target else "0.0"
+        exit_code = send(
+            response["session"],
+            text=launch_command,
+            enter=True,
+            pane=pane,
+            wait_for_completion=True,
+            timeout=timeout,
+            autoyes=True,
+            show_next_hint=False,
+        )
+        if exit_code != 0:
+            return exit_code
+        print_role_launch_hint(response.get("session"))
+        return 0
+    print_next_hint("launch", response.get("session"))
+    return 0
+
+
+def send(
+    session: str | None,
+    text: str | None = None,
+    file_path: str | None = None,
+    enter: bool = False,
+    pane: str = "0.0",
+    wait_for_completion: bool = False,
+    timeout: float = wait_cli.DEFAULT_TIMEOUT,
+    autoyes: bool = False,
+    show_next_hint: bool = True,
+) -> int:
+    target = resolve_target(session, pane)
+    if autoyes and not wait_for_completion:
+        print("assist: --autoyes requires --wait", file=sys.stderr)
+        raise SystemExit(2)
+    if (text is None) == (file_path is None):
+        print(
+            "assist: exactly one of text or --file is required",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    if file_path == "-":
+        send_text = sys.stdin.read()
+    elif file_path is not None:
+        try:
+            send_text = Path(file_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            print(f"assist: unable to read {file_path}: {exc}", file=sys.stderr)
+            raise SystemExit(1) from None
+    else:
+        send_text = text
+
+    baseline_hash = None
+    if wait_for_completion:
+        baseline_hash = wait_cli.capture_hash(target)
+
+    response = http.post(
+        "/type",
+        {
+            "target": target,
+            "text": send_text,
+            "enter": enter,
+            "no_history": True,
+            "raw": True,
+        },
+    )
+    sent_chars = response.get("sent_chars")
+    if sent_chars is None:
+        sent_chars = 0
+    print(f"sent {sent_chars} chars to {target}", flush=True)
+    print_callback_hint(session)
+    if wait_for_completion:
+        exit_code = wait_cli.run_wait(
+            session,
+            target,
+            timeout,
+            baseline_hash,
+            autoyes=autoyes,
+        )
+        if exit_code != 0:
+            return exit_code
+    if show_next_hint:
+        print_next_hint("send", session)
+    return 0
+
+
+def _http_error_detail(error: http.ApiError) -> str:
+    try:
+        response = json.loads(error.body)
+    except (json.JSONDecodeError, TypeError):
+        response = {}
+    detail = response.get("error") if isinstance(response, dict) else None
+    if not detail:
+        detail = str(error)
+    return " ".join(str(detail).split())
+
+
+def kill(session: str | None, pane: str = "0.0") -> int:
+    """Kill a tmux session through Assist's existing terminal endpoint."""
+    resolve_target(session, pane)
+    try:
+        response = http.post("/terminal/kill", {"session": session})
+    except http.ApiError as exc:
+        if exc.kind != "http":
+            raise
+        print(f"assist: {_http_error_detail(exc)}", file=sys.stderr)
+        return exc.exit_code
+    print(f"killed {response.get('session') or session}")
+    return 0
+
+
+def _autoyes_state(response: dict, session: str) -> tuple[bool, object | None]:
+    enabled = bool((response.get("sessions") or {}).get(session))
+    delay = (response.get("delays") or {}).get(session)
+    return enabled, delay
+
+
+def _delay_text(delay: object | None) -> str:
+    if delay is None:
+        return "server default"
+    try:
+        return f"{float(delay):g}s"
+    except (TypeError, ValueError):
+        return str(delay)
+
+
+def _print_autoyes_state(
+    session: str,
+    enabled: bool,
+    delay: object | None,
+    global_on: bool = False,
+    global_delay: object | None = None,
+    source: str | None = None,
+) -> None:
+    # Say WHY it is on: under the global switch a session nobody touched reads
+    # "on", and "on (global…)" is the difference between that and a hand-armed
+    # session whose setting survives the switch being turned off. The delay is
+    # the global one either way while the switch is on.
+    if enabled and global_on and source == "global":
+        print(f"autoyes {session}: on (global, delay: {_delay_text(global_delay)})")
+    elif enabled and global_on:
+        print(f"autoyes {session}: on (set here, delay: {_delay_text(global_delay)})")
+    elif enabled:
+        print(f"autoyes {session}: on (delay: {_delay_text(delay)})")
+    elif global_on and source == "global":
+        # In scope for the switch but nothing to act on: the switch covers agent
+        # panes only, and this session has none. Not the same as an opt-out.
+        print(f"autoyes {session}: off (no agent pane)")
+    elif global_on:
+        print(f"autoyes {session}: off (opted out of global)")
+    else:
+        print(f"autoyes {session}: off")
+
+
+def _autoyes_global(mode: str, delay: float | None) -> int:
+    """Set or inspect the all-sessions switch."""
+    if mode != "status":
+        payload: dict[str, object] = {"enabled": mode == "on"}
+        if delay is not None:
+            payload["delay"] = delay
+        http.post("/autoyes/global", payload)
+    status = http.get("/autoyes/status")
+    block = status.get("global") or {}
+    if block.get("enabled"):
+        print(f"autoyes --global: on (delay: {_delay_text(block.get('delay'))})")
+        armed = sorted(s for s, on in (status.get("sessions") or {}).items() if on)
+        print(f"  armed sessions: {', '.join(armed) if armed else '(none live)'}")
+    else:
+        print("autoyes --global: off")
+    return 0
+
+
+def autoyes(
+    session: str | None,
+    mode: str,
+    delay: float | None = None,
+    global_switch: bool = False,
+) -> int:
+    """Persistently set or inspect auto-yes without accidentally re-toggling it."""
+    # Checked before the --global branch so the rule guards both forms.
+    if delay is not None and mode != "on":
+        print("assist: --delay requires --on", file=sys.stderr)
+        raise SystemExit(2)
+    if global_switch:
+        return _autoyes_global(mode, delay)
+    if not session:
+        resolve_target(session)
+
+    status = http.get("/autoyes/status")
+    global_block = status.get("global") or {}
+    global_on = bool(global_block.get("enabled"))
+    enabled, current_delay = _autoyes_state(status, session)
+    if mode != "status":
+        requested = mode == "on"
+        if enabled != requested:
+            payload: dict[str, object] = {"session": session, "enabled": requested}
+            # The global switch owns the delay; sending one would be ignored.
+            if requested and delay is not None and not global_on:
+                payload["delay"] = delay
+            http.post("/autoyes/set", payload)
+            status = http.get("/autoyes/status")
+            enabled, current_delay = _autoyes_state(status, session)
+
+    _print_autoyes_state(
+        session,
+        enabled,
+        current_delay,
+        global_on,
+        global_block.get("delay"),
+        (status.get("sources") or {}).get(session),
+    )
+    return 0

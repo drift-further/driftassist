@@ -1,0 +1,120 @@
+.toast-container {
+    position: fixed;
+    top: calc(var(--status-bar-h, 32px) + 4px);
+    left: 8px; right: 8px;
+    z-index: 200;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    pointer-events: none;
+}
+.toast {
+    padding: 10px 14px;
+    background: rgba(9, 12, 14, 0.95);
+    border-left: 3px solid var(--cyan);
+    font-family: var(--font);
+    font-size: 11px;
+    color: var(--text);
+    pointer-events: auto;
+    transform: translateY(-100%);
+    opacity: 0;
+    transition: transform 0.3s ease, opacity 0.3s ease;
+    cursor: pointer;
+    touch-action: pan-x;
+}
+.toast.visible { transform: translateY(0); opacity: 1; }
+.toast.toast-success { border-left-color: var(--green); }
+.toast.toast-error { border-left-color: var(--red); }
+.toast.swiped { transform: translateX(100%); opacity: 0; }
+
+/* Prompt popups (js/prompt-popup.js): sudo anywhere, agent prompts in tabs not
+   in view. Fixed, so they move no layout; the host passes touches through
+   everywhere except the cards. */
+.prompt-popup-host {
+    position: fixed;
+    top: calc(var(--status-bar-h, 32px) + 4px);
+    left: 8px; right: 8px;
+    z-index: 210;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 4px;
+    pointer-events: none;
+}
+.prompt-popup {
+    position: relative;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 6px;
+    width: 100%;
+    max-width: 420px;
+    padding: 5px 32px 7px 10px;
+    background: rgba(9, 12, 14, 0.96);
+    border: 1px solid rgba(225, 181, 106, 0.3);
+    border-left: 3px solid var(--amber);
+    font-family: var(--font);
+    font-size: 11px;
+    color: var(--text);
+    overflow: hidden;
+    pointer-events: auto;
+    touch-action: manipulation;
+    user-select: none;
+    -webkit-user-select: none;
+    opacity: 0;
+    transform: translateY(-6px);
+    transition: opacity 0.2s ease, transform 0.2s ease;
+}
+.prompt-popup.visible { opacity: 1; transform: none; }
+.prompt-popup.question { border-color: rgba(112, 174, 249, 0.3); border-left-color: var(--cyan); }
+.prompt-popup-text { flex: 1 1 160px; min-width: 0; }
+.prompt-popup-where,
+.prompt-popup-detail { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.prompt-popup-where { color: var(--amber); font-size: 10px; }
+.prompt-popup.question .prompt-popup-where { color: var(--cyan); }
+.prompt-popup-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 4px;
+    max-width: 100%;
+}
+.prompt-popup-actions button {
+    max-width: 16em;
+    height: 34px;
+    padding: 0 10px;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    background: transparent;
+    border: 1px solid;
+    border-radius: 3px;
+    font-family: var(--font);
+    font-size: 12px;
+    cursor: pointer;
+}
+.prompt-popup .pp-green { color: var(--green); border-color: rgba(131, 215, 162, 0.5); }
+.prompt-popup .pp-cyan { color: var(--cyan); border-color: rgba(112, 174, 249, 0.5); }
+.prompt-popup-close {
+    position: absolute;
+    top: 0; right: 0;
+    width: 30px; height: 30px;
+    padding: 0;
+    background: transparent;
+    border: none;
+    color: var(--text-dim);
+    font-family: var(--font);
+    font-size: 16px;
+    line-height: 30px;
+    cursor: pointer;
+}
+.prompt-popup-timer {
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    height: 2px;
+    background: var(--amber);
+    transform-origin: left;
+    animation: prompt-popup-countdown linear forwards;
+}
+.prompt-popup.question .prompt-popup-timer { background: var(--cyan); }
+@keyframes prompt-popup-countdown { from { transform: scaleX(1); } to { transform: scaleX(0); } }

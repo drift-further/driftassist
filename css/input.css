@@ -1,0 +1,257 @@
+/* input.css — Content area, textarea, flash overlay, action buttons, file attach, route indicator */
+
+.content {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 8px;
+    gap: 6px;
+    overflow: hidden;
+    position: relative;
+    z-index: 1;
+}
+
+/* Textarea */
+.input-wrap {
+    position: relative;
+    flex: 0 0 auto;
+    min-height: 80px;
+    max-height: 35dvh;
+}
+
+/* Keep the composer and its deck at a usable instrument width on desktops. */
+.input-wrap,
+.attach-bar,
+.btn-row,
+.route-indicator {
+    width: 100%;
+    max-width: 720px;
+    align-self: center;
+}
+/* The shared Drift launcher is injected at bottom-right. Reserve its 44px
+   footprint plus a gap only while the centered deck reaches that corner. */
+.btn-row {
+    padding-right: clamp(0px, calc(432px - 50vw), 64px);
+}
+#text-input {
+    width: 100%;
+    height: 100%;
+    min-height: 80px;
+    max-height: 35dvh;
+    padding: 14px;
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text-strong);
+    font-family: var(--font);
+    font-size: 15px;
+    line-height: 1.5;
+    resize: none;
+    outline: none;
+    caret-color: var(--coral-hi);
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+#text-input::placeholder { color: var(--text-muted); }
+#text-input:focus {
+    border-color: #3a4650;
+    box-shadow: none;
+}
+
+/* Flash overlay on textarea */
+.flash-overlay {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    pointer-events: none;
+    opacity: 0;
+    border-radius: 8px;
+    transition: opacity 0.2s;
+    z-index: 2;
+}
+.flash-overlay.sent {
+    background: rgba(131, 215, 162, 0.1);
+    color: var(--green);
+    border: 1px solid var(--green);
+}
+.flash-overlay.copied {
+    background: rgba(112, 174, 249, 0.1);
+    color: var(--cyan);
+    border: 1px solid var(--cyan);
+}
+.flash-overlay.error {
+    background: rgba(242, 87, 103, 0.1);
+    color: var(--red);
+    border: 1px solid var(--red);
+}
+.flash-overlay.uploading { background: rgba(225, 181, 106, 0.1); color: var(--amber); border: 1px solid var(--amber); }
+.flash-overlay.show { opacity: 1; }
+
+/* Action buttons */
+.btn-row {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+.action-btn {
+    flex: 1;
+    height: 44px;
+    border: 1px solid;
+    border-radius: 6px;
+    background: var(--bg-card);
+    font-family: var(--font);
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.3px;
+    cursor: pointer;
+    transition: all 0.15s;
+    -webkit-tap-highlight-color: transparent;
+}
+.action-btn:active { transform: scale(0.96); }
+/* Send is the one solid coral action in the composer. */
+.btn-paste { color: #fff; font-weight: 700; border-color: var(--coral); background: var(--coral); }
+.btn-paste:active { background: #d23a21; border-color: #d23a21; }
+.btn-upload { color: var(--text); border-color: var(--border); }
+.btn-upload:active { background: var(--bg-selected); border-color: #3a4650; }
+
+/* Enter lock — per tab, armed by default.
+   Armed is the status quo and stays quiet; DISARMED is the state that changes
+   what a keypress does, so that is the one that lights up. The glyph is struck
+   through when disarmed: Enter no longer submits. Fixed width rather than
+   flex:1 so the five labelled buttons keep their room at 390px. */
+.btn-enter-lock {
+    flex: 0 0 40px;
+    position: relative;
+    font-size: 17px;
+    letter-spacing: 0;
+    color: var(--text-dim);
+    border-color: var(--border);
+}
+.btn-enter-lock:active { background: rgba(182, 156, 242, 0.12); }
+.btn-enter-lock.unlocked {
+    color: var(--purple);
+    border-color: rgba(182, 156, 242, 0.55);
+    background: rgba(182, 156, 242, 0.1);
+    box-shadow: 0 0 10px rgba(182, 156, 242, 0.22);
+}
+/* The strike is a pseudo-element on the button, not a character, so the glyph
+   itself stays crisp at 17px in a monospace face. */
+.btn-enter-lock.unlocked::after {
+    content: '';
+    position: absolute;
+    left: 22%;
+    right: 22%;
+    top: 50%;
+    height: 1px;
+    background: currentColor;
+    transform: rotate(-20deg);
+}
+
+/* One compact slot in the existing row, never a new mobile band. It exists only
+   while the active pane is waiting for the matching vault entry. The visible
+   handle needs a little more than the old one-glyph key, but still shares the
+   same 44px-high row on a phone. */
+.btn-vault {
+    flex: 0 0 auto;
+    min-width: 54px;
+    padding: 0 7px;
+    font-size: 11px;
+    letter-spacing: 0.5px;
+    text-transform: none;
+    color: var(--purple);
+    border-color: rgba(182, 156, 242, 0.55);
+    background: rgba(182, 156, 242, 0.1);
+}
+.btn-vault.hidden { display: none; }
+.btn-vault:active { background: rgba(182, 156, 242, 0.24); }
+
+/* File attach bar */
+/* One chip per attached file, scrolling sideways so N files never cost a second
+   row of height on a phone. */
+.attach-bar {
+    display: none; align-items: center; gap: 6px; padding: 6px 8px;
+    border-radius: 8px;
+    background: rgba(225, 181, 106, 0.06); border: 1px solid rgba(225, 181, 106, 0.25);
+    flex-shrink: 0; animation: fadeSlide 0.2s ease-out;
+    overflow-x: auto; white-space: nowrap; scrollbar-width: none;
+}
+.attach-bar::-webkit-scrollbar { display: none; }
+.attach-bar.visible { display: flex; }
+@keyframes upload-pulse {
+    0%, 100% { background: rgba(225, 181, 106, 0.06); }
+    50% { background: rgba(225, 181, 106, 0.15); }
+}
+.attach-chip {
+    display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0;
+    padding: 3px 4px 3px 8px;
+    border-radius: 6px;
+    background: rgba(225, 181, 106, 0.08); border: 1px solid rgba(225, 181, 106, 0.35);
+    max-width: 62vw;
+}
+.attach-chip.uploading { animation: upload-pulse 1s ease-in-out infinite; }
+.attach-chip-name { font-size: 11px; font-weight: 600; color: var(--amber); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; letter-spacing: 0.3px; }
+.attach-chip-size { font-size: 9px; color: var(--text-dim); flex-shrink: 0; letter-spacing: 0.5px; }
+.attach-remove {
+    width: 28px; height: 28px; border: 1px solid rgba(242, 87, 103, 0.3); background: transparent;
+    color: var(--red); font-size: 16px; font-family: var(--font); cursor: pointer;
+    display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+    -webkit-tap-highlight-color: transparent;
+}
+.attach-remove:active { background: rgba(242, 87, 103, 0.15); transform: scale(0.9); }
+
+/* Route indicator */
+.route-indicator {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0;
+    flex-shrink: 0;
+}
+.route-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.route-dot.tmux { background: var(--cyan); box-shadow: 0 0 6px var(--cyan); }
+.route-dot.desktop { background: var(--amber); box-shadow: 0 0 6px var(--amber); }
+.route-label { font-size: 9px; font-weight: 500; letter-spacing: 1px; color: var(--text-dim); }
+/* The attach hint is a copy button: quiet at rest, legible the moment you
+   reach for it. Touch has no hover, so the dotted underline carries the
+   affordance there and :active does the confirming. */
+.route-attach {
+    font-family: inherit;
+    font-size: 9px;
+    color: var(--text-dim);
+    opacity: 0.55;
+    margin-left: auto;
+    padding: 3px 6px;
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    border-bottom-style: dotted;
+    border-bottom-color: rgba(141, 149, 155, 0.6);
+    cursor: pointer;
+    white-space: nowrap;
+    transition: opacity 0.15s, color 0.15s, background 0.15s, border-color 0.15s;
+    -webkit-tap-highlight-color: transparent;
+}
+.route-attach:empty { display: none; }
+.route-attach:hover, .route-attach:focus-visible {
+    opacity: 1;
+    color: var(--cyan);
+    background: rgba(112, 174, 249, 0.1);
+    border-color: rgba(112, 174, 249, 0.35);
+    outline: none;
+}
+.route-attach:active {
+    background: rgba(112, 174, 249, 0.18);
+    transform: scale(0.97);
+}
+.route-attach.copied {
+    opacity: 1;
+    color: var(--green);
+    background: rgba(131, 215, 162, 0.12);
+    border-color: rgba(131, 215, 162, 0.4);
+}

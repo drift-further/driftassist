@@ -1,0 +1,142 @@
+// state.js — Global variables, constants, and DOM refs
+// Loaded first; all other modules depend on these globals.
+
+// Settings — fetched from /api/settings on load, updated on save.
+// The one place the launch-mode → command mapping is written. It mirrors
+// CLAUDE_COMMANDS in shared/state.py; keep the two in step if a mode is added.
+const CLAUDE_COMMANDS = { npx: 'npx @anthropic-ai/claude-code', claude: 'claude' };
+
+function claudeCmdForMode(mode) {
+    return CLAUDE_COMMANDS[mode] || CLAUDE_COMMANDS.npx;
+}
+
+let SETTINGS = null;  // populated by loadSettings()
+let CLAUDE_CMD = CLAUDE_COMMANDS.npx;  // default until settings load
+let _serverPid = null;
+let _serverUptime = 0;
+
+async function loadSettings() {
+    try {
+        const r = await fetch('/api/settings');
+        if (r.ok) {
+            const d = await r.json();
+            SETTINGS = d.settings;
+            _serverPid = d.pid;
+            _serverUptime = d.uptime;
+            CLAUDE_CMD = claudeCmdForMode(SETTINGS.server.claude_mode);
+            // Automate and Container ship hidden (index.html) and appear only
+            // once the server says their execution intents are no longer parked.
+            if (d.parked === false) {
+                document.querySelectorAll('[data-parked]').forEach(el => { el.style.display = ''; });
+            }
+        }
+    } catch(e) {}
+}
+
+// Load on startup
+loadSettings();
+
+const input = document.getElementById('text-input');
+const flash = document.getElementById('flash');
+const dot = document.getElementById('status-dot');
+const statusTime = document.getElementById('status-time');
+const listArea = document.getElementById('list-area');
+const tmuxInd = document.getElementById('tmux-ind');
+const routeDot = document.getElementById('route-dot');
+const routeLabel = document.getElementById('route-label');
+const routeAttach = document.getElementById('route-attach');
+
+let lastAction = null;
+let _history = [];
+let _favorites = [];
+let _filterText = '';
+
+// Terminal state
+let _termOpen = true;           // always open in drawer layout
+let _termTarget = null;         // active tmux target
+let _termExpectedIdentity = null; // server-selected identity from bare launch
+let _termPaused = false;        // scroll-freeze
+let _termLines = 2000;          // scrollback depth (10x default)
+let _termPollTimer = null;
+let _termLatestContent = '';    // stored when paused
+let _termHasNew = false;
+let _termLastContent = '';      // last displayed content
+let _termProjects = [];
+let _termShowProjects = false;
+
+// WebSocket state
+let _termWs = null;             // WebSocket instance
+let _termWsConnected = false;   // true when WS is active
+let _termWsReconnectTimer = null;
+
+// Smart actions state — per-target so background-pane scans can't reset
+// the active pane's dismissal, and vice versa.
+let _smartState = {};           // target -> { key, dismissedContent (ANSI-stripped) }
+let _smartActionTarget = null;  // which pane the smart action came from (main or split)
+
+function _getSmartState(target) {
+    const t = target || _termTarget || '';
+    if (!_smartState[t]) _smartState[t] = { key: '', dismissedContent: null };
+    return _smartState[t];
+}
+let _layoutShifting = false;    // true during smart-actions show/hide to suppress scroll-freeze
+
+// Input routing: when true, keyboard input goes to split pane instead of main
+let _inputToSplit = false;
+
+function getInputTarget() {
+    if (_inputToSplit) {
+        const session = _termTarget ? _termTarget.split(':')[0] : '';
+        const state = _splitPanes[session];
+        if (state) return state.target;
+    }
+    return _termTarget;
+}
+
+// Session state
+let _sessionPanes = [];
+let _sessionPrompts = {};       // target -> true if prompt detected
+let _paneModelLast = {};        // target -> last model_changed_at this page has rendered
+let _sessionStates = {};        // target -> { state, since, prevState }
+
+// Input state
+let _sending = false;
+// Attachments for the message being composed. Each entry uploads on attach, so
+// it carries {id, name, size, path, uploading}; the tray clears on send.
+let _attachments = [];
+
+// Notification state
+let _notifPermission = typeof Notification !== 'undefined' ? Notification.permission : 'denied';
+let _notifSentFor = {};         // target -> last notified tail hash
+
+// Saved commands state
+let _splitPanes = {};              // session -> { target, ws, wsConnected, lastContent, label }
+let _cmdPanelOpen = false;
+let _cmdOutputOpen = false;
+let _currentCommands = [];
+let _currentCommandsProject = '';
+
+// Content-based activity detection (more reliable than tmux session_activity)
+let _activityDecayTimers = {};  // target -> setTimeout id
+let _lastScanContent = {};      // target -> last scanned tail (for change detection)
+
+// Per-project automation settings
+let _projectSettings = null;
+let _projectSettingsName = '';
+let _projSettingsOpen = false;
+
+// Idle fade: suppress for first few poll cycles so content detection can establish baseline
+const _pageLoadedAt = Date.now();
+
+// A 401 means this browser's sign-in is gone: the token was rotated or the
+// cookie cleared. Without this every open tab sat on a frozen terminal with a
+// red dot and no way back. Returns true when it has sent the page to /login.
+let _authRedirecting = false;
+function authLost(resp) {
+    if (!resp || resp.status !== 401) return false;
+    if (!_authRedirecting) {
+        _authRedirecting = true;
+        location.replace('/login');
+    }
+    return true;
+}

@@ -1,0 +1,247 @@
+"""routes/commands.py — Skills, saved commands, split pane management."""
+
+import json
+import subprocess
+import threading
+import time
+
+from flask import Blueprint, jsonify, request
+
+import shared.state as state
+from shared import execution_park as park
+from shared.tmux import (
+    activate_venv,
+    create_tmux_split,
+    pane_tab_target,
+    tmux_exact_target,
+    tmux_send_keys,
+    tmux_send_text,
+)
+
+commands_bp = Blueprint("commands_bp", __name__)
+
+
+def _parse_skill_frontmatter(text):
+    """Extract YAML frontmatter (name, description) from a SKILL.md file."""
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return {}
+    meta = {}
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        if ":" in line:
+            key, _, value = line.partition(":")
+            meta[key.strip()] = value.strip()
+    return meta
+
+
+def _scan_skills_dir(skills_dir, source="project"):
+    """Scan a .claude/skills/ directory and return list of skill dicts."""
+    skills = []
+    if not skills_dir.is_dir():
+        return skills
+    for entry in sorted(skills_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+        skill_file = entry / "SKILL.md"
+        if not skill_file.exists():
+            continue
+        try:
+            meta = _parse_skill_frontmatter(skill_file.read_text())
+            if meta.get("name"):
+                skills.append(
+                    {
+                        "name": meta["name"],
+                        "description": meta.get("description", ""),
+                        "source": source,
+                    }
+                )
+        except Exception:
+            continue
+    return skills
+
+
+@commands_bp.route("/api/skills/<project>")
+def get_skills(project):
+    """List skills from project .claude/skills/ + global ~/.claude/skills/."""
+    project_path = state.PROJECTS_DIR / project
+    if not project_path.is_dir():
+        return jsonify({"ok": False, "error": "Project not found"}), 404
+
+    project_skills = _scan_skills_dir(
+        project_path / ".claude" / "skills", source="project"
+    )
+    project_names = {s["name"] for s in project_skills}
+
+    global_skills = [
+        s
+        for s in _scan_skills_dir(state.GLOBAL_SKILLS_DIR, source="global")
+        if s["name"] not in project_names
+    ]
+
+    return jsonify({"ok": True, "skills": project_skills + global_skills})
+
+
+@commands_bp.route("/api/commands/<project>", methods=["GET"])
+def get_commands(project):
+    """Read .assist-commands.json from a project root."""
+    project_path = state.PROJECTS_DIR / project
+    if not project_path.is_dir():
+        return jsonify({"ok": False, "error": "Project not found"}), 404
+    cmd_file = project_path / ".assist-commands.json"
+    if not cmd_file.exists():
+        return jsonify({"ok": True, "commands": []})
+    try:
+        data = json.loads(cmd_file.read_text())
+        return jsonify({"ok": True, "commands": data.get("commands", [])})
+    except (json.JSONDecodeError, OSError) as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@commands_bp.route("/api/commands/<project>", methods=["POST"])
+def save_commands(project):
+    """Save commands array to .assist-commands.json in project root."""
+    project_path = state.PROJECTS_DIR / project
+    if not project_path.is_dir():
+        return jsonify({"ok": False, "error": "Project not found"}), 404
+    data = request.get_json(silent=True) or {}
+    commands = data.get("commands", [])
+    cmd_file = project_path / ".assist-commands.json"
+    try:
+        state.atomic_write_json(cmd_file, {"commands": commands})
+        return jsonify({"ok": True})
+    except OSError as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@commands_bp.route("/api/commands/run", methods=["POST"])
+def run_command():
+    """Run a command in a tmux split pane alongside the main session."""
+    result = park.perform(park.Intent.SAVED_COMMAND, _run_command_effect)
+    if park.is_refusal(result):
+        return jsonify(result.body()), result.http_status
+    return result
+
+
+# session name -> pane id of the split /api/commands/run created there. Stop,
+# rerun and the alive check act on this pane only. It used to be `session:0.1`,
+# which is the MAIN pane under pane-base-index 1, a split the user made
+# themselves at tmux's defaults, and nothing at all under base-index 1. In
+# memory: after a restart there is no command pane to kill, which is the safe
+# way to forget one.
+_command_panes = {}
+_command_panes_lock = threading.Lock()
+
+
+def rename_command_pane(old, new):
+    """Carry a session's command pane across a rename (see on_session_renamed)."""
+    with _command_panes_lock:
+        if old in _command_panes:
+            _command_panes[new] = _command_panes.pop(old)
+
+
+def _pane_in_session(pane_id, session):
+    """True when `pane_id` is alive and still belongs to `session`."""
+    proc = subprocess.run(
+        ["tmux", "display-message", "-p", "-t", pane_id,
+         "#{pane_id}\t#{session_name}"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    # display-message exits 0 with empty fields for a missing pane, so check
+    # the id came back rather than trusting the return code.
+    return proc.returncode == 0 and proc.stdout.rstrip("\n") == f"{pane_id}\t{session}"
+
+
+def _kill_command_pane(session):
+    """Kill the split this route created in `session`, and nothing else."""
+    with _command_panes_lock:
+        pane_id = _command_panes.pop(session, None)
+    if not pane_id or not _pane_in_session(pane_id, session):
+        return True, ""
+    proc = subprocess.run(
+        ["tmux", "kill-pane", "-t", pane_id],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    return proc.returncode == 0, proc.stderr
+
+
+def _run_command_effect():
+    """Complete saved/request command unit under the decision lock."""
+    data = request.get_json(silent=True) or {}
+    session = (data.get("session") or "").strip()
+    cmd = (data.get("cmd") or "").strip()
+    project = (data.get("project") or "").strip()
+
+    if not session or not cmd:
+        return jsonify({"ok": False, "error": "session and cmd required"}), 400
+
+    _kill_command_pane(session)
+    time.sleep(0.1)
+
+    created = create_tmux_split(
+        target=tmux_exact_target(session),
+        height="30%",
+        surface="saved_command_split",
+        diagnostic_alias=f"{session}:",
+    )
+    if not created.ok:
+        return (
+            jsonify({"ok": False, "error": created.status}),
+            500,
+        )
+    delivery_target = created.identity.pane_id
+    with _command_panes_lock:
+        _command_panes[session] = delivery_target
+
+    if project:
+        project_path = state.PROJECTS_DIR / project
+        if project_path.is_dir():
+            activate_venv(delivery_target, project_path)
+
+    tmux_send_text(delivery_target, cmd)
+    tmux_send_keys(delivery_target, "Enter")
+
+    return jsonify(
+        {
+            "ok": True,
+            "target": pane_tab_target(delivery_target),
+            "pane_id": delivery_target,
+        }
+    )
+
+
+@commands_bp.route("/api/commands/stop", methods=["POST"])
+def stop_command():
+    """Kill the split pane /api/commands/run created in a session."""
+    return park.perform(park.Intent.STOP, _stop_command_effect)
+
+
+def _stop_command_effect():
+    """Stop the exact command pane under the decision lock."""
+    data = request.get_json(silent=True) or {}
+    session = (data.get("session") or "").strip()
+    if not session:
+        return jsonify({"ok": False, "error": "session required"}), 400
+
+    ok, stderr = _kill_command_pane(session)
+    if not ok:
+        return (
+            jsonify({"ok": False, "error": f"kill-pane failed: {stderr}"}),
+            500,
+        )
+    return jsonify({"ok": True})
+
+
+@commands_bp.route("/api/commands/pane/<session>")
+def check_split_pane(session):
+    """Check whether the command split /api/commands/run created still exists."""
+    with _command_panes_lock:
+        pane_id = _command_panes.get(session)
+    exists = bool(pane_id) and _pane_in_session(pane_id, session)
+    target = pane_tab_target(pane_id) if exists else None
+    return jsonify({"ok": True, "exists": exists, "target": target})

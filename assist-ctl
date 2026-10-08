@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+#
+# assist-ctl — Process control for the Drift Assist server.
+#
+set -euo pipefail
+umask 077
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SERVE_SCRIPT="$SCRIPT_DIR/serve.py"
+
+# Use project-local venv if it exists, otherwise system python3
+if [[ -x "$SCRIPT_DIR/.venv/bin/python" ]]; then
+    PYTHON="$SCRIPT_DIR/.venv/bin/python"
+else
+    PYTHON="python3"
+fi
+
+# Park activation is sealed by bin/assist and must not source a checkout .env
+# or otherwise allow ambient configuration to replace one attempt path midway.
+if [[ "${1:-}" == "activate-park-v16" ]]; then
+    if [[ "${2:-}" == "--resume" ]]; then
+        exec "$PYTHON" -m shared.park_activation resume
+    fi
+    if [[ $# -ne 1 ]]; then
+        echo "Usage: assist-ctl activate-park-v16 [--resume]" >&2
+        exit 1
+    fi
+    exec "$PYTHON" -m shared.park_activation controller
+fi
+
+# Load .env if present -- BEFORE any path or port is computed, so a port or
+# log path set only in .env is honoured when this script is run directly.
+if [[ -f "$SCRIPT_DIR/.env" ]]; then
+    set -a
+    source "$SCRIPT_DIR/.env"
+    set +a
+fi
+
+# Per-user state, not a shared /tmp name: a second checkout, or a second user,
+# must not read or kill this server through the same PID file. cli/config.py
+# computes the same defaults; tests/test_install_paths.py keeps them in step.
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/drift-assist"
+PORT="${ASSIST_PORT:-8089}"
+PID_FILE="${ASSIST_PID_FILE:-$STATE_DIR/assist.pid}"
+LOG_FILE="${ASSIST_LOG_FILE:-$STATE_DIR/assist.log}"
+LOG_MAX_BYTES="${ASSIST_LOG_MAX_BYTES:-10485760}"
+# The pre-XDG default. A server started before the move is adopted only when
+# its command line runs THIS checkout's serve.py, so another checkout's server
+# is never stopped from here.
+LEGACY_PID_FILE="${ASSIST_LEGACY_PID_FILE:-/tmp/assist-server.pid}"
+
+ensure_state_dirs() {
+    mkdir -p "$(dirname "$PID_FILE")" "$(dirname "$LOG_FILE")"
+    if [[ "$PID_FILE" == "$STATE_DIR/"* || "$LOG_FILE" == "$STATE_DIR/"* ]]; then
+        chmod 700 "$STATE_DIR"
+    fi
+}
+
+# Size rotation at start: one previous generation kept as <log>.1.
+rotate_log() {
+    local size
+    [[ -f "$LOG_FILE" ]] || return 0
+    size="$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)"
+    if [[ "${size// /}" -gt "$LOG_MAX_BYTES" ]]; then
+        mv -f "$LOG_FILE" "$LOG_FILE.1"
+    fi
+}
+
+# The same script under its physical path, for a checkout reached through a symlink.
+SERVE_SCRIPT_REAL="$(cd -P "$SCRIPT_DIR" && pwd)/serve.py"
+
+# /proc keeps argv's NUL boundaries. Where there is none (macOS), `ps` joins
+# argv with spaces, so that text is matched as a whole rather than split: a
+# checkout path may itself contain spaces. ASSIST_PROC_ROOT exists for tests.
+PROC_ROOT="${ASSIST_PROC_ROOT:-/proc}"
+
+is_python() {
+    local base="${1##*/}"
+    [[ "$base" =~ ^[Pp]ython(3(\.[0-9]+)?)?$ ]]
+}
+
+# True when $1 names this checkout's serve.py, by the path given or its
+# physical path (a checkout reached through a symlink).
+is_our_script() {
+    [[ "$1" == "$SERVE_SCRIPT" || "$1" == "$SERVE_SCRIPT_REAL" ]] && return 0
+    local dir
+    dir="$(cd -P "$(dirname "$1")" 2>/dev/null && pwd)" || return 1
+    [[ "$dir/${1##*/}" == "$SERVE_SCRIPT_REAL" ]]
+}
+
+# ours | foreign | stale from a boundary-preserving argv: a Python interpreter
+# as the executable, and serve.py in the script position right after it. A
+# reader or editor holding the same path (`tail -f .../serve.py`) is stale.
+owner_from_argv() {
+    (( $# >= 2 )) && is_python "$1" || { echo "stale"; return; }
+    if is_our_script "$2"; then
+        echo "ours"
+    elif [[ "$2" == */serve.py ]]; then
+        echo "foreign"
+    else
+        echo "stale"
+    fi
+}
+
+# Without /proc (macOS), `ps` flattens argv into one space-joined string, so
+# nothing is inferred from it. The EXPECTED invocations are built from known
+# paths instead -- this checkout's interpreter (the venv python, its resolved
+# path, or the python3 fallback this script uses without a venv) followed by
+# exactly this checkout's serve.py (as given or physical) -- and the text must
+# EQUAL one of them or continue with a known server flag. Anything else that
+# runs some serve.py with --port is another checkout's; the rest is stale.
+real_path() {
+    realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null || echo "$1"
+}
+
+owner_from_command() {
+    local cmd="$1" interp script expected
+    local venv_python="$SCRIPT_DIR/.venv/bin/python"
+    for interp in "$venv_python" "$(real_path "$venv_python")" \
+            "$(cd -P "$SCRIPT_DIR" && pwd)/.venv/bin/python" "python3"; do
+        for script in "$SERVE_SCRIPT" "$SERVE_SCRIPT_REAL"; do
+            expected="$interp $script"
+            if [[ "$cmd" == "$expected" || "$cmd" == "$expected --port "* \
+                    || "$cmd" == "$expected --park-handoff-fd "* ]]; then
+                echo "ours"
+                return
+            fi
+        done
+    done
+    if [[ "$cmd" == *"/serve.py --port "* ]]; then
+        echo "foreign"
+    else
+        echo "stale"
+    fi
+}
+
+# Who a recorded PID belongs to, checked on EVERY read and again just before a
+# signal: "ours" only when the process IS this checkout's server invocation;
+# "foreign" when it runs another checkout's serve.py; "stale" when it is dead
+# or a reused PID running anything else.
+pid_owner() {
+    local pid="$1"
+    if [[ ! "$pid" =~ ^[0-9]+$ ]] || ! kill -0 "$pid" 2>/dev/null; then
+        echo "stale"
+        return
+    fi
+    if [[ -r "$PROC_ROOT/$pid/cmdline" ]]; then
+        local -a argv=()
+        local arg
+        while IFS= read -r -d '' arg; do
+            argv+=("$arg")
+        done < "$PROC_ROOT/$pid/cmdline"
+        owner_from_argv "${argv[@]}"
+    else
+        owner_from_command "$(ps -ww -o args= -p "$pid" 2>/dev/null || true)"
+    fi
+}
+
+# Sets REC_PID and REC_OWNER (none | stale | foreign | ours). No subshell, so
+# the legacy migration below happens once, in this process.
+load_record() {
+    REC_PID=""
+    REC_OWNER="none"
+    if [[ -f "$PID_FILE" ]]; then
+        REC_PID="$(tr -dc '0-9' < "$PID_FILE" 2>/dev/null || true)"
+        REC_OWNER="$(pid_owner "$REC_PID")"
+    fi
+    if [[ "$REC_OWNER" == "none" || "$REC_OWNER" == "stale" ]] \
+            && [[ -z "${ASSIST_PID_FILE:-}" && -f "$LEGACY_PID_FILE" ]]; then
+        local legacy
+        legacy="$(tr -dc '0-9' < "$LEGACY_PID_FILE" 2>/dev/null || true)"
+        if [[ "$(pid_owner "$legacy")" == "ours" ]]; then
+            # Migrate: from here on the per-user path is the only record.
+            ensure_state_dirs
+            echo "$legacy" > "$PID_FILE"
+            rm -f "$LEGACY_PID_FILE"
+            REC_PID="$legacy"
+            REC_OWNER="ours"
+        fi
+    fi
+}
+
+refuse_foreign() {
+    echo "PID file $PID_FILE records PID $REC_PID, which runs another checkout's serve.py." >&2
+    echo "Not touching it. Give this checkout its own ASSIST_PID_FILE and ASSIST_LOG_FILE in .env." >&2
+    return 1
+}
+
+is_alive() {
+    local pid="$1"
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+health_check() {
+    curl -sf --max-time 3 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1
+}
+
+do_start() {
+    load_record
+    case "$REC_OWNER" in
+        ours)    echo "Assist server already running (PID $REC_PID)"; return 0 ;;
+        foreign) refuse_foreign; return 1 ;;
+    esac
+
+    ensure_state_dirs
+    rotate_log
+    echo "Starting Assist server..."
+    nohup "$PYTHON" "$SERVE_SCRIPT" --port "$PORT" >> "$LOG_FILE" 2>&1 &
+    local new_pid=$!
+    echo "$new_pid" > "$PID_FILE"
+
+    # Wait for server to become healthy (up to 10 seconds)
+    local tries=0
+    while [[ $tries -lt 20 ]]; do
+        if health_check; then
+            echo "Started (PID $new_pid) on port $PORT"
+            echo "  Log: $LOG_FILE"
+            return 0
+        fi
+        if ! is_alive "$new_pid"; then
+            echo "Server process exited unexpectedly. Check log: $LOG_FILE"
+            tail -5 "$LOG_FILE" 2>/dev/null
+            return 1
+        fi
+        sleep 0.5
+        tries=$((tries + 1))
+    done
+    echo "Started (PID $new_pid) but not yet healthy on port $PORT"
+    echo "  Log: $LOG_FILE"
+}
+
+do_stop() {
+    load_record
+    case "$REC_OWNER" in
+        foreign) refuse_foreign; return 1 ;;
+        ours) ;;
+        *)
+            # Check if something is on the port anyway
+            if health_check; then
+                echo "No PID file but server responding on port $PORT — find and kill manually"
+                return 1
+            fi
+            echo "Assist server is not running."
+            if [[ "$REC_OWNER" == "stale" ]]; then
+                rm -f "$PID_FILE"
+            fi
+            return 0
+            ;;
+    esac
+
+    # Re-check at the last moment: the process could have exited and its PID
+    # been reused since load_record looked.
+    if [[ "$(pid_owner "$REC_PID")" != "ours" ]]; then
+        echo "PID $REC_PID no longer runs this checkout's server; not signalling it."
+        rm -f "$PID_FILE"
+        return 0
+    fi
+    kill "$REC_PID" 2>/dev/null || true
+    rm -f "$PID_FILE"
+    echo "Stopped (PID $REC_PID)"
+}
+
+do_restart() {
+    do_stop || return 1
+    sleep 1
+    do_start
+}
+
+do_status() {
+    load_record
+
+    if [[ "$REC_OWNER" == "ours" ]]; then
+        if health_check; then
+            echo "Assist server is running (PID $REC_PID) — healthy"
+        else
+            echo "Assist server process alive (PID $REC_PID) — NOT responding on /health"
+        fi
+        echo "  Port: $PORT"
+        echo "  Log:  $LOG_FILE"
+    elif [[ "$REC_OWNER" == "foreign" ]]; then
+        echo "Assist server is not running from this checkout."
+        echo "  $PID_FILE records PID $REC_PID, another checkout's server."
+    else
+        if health_check; then
+            echo "Assist server responding on port $PORT but PID file stale/missing"
+        else
+            echo "Assist server is not running."
+        fi
+    fi
+}
+
+# Foreground run for a service manager (systemd --user, launchd): the manager
+# owns the process, so no PID file; output still goes to the rotated log that
+# `assist logs` reads.
+do_run() {
+    ensure_state_dirs
+    rotate_log
+    exec >> "$LOG_FILE" 2>&1
+    exec "$PYTHON" "$SERVE_SCRIPT" --port "$PORT"
+}
+
+case "${1:-help}" in
+    start)   do_start ;;
+    run)     do_run ;;
+    owner)   pid_owner "${2:-}" ;;  # read-only: ours | foreign | stale (tests use it)
+    paths)   printf 'port=%s\npid_file=%s\nlog_file=%s\nbind=%s\n' "$PORT" "$PID_FILE" "$LOG_FILE" "${ASSIST_BIND:-}" ;;
+    stop)    do_stop ;;
+    restart) do_restart ;;
+    status)  do_status ;;
+    *)
+        echo "Usage: assist-ctl {start|stop|restart|status|run|paths}"
+        echo ""
+        echo "Environment variables (or set in .env):"
+        echo "  ASSIST_PORT           Port (default: 8089)"
+        echo "  ASSIST_BIND           Extra LAN address to listen on (see: assist expose)"
+        echo "  ASSIST_PID_FILE       PID file (default: \$XDG_STATE_HOME/drift-assist/assist.pid)"
+        echo "  ASSIST_LOG_FILE       Log file (default: \$XDG_STATE_HOME/drift-assist/assist.log)"
+        echo "  ASSIST_PROJECTS_DIR   Projects root directory"
+        echo "  ASSIST_CLI_BIN        Path to CLI binary for proxy"
+        echo "  ASSIST_CLI_DIR        CLI working directory"
+        echo "  ASSIST_MOUNT_SCRIPT   Path to claude-direct-mount.sh"
+        exit 1
+        ;;
+esac

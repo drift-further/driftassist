@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# Drift Assist download installer. Generated for one reviewed source revision.
+# Download, inspect, then run with Bash. No sudo or server restart is performed.
+set -euo pipefail
+umask 077
+
+REVISION=@REVISION@
+REPOSITORY=@REPOSITORY@
+BRANCH=@BRANCH@
+PREFIX="${XDG_DATA_HOME:-$HOME/.local/share}/drift-assist"
+INSTALL_OPTIONS=()
+
+fail() { printf 'Assist installer: %s\n' "$*" >&2; exit 1; }
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --prefix)
+            [[ $# -ge 2 && -n "$2" ]] || fail '--prefix requires a directory'
+            PREFIX="$2"; shift 2 ;;
+        --check|--non-interactive|--no-integrations|--dependencies-only|--replace-command)
+            INSTALL_OPTIONS+=("$1"); shift ;;
+        -h|--help)
+            cat <<HELP
+Usage: bash install.sh [--prefix DIR] [installer options]
+Downloads reviewed revision $REVISION from $REPOSITORY.
+Default directory: \${XDG_DATA_HOME:-\$HOME/.local/share}/drift-assist
+Options: --check --non-interactive --no-integrations --dependencies-only --replace-command
+An existing installation is reused without pulling or replacing its source.
+Use assist update for updates; restart remains a separate action.
+HELP
+            exit 0 ;;
+        *) fail "Unknown option: $1" ;;
+    esac
+done
+
+command -v python3 >/dev/null || fail 'Python 3.10+ is required'
+python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' || fail 'Python 3.10+ is required'
+command -v git >/dev/null || fail 'Git is required to download Assist'
+[[ "$REVISION" =~ ^[a-f0-9]{40}$ || "$REVISION" =~ ^[a-f0-9]{64}$ ]] || fail 'No valid reviewed revision is configured'
+git check-ref-format "refs/heads/$BRANCH" >/dev/null || fail 'Invalid update branch'
+PREFIX="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$PREFIX")"
+[[ ! -L "$PREFIX" ]] || fail 'The installation directory is a symlink; choose its physical directory with --prefix'
+
+export GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=Never
+export GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=10'
+
+validate_source() {
+    local directory="$1"
+    for required in install.sh serve.py bin/assist requirements.lock; do
+        [[ -f "$directory/$required" ]] || fail "Incomplete Assist source: missing $required"
+    done
+}
+
+if [[ -e "$PREFIX" ]]; then
+    [[ -d "$PREFIX" ]] || fail 'The installation destination is not a directory'
+    root="$(git -C "$PREFIX" rev-parse --show-toplevel 2>/dev/null)" || fail 'An unrelated directory already exists; choose another --prefix'
+    [[ "$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$PREFIX")" == "$root" ]] || fail 'The destination is inside another checkout'
+    [[ "$(git -C "$PREFIX" remote get-url origin)" == "$REPOSITORY" ]] || fail 'The existing checkout has a different source; use its own installer'
+    validate_source "$PREFIX"
+    printf 'Reusing existing Assist installation; source files will not be updated.\n'
+    exec bash "$PREFIX/install.sh" ${INSTALL_OPTIONS[@]+"${INSTALL_OPTIONS[@]}"}
+fi
+
+# --check performs no download and leaves the filesystem untouched.
+for option in ${INSTALL_OPTIONS[@]+"${INSTALL_OPTIONS[@]}"}; do
+    if [[ "$option" == '--check' ]]; then
+        [[ "$(uname -s)" == Linux || "$(uname -s)" == Darwin ]] || fail 'Supported platforms: Linux and macOS'
+        command -v tmux >/dev/null || fail 'tmux 3.2+ is required'
+        python3 - "$(tmux -V)" <<'PY' || fail 'tmux 3.2+ is required'
+import re, sys
+match = re.search(r'(\d+)\.(\d+)', sys.argv[1])
+sys.exit(0 if match and tuple(map(int, match.groups())) >= (3, 2) else 1)
+PY
+        python3 -c 'import ensurepip, venv' || fail 'Python venv support is required'
+        printf 'Download prerequisites verified; no files changed.\n'
+        exit 0
+    fi
+done
+
+parent="$(dirname "$PREFIX")"
+mkdir -p "$parent"
+lock="$parent/.$(basename "$PREFIX").assist-install-lock"
+mkdir "$lock" 2>/dev/null || fail 'Another installer may be running; inspect the install lock before retrying'
+staging=''
+cleanup() {
+    if [[ -n "$staging" ]]; then
+        python3 - "$staging" <<'PY'
+import shutil, sys
+shutil.rmtree(sys.argv[1])
+PY
+    fi
+    rmdir "$lock"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+[[ ! -e "$PREFIX" && ! -L "$PREFIX" ]] || fail 'The installation destination appeared; nothing was replaced'
+staging="$(mktemp -d "$parent/.assist-download.XXXXXXXX")"
+mkdir "$staging/hooks"
+printf 'Downloading reviewed Assist revision %s…\n' "$REVISION"
+git -c core.hooksPath="$staging/hooks" clone --quiet --no-checkout --branch "$BRANCH" -- "$REPOSITORY" "$staging/source" || fail 'Source download failed; nothing was installed'
+actual="$(git -C "$staging/source" rev-parse --verify "$REVISION^{commit}" 2>/dev/null)" || fail 'The reviewed revision was not found in the source'
+[[ "$actual" == "$REVISION" ]] || fail 'Downloaded revision did not match the reviewed revision'
+git -C "$staging/source" merge-base --is-ancestor "$REVISION" "origin/$BRANCH" || fail 'The reviewed revision is not on the configured update branch'
+git -c core.hooksPath="$staging/hooks" -C "$staging/source" checkout --quiet -B "$BRANCH" "$REVISION"
+git -C "$staging/source" branch --set-upstream-to="origin/$BRANCH" "$BRANCH" >/dev/null
+validate_source "$staging/source"
+
+# Claim the destination exclusively. Never rename over a pre-existing directory.
+# Once claimed, keep the checkout if dependency setup fails, for an installer rerun.
+python3 - "$staging/source" "$PREFIX" <<'PY'
+import os, sys
+from pathlib import Path
+source, destination = map(Path, sys.argv[1:])
+destination.mkdir(mode=0o700)
+for child in source.iterdir():
+    os.rename(child, destination / child.name)
+PY
+printf 'Installing Assist in %s\n' "$PREFIX"
+bash "$PREFIX/install.sh" ${INSTALL_OPTIONS[@]+"${INSTALL_OPTIONS[@]}"}

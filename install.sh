@@ -1,0 +1,453 @@
+#!/usr/bin/env bash
+#
+# install.sh — Install Drift Assist (venv, deps, config, CLI command).
+#
+# Run from inside the repo:
+#
+#     git clone https://github.com/drift-further/driftassist.git ~/.local/share/drift-assist
+#     cd ~/.local/share/drift-assist
+#     ./install.sh
+#
+# Idempotent — safe to re-run. Never overwrites an existing .env.
+#
+set -euo pipefail
+umask 077
+
+CHECK_ONLY=0
+DEPENDENCIES_ONLY=0
+NO_INTEGRATIONS=0
+NON_INTERACTIVE=0
+REPLACE_COMMAND=0
+for arg in "$@"; do
+    case "$arg" in
+        --check) CHECK_ONLY=1 ;;
+        --dependencies-only) DEPENDENCIES_ONLY=1; NO_INTEGRATIONS=1; NON_INTERACTIVE=1 ;;
+        --no-integrations) NO_INTEGRATIONS=1 ;;
+        --non-interactive) NON_INTERACTIVE=1 ;;
+        --replace-command) REPLACE_COMMAND=1 ;;
+        -h|--help)
+            cat <<'HELP'
+Usage: bash install.sh [options]
+  --check               Check the source and prerequisites without installing
+  --non-interactive     Skip optional prompts (explicit environment opt-ins apply)
+  --no-integrations     Leave status-line and service configuration untouched
+  --dependencies-only   Create/repair only the project venv and pinned dependencies
+  --replace-command     Explicitly replace a different command at the CLI destination
+  --help                Show this help
+Requires a complete Assist source directory; download hosting is configured separately.
+HELP
+            exit 0 ;;
+        *) printf 'Unknown install option: %s\n' "$arg" >&2; exit 2 ;;
+    esac
+done
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+cd "$SCRIPT_DIR"
+
+# ---- helpers ---------------------------------------------------------------
+say()  { printf '\033[36m==>\033[0m %s\n' "$*"; }
+ok()   { printf '    \033[32m✓\033[0m %s\n' "$*"; }
+warn() { printf '    \033[33m!\033[0m %s\n' "$*"; }
+err()  { printf '\033[31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/drift-assist"
+CONFIG_FILE="$CONFIG_DIR/config.env"
+ROSTER_FILE="$CONFIG_DIR/roster.toml"
+BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
+BIN_TARGET="$BIN_DIR/assist"
+SRC_BIN="$SCRIPT_DIR/bin/assist"
+
+# ---- [1/8] check prerequisites --------------------------------------------
+say "[1/8] Checking prerequisites"
+
+OS="$(uname -s)"
+[[ "$OS" == "Linux" || "$OS" == "Darwin" ]] || err "Supported platforms: Linux and macOS (found $OS)"
+if [[ "$OS" == "Darwin" ]]; then
+    PY_HINT="brew install python@3.12  (macOS's /usr/bin/python3 is too old)"
+    TMUX_HINT="brew install tmux"
+else
+    PY_HINT="sudo apt install python3 python3-venv  (Fedora: sudo dnf install python3)"
+    TMUX_HINT="sudo apt install tmux  (Fedora: sudo dnf install tmux)"
+fi
+
+command -v python3 >/dev/null || err "python3 not found (install with: $PY_HINT)"
+
+PY_VER="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+PY_OK="$(python3 -c 'import sys; print(1 if sys.version_info >= (3,10) else 0)')"
+[[ "$PY_OK" == "1" ]] || err "Python 3.10+ required (found $PY_VER; install with: $PY_HINT)"
+ok "python3 $PY_VER"
+
+# tmux is required — every core feature (terminal streaming, auto-yes,
+# session management) calls tmux directly. 3.2 is the floor: the control
+# client uses `-f no-output`, which older tmux rejects, and interactive input
+# then breaks long after the install looked fine.
+command -v tmux >/dev/null || err "tmux not found (install with: $TMUX_HINT)"
+TMUX_VER="$(tmux -V | sed -E 's/^tmux (next-)?//')"
+TMUX_OK="$(python3 -c '
+import re, sys
+m = re.match(r"(\d+)\.(\d+)", sys.argv[1])
+print(1 if m and (int(m[1]), int(m[2])) >= (3, 2) else 0)
+' "$TMUX_VER")"
+[[ "$TMUX_OK" == "1" ]] || err "tmux 3.2+ required (found $TMUX_VER; upgrade with: $TMUX_HINT)"
+ok "tmux $TMUX_VER"
+
+for required in serve.py pyproject.toml requirements.lock env.example roster.example.toml bin/assist bin/statusline.sh assist-ctl cli/__init__.py shared/state.py routes/__init__.py index.html; do
+    [[ -f "$SCRIPT_DIR/$required" ]] || err "Incomplete Assist source: missing $required"
+done
+python3 -c 'import ensurepip, venv' &>/dev/null || err "python3-venv not found (install with: $PY_HINT)"
+[[ -w "$SCRIPT_DIR" ]] || err "Repo directory is not writable: $SCRIPT_DIR"
+if [[ "$DEPENDENCIES_ONLY" == "0" && ( -e "$BIN_TARGET" || -L "$BIN_TARGET" ) ]]; then
+    [[ ! -d "$BIN_TARGET" || -L "$BIN_TARGET" ]] || err "CLI destination is a directory: $BIN_TARGET"
+    existing="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve())' "$BIN_TARGET")"
+    if [[ "$existing" != "$SRC_BIN" && "$REPLACE_COMMAND" == "0" ]]; then
+        err "Another command exists at $BIN_TARGET. Choose XDG_BIN_HOME or explicitly use --replace-command."
+    fi
+fi
+if [[ "$CHECK_ONLY" == "1" ]]; then
+    ok "source and prerequisites verified; no files changed"
+    exit 0
+fi
+
+# One flag (shared/execution_park.py): while Automate and image builds are
+# parked, the installer neither checks for docker nor offers a container build.
+PARKED="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from shared.execution_park import FEATURES_PARKED; print(int(FEATURES_PARKED))' "$SCRIPT_DIR" 2>/dev/null || echo 1)"
+
+# Clipboard / key-send tools — fallback paths only (tmux path is always preferred).
+if [[ "$OS" == "Darwin" ]]; then
+    # macOS: pbcopy/pbpaste are built-in; osascript handles folder picker and key-send.
+    ok "pbcopy/pbpaste (built-in)"
+    command -v osascript >/dev/null && ok "osascript (built-in)" || warn "osascript not found — folder picker and paste fallback disabled"
+else
+    # Linux: xclip for clipboard, xdotool for X11 key-send, zenity for folder picker.
+    if command -v xclip >/dev/null; then
+        ok "xclip"
+    else
+        warn "xclip not found — clipboard copy disabled (install: sudo apt install xclip)"
+    fi
+    if command -v xdotool >/dev/null; then
+        ok "xdotool"
+    else
+        warn "xdotool not found — X11 key-send disabled (install: sudo apt install xdotool)"
+    fi
+    if command -v zenity >/dev/null; then
+        ok "zenity"
+    else
+        warn "zenity not found — native folder picker disabled (install: sudo apt install zenity)"
+    fi
+fi
+
+# claude CLI — primary Claude Code launch mode (default)
+if command -v claude >/dev/null; then
+    ok "claude binary ($(claude --version 2>/dev/null || echo '?'))"
+elif command -v npx >/dev/null; then
+    warn "npx found (set claude_mode to 'npx' in Settings if claude CLI not available)"
+else
+    warn "claude CLI and npx not found — Claude Code launch will fail"
+    warn "  install Claude CLI: https://claude.com/claude-code"
+    warn "  or Node.js: https://nodejs.org/"
+fi
+
+if [[ "$PARKED" == "1" ]]; then
+    :  # container features are parked; docker is not needed
+elif command -v docker >/dev/null; then
+    if docker ps >/dev/null 2>&1; then
+        ok "docker (user has access)"
+    else
+        warn "docker installed but user cannot run it — add user to docker group:"
+        warn "  sudo usermod -aG docker \$USER && newgrp docker"
+    fi
+else
+    warn "docker not found — container build/spawn features disabled"
+fi
+
+command -v curl >/dev/null && ok "curl" || warn "curl not found — assist CLI will fall back to python for HTTP"
+
+# Repo directory writability — server writes settings, history, state files here
+[[ -w "$SCRIPT_DIR" ]] || err "Repo directory is not writable: $SCRIPT_DIR"
+ok "repo directory writable"
+
+# ---- [2/8] create venv + install deps --------------------------------------
+say "[2/8] Creating Python venv and installing dependencies"
+
+# On Debian/Ubuntu, python3-venv may not be installed
+python3 -c 'import ensurepip, venv' &>/dev/null || err "python3-venv not found (install with: $PY_HINT)"
+
+if [[ ! -d "$SCRIPT_DIR/.venv" ]]; then
+    python3 -m venv "$SCRIPT_DIR/.venv"
+    ok "created .venv"
+else
+    ok ".venv already exists"
+fi
+
+# The lock pins every transitive version and its hash, so a new Flask or
+# Werkzeug release cannot change what a fresh install gets.
+"$SCRIPT_DIR/.venv/bin/pip" install --quiet --require-hashes -r "$SCRIPT_DIR/requirements.lock"
+ok "installed pinned dependencies from requirements.lock"
+if [[ "$DEPENDENCIES_ONLY" == "1" ]]; then
+    ok "dependencies ready; install configuration and integrations unchanged"
+    exit 0
+fi
+
+# ---- [3/8] seed .env -------------------------------------------------------
+say "[3/8] Seeding .env"
+
+if [[ ! -f "$SCRIPT_DIR/.env" ]]; then
+    cp "$SCRIPT_DIR/env.example" "$SCRIPT_DIR/.env"
+    ok "created .env from env.example"
+else
+    ok ".env already exists (not overwritten)"
+fi
+
+# ---- [4/8] record install location -----------------------------------------
+say "[4/8] Recording install location"
+
+mkdir -p "$CONFIG_DIR"
+python3 - "$CONFIG_FILE" "$SCRIPT_DIR" <<'PYEOF'
+import os, pathlib, re, shlex, sys, tempfile
+path = pathlib.Path(sys.argv[1]).resolve()
+lines = path.read_text().splitlines() if path.exists() else ['# Drift Assist install location']
+lines = [line for line in lines if not re.match(r'^\s*(?:export\s+)?ASSIST_HOME\s*=', line)]
+lines.append('ASSIST_HOME=' + shlex.quote(sys.argv[2]))
+fd, temporary = tempfile.mkstemp(dir=path.parent, prefix='.config-')
+try:
+    with os.fdopen(fd, 'w') as stream:
+        stream.write('\n'.join(lines) + '\n')
+    os.replace(temporary, path)
+finally:
+    if os.path.exists(temporary): os.unlink(temporary)
+PYEOF
+ok "wrote $CONFIG_FILE"
+
+if [[ ! -f "$ROSTER_FILE" ]]; then
+    cp "$SCRIPT_DIR/roster.example.toml" "$ROSTER_FILE"
+    ok "created $ROSTER_FILE from roster.example.toml"
+else
+    ok "$ROSTER_FILE already exists (not overwritten)"
+fi
+
+# ---- [5/8] install CLI command ---------------------------------------------
+say "[5/8] Installing 'assist' CLI command"
+
+[[ -f "$SRC_BIN" ]] || err "Missing $SRC_BIN — repo is incomplete"
+
+mkdir -p "$BIN_DIR"
+chmod +x "$SRC_BIN" "$SCRIPT_DIR/assist-ctl"
+
+link_cli() {
+    python3 - "$SRC_BIN" "$BIN_TARGET" "$REPLACE_COMMAND" <<'PYEOF'
+import os, pathlib, sys, tempfile
+source, target = map(pathlib.Path, sys.argv[1:3])
+if target.exists() or target.is_symlink():
+    if target.resolve() != source.resolve() and sys.argv[3] != '1':
+        raise SystemExit('CLI destination changed during install; refusing replacement')
+    if target.is_dir() and not target.is_symlink():
+        raise SystemExit('CLI destination is a directory; refusing replacement')
+fd, temporary = tempfile.mkstemp(dir=target.parent, prefix='.assist-link-')
+os.close(fd); os.unlink(temporary)
+try:
+    os.symlink(source, temporary)
+    os.replace(temporary, target)
+finally:
+    if os.path.lexists(temporary): os.unlink(temporary)
+PYEOF
+}
+
+if [[ -L "$BIN_TARGET" ]]; then
+    existing="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve())' "$BIN_TARGET")"
+    if [[ "$existing" == "$SRC_BIN" ]]; then
+        ok "$BIN_TARGET already linked"
+    else
+        link_cli
+        ok "updated symlink $BIN_TARGET"
+    fi
+elif [[ -e "$BIN_TARGET" ]]; then
+    [[ "$REPLACE_COMMAND" == "1" ]] || err "CLI destination changed during install; refusing replacement"
+    link_cli
+    ok "replaced $BIN_TARGET as requested"
+else
+    link_cli
+    ok "created symlink $BIN_TARGET"
+fi
+
+case ":$PATH:" in
+    *":$BIN_DIR:"*)
+        ok "$BIN_DIR is on PATH"
+        ;;
+    *)
+        warn "$BIN_DIR is NOT on your PATH"
+        warn "  add this to ~/.bashrc or ~/.zshrc:"
+        warn "    export PATH=\"$BIN_DIR:\$PATH\""
+        ;;
+esac
+
+# ---- [6/8] Claude Code statusline integration (optional) -------------------
+say "[6/8] Claude Code statusline integration"
+
+STATUSLINE_BIN="$SCRIPT_DIR/bin/statusline.sh"
+CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+CONTEXT_USAGE="$HOME/.claude/state/context-usage.json"
+# Threshold for "recent enough to count as working". One week covers the
+# infrequent-Claude-user case without permanently masking a broken setup.
+STALE_AFTER_SEC=604800
+
+chmod +x "$STATUSLINE_BIN" 2>/dev/null || true
+# Only for an existing Claude Code install: never create ~/.claude for a user
+# who does not have it.
+if [[ "$NO_INTEGRATIONS" == "0" ]]; then
+    if [[ -d "$HOME/.claude" ]]; then
+        mkdir -p "$HOME/.claude/state" 2>/dev/null && ok "ensured ~/.claude/state/"
+    fi
+fi
+
+# Read the configured statusLine command (or empty if none/malformed).
+read_statusline_cmd() {
+    python3 - "$CLAUDE_SETTINGS" <<'PYEOF'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    sl = d.get('statusLine')
+    if isinstance(sl, dict): print(sl.get('command', ''))
+    elif isinstance(sl, str): print(sl)
+except Exception:
+    sys.exit(2)
+PYEOF
+}
+
+# Replace ~/.claude/settings.json's statusLine with assist's, after backing up.
+write_assist_statusline() {
+    local backup="$CLAUDE_SETTINGS.bak.$(date +%s)"
+    cp "$CLAUDE_SETTINGS" "$backup"
+    python3 - "$CLAUDE_SETTINGS" "$STATUSLINE_BIN" <<'PYEOF'
+import json, sys
+path, cmd = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    d = json.load(f)
+d['statusLine'] = {'type': 'command', 'command': cmd, 'padding': 0}
+with open(path, 'w') as f:
+    json.dump(d, f, indent=2)
+PYEOF
+    ok "  backed up old settings to: $backup"
+}
+
+# Returns 0 if context-usage.json is present and updated within STALE_AFTER_SEC.
+context_usage_is_fresh() {
+    [[ -f "$CONTEXT_USAGE" ]] || return 1
+    local mtime now age
+    mtime="$(stat -c%Y "$CONTEXT_USAGE" 2>/dev/null || stat -f%m "$CONTEXT_USAGE" 2>/dev/null || echo 0)"
+    now="$(date +%s)"
+    age=$(( now - mtime ))
+    [[ $age -lt $STALE_AFTER_SEC ]]
+}
+
+# Prompt before changing statusLine. Honors ASSIST_REPLACE_STATUSLINE=1 for
+# non-interactive runs and defaults to "no" when there's no TTY.
+prompt_replace_statusline() {
+    if [[ "${ASSIST_REPLACE_STATUSLINE:-0}" == "1" ]]; then
+        echo "y"; return
+    fi
+    if [[ "$NON_INTERACTIVE" == "0" && -t 0 ]]; then
+        local ans=""
+        read -r -p "    Set statusLine to Assist's bin/statusline.sh? [y/N] " ans
+        echo "${ans:-n}"
+    else
+        echo "n"
+    fi
+}
+
+if [[ "$NO_INTEGRATIONS" == "1" ]]; then
+    ok "status-line integration skipped"
+elif [[ ! -f "$CLAUDE_SETTINGS" ]]; then
+    warn "~/.claude/settings.json not found — Claude Code may not be installed yet"
+    warn "  after installing Claude Code, add statusLine to get 'i' button context data:"
+    warn "  \"statusLine\": {\"type\": \"command\", \"command\": \"$STATUSLINE_BIN\"}"
+else
+    sl_cmd="$(read_statusline_cmd)" || sl_cmd="__parse_error__"
+
+    if [[ "$sl_cmd" == "__parse_error__" ]]; then
+        warn "could not parse $CLAUDE_SETTINGS — add statusLine manually:"
+        warn "  \"statusLine\": {\"type\": \"command\", \"command\": \"$STATUSLINE_BIN\"}"
+    elif [[ -z "$sl_cmd" ]]; then
+        # No statusLine — offer ours, but never edit Claude settings silently.
+        ans="$(prompt_replace_statusline)"
+        if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
+            write_assist_statusline
+            ok "added statusLine to $CLAUDE_SETTINGS"
+            ok "  using $STATUSLINE_BIN"
+        else
+            warn "skipped statusLine setup — the Assist 'i' button needs a compatible statusLine"
+        fi
+    elif [[ "$sl_cmd" == "$STATUSLINE_BIN" ]]; then
+        ok "Claude Code statusLine already set to Assist's bin/statusline.sh"
+    else
+        # A custom statusLine is configured. The 'i' panel only works if SOMETHING
+        # is keeping ~/.claude/state/context-usage.json fresh — check that directly,
+        # which is robust to project-local overrides we can't see from here.
+        if context_usage_is_fresh; then
+            ok "Claude Code statusLine is configured and ~/.claude/state/context-usage.json is recent"
+            ok "  ($sl_cmd)"
+        else
+            warn "Claude Code statusLine is configured but ~/.claude/state/context-usage.json is missing or stale:"
+            warn "    command: $sl_cmd"
+            if [[ -f "$CONTEXT_USAGE" ]]; then
+                warn "    last updated: $(date -d "@$(stat -c%Y "$CONTEXT_USAGE")" '+%Y-%m-%d %H:%M' 2>/dev/null || stat -f%Sm "$CONTEXT_USAGE")"
+            else
+                warn "    file does not exist"
+            fi
+            warn "    The Assist 'i' button will be blank without it."
+            ans="$(prompt_replace_statusline)"
+            if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
+                write_assist_statusline
+                ok "replaced statusLine with $STATUSLINE_BIN"
+                ok "  the 'i' panel will populate after Claude Code runs once"
+            else
+                warn "    skipped — set ASSIST_REPLACE_STATUSLINE=1 to auto-replace next time, or update manually:"
+                warn "    \"statusLine\": {\"type\": \"command\", \"command\": \"$STATUSLINE_BIN\"}"
+            fi
+        fi
+    fi
+fi
+
+# ---- [7/8] keep it running (optional) ---------------------------------------
+say "[7/8] Run as a service (optional)"
+
+# Opt-in only. ASSIST_INSTALL_SERVICE=1 answers yes without a TTY; with no TTY
+# and no variable the answer is no.
+ans="n"
+if [[ "$NO_INTEGRATIONS" == "0" && "${ASSIST_INSTALL_SERVICE:-0}" == "1" ]]; then
+    ans="y"
+elif [[ "$NO_INTEGRATIONS" == "0" && "$NON_INTERACTIVE" == "0" && -t 0 ]]; then
+    read -r -p "    Start Assist at login and keep it running (systemd --user / launchd)? [y/N] " ans
+fi
+if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
+    "$SRC_BIN" service install && SERVICE_INSTALLED=1 || warn "service install failed — run: assist service install"
+else
+    ok "skipped — enable later with: assist service install"
+fi
+
+# ---- [8/8] done ------------------------------------------------------------
+say "[8/8] Install complete"
+PORT="$(bash -c 'set -a; source "$1/.env" >/dev/null 2>&1; echo "${ASSIST_PORT:-8089}"' _ "$SCRIPT_DIR")"
+if [[ "${SERVICE_INSTALLED:-0}" == "1" ]]; then
+    START_STEP="Already running as a service (assist service status)"
+else
+    START_STEP="assist start"
+fi
+cat <<EOF
+
+Next steps:
+  1. Start the server:
+       $START_STEP
+     then open http://localhost:$PORT on this machine.
+  2. Reach it from your phone (listens on your LAN address too):
+       assist expose
+  3. Sign the phone in — prints a URL and a QR code to scan:
+       assist pair
+     (or type the token: assist token)
+
+  Check the install any time with:  assist doctor
+  All commands:                     assist help
+
+Keep Assist on loopback or a LAN you own; never expose it to the internet.
+See SECURITY.md.
+
+EOF

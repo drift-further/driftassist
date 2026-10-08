@@ -1,0 +1,166 @@
+/* status-bar.css — Top chrome: a utility bar (row 1) over the session rail
+   (row 2, see terminal.css). .top-chrome wraps both and owns the safe-area
+   inset, so collapsing row 1 cannot pull the surviving rail under an iPhone's
+   sensor housing. Do not re-add padding-top: env(...) to .status-bar — two
+   copies silently double the notch inset. */
+
+.top-chrome {
+    position: relative;
+    flex: 0 0 auto;
+    padding-top: env(safe-area-inset-top, 0px);
+    background: var(--bg-bar);
+    border-bottom: 1px solid var(--line);
+    z-index: 10;
+}
+
+.status-bar {
+    position: relative;
+    box-sizing: border-box;
+    width: 100%;
+    background: var(--bg-bar);
+    height: 41px;
+    min-height: 41px;
+    padding: 0 8px;
+    display: flex;
+    align-items: center;
+    /* Left-aligned, not centered: centering left a ~496px island floating in
+       the middle of a 1440px desktop with ~470px empty on either side. */
+    justify-content: flex-start;
+    gap: 4px;
+    flex-shrink: 0;
+}
+
+/* Eats the slack between the identity cluster and the action cluster. */
+.chrome-spacer { flex: 1 1 auto; min-width: 0; }
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    flex-shrink: 0;
+    transition: all 0.3s;
+}
+.status-dot.ok {
+    background: var(--green);
+    box-shadow: 0 0 6px rgba(131, 215, 162, 0.45);
+}
+.status-dot.err {
+    background: var(--red);
+    box-shadow: 0 0 8px var(--red);
+}
+.status-title {
+    min-width: 0;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 10px;
+    line-height: 1;
+    font-weight: 500;
+    color: var(--text-dim);
+    letter-spacing: 0.2px;
+    flex: 0 1 auto;
+}
+.status-title span { display: none; color: var(--text-dim); font-weight: 400; }
+
+/* Brand lockup: the Live threads mark and the Studio-style lowercase address.
+   Purely a label — no handler — so it cannot steal a tap from the tabs. */
+.brand-lockup {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    flex: 0 0 auto;
+    margin-right: 6px;
+    color: var(--text-strong);
+    white-space: nowrap;
+    user-select: none;
+}
+.brand-mark { width: 20px; height: 20px; color: var(--coral); flex-shrink: 0; }
+.brand-word {
+    font-family: var(--font);
+    font-size: 14px;
+    font-weight: 500;
+    letter-spacing: -0.04em;
+}
+.brand-word span { color: var(--text-dim); font-weight: 400; }
+
+/* The tabs no longer live in this bar — they own .session-rail below it, at
+   full width. The overrides that used to sit here (flex: 0 1 auto,
+   width: max-content, max-width: 960px, padding: 0) were what starved the
+   strip to 180px on a phone and stripped the badge headroom; do not
+   reintroduce them. */
+
+.tmux-indicator {
+    font-size: 9px;
+    font-weight: 600;
+    color: var(--cyan);
+    letter-spacing: 1px;
+    opacity: 0;
+    transition: opacity 0.3s;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    /* Content-sized, not a fixed 64px reservation: empty means zero width,
+       which is most of what the tab strip gained on a phone. */
+    width: auto;
+    max-width: 96px;
+    min-width: 0;
+    flex: 0 1 auto;
+}
+.tmux-indicator.active { opacity: 1; }
+.btn-actions {
+    height: 40px;
+    min-height: 40px;
+    min-width: 76px;
+    padding: 0 10px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    flex: 0 0 auto;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-card);
+    font-family: var(--font);
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.3px;
+    cursor: pointer;
+    white-space: nowrap;
+    -webkit-tap-highlight-color: transparent;
+}
+.btn-actions:active { background: var(--bg-selected); }
+.btn-actions.active {
+    color: var(--text-strong);
+    border-color: #3a4650;
+    background: var(--bg-selected);
+}
+.actions-menu-bars { font-size: 12px; line-height: 1; }
+/* Not a clock — js/monitor.js:updateStatusTime() writes "12s ago" for the last
+   poll activity, and empties it when there is none. A liveness readout that
+   costs zero width while everything is fresh. */
+.status-time {
+    font-size: 9px;
+    color: var(--text-muted);
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+/* --- Responsive distribution of row 1 ------------------------------------ */
+
+@media (max-width: 600px) {
+    .status-bar, .session-rail { padding-left: 4px; padding-right: 4px; }
+    .tmux-indicator { max-width: 64px; }
+    /* The lockup carries the identity here; the session/waiting counts
+       only fit on wider screens (they never fit the old 46px slot either). */
+    .status-title { display: none; }
+    .brand-lockup { margin-right: 2px; }
+}
+
+@media (min-width: 900px) {
+    .status-bar, .session-rail { padding-left: 16px; padding-right: 16px; }
+    .tmux-indicator { max-width: 160px; }
+}

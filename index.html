@@ -1,0 +1,756 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Drift Assist</title>
+    <link rel="icon" type="image/svg+xml" href="/icons/assist-live-threads.svg?v=2">
+    <link rel="apple-touch-icon" sizes="180x180" href="/icons/assist-live-threads-180.png?v=2">
+    <link rel="stylesheet" href="/css/fonts.css">
+    <link rel="stylesheet" href="/css/base.css?v=2">
+    <link rel="stylesheet" href="/css/status-bar.css?v=6">
+    <link rel="stylesheet" href="/css/input.css?v=9">
+    <link rel="stylesheet" href="/css/terminal.css?v=17">
+    <link rel="stylesheet" href="/css/opencode.css?v=2">
+    <link rel="stylesheet" href="/css/drawers.css?v=5">
+    <link rel="stylesheet" href="/css/widgets.css?v=2">
+    <link rel="stylesheet" href="/css/commands.css?v=2">
+    <link rel="stylesheet" href="/css/autocomplete.css?v=2">
+    <link rel="stylesheet" href="/css/segments.css?v=3">
+    <link rel="stylesheet" href="/css/container.css?v=2">
+    <link rel="stylesheet" href="/css/studio.css?v=9">
+    <link rel="stylesheet" href="/css/access.css?v=3">
+    <link rel="stylesheet" href="/css/chrome.css?v=6">
+    <link rel="stylesheet" href="/css/notifications.css?v=4">
+    <link rel="stylesheet" href="/css/updates.css?v=1">
+</head>
+<body>
+    <script>
+      // Before first paint: applying these from js/chrome.js instead would
+      // flash the full chrome for ~100ms on every load, which reads as a
+      // fault. Both preferences change the header's height and row count, so
+      // both have to be on <body> before the first layout.
+      try { if (localStorage.getItem('assist.chromeCollapsed'))
+              document.body.classList.add('chrome-collapsed');
+            if (localStorage.getItem('assist.tabsWrap'))
+              document.body.classList.add('tabs-wrap'); } catch (e) {}
+    </script>
+
+    <!-- Top chrome: a utility bar over a full-width session rail. The badge
+         headroom the tabs need lives INSIDE the rail's scrollport (8px of top
+         padding on a 48px rail holding 40px tabs), because .session-tabs is
+         overflow-x:auto and a non-visible overflow-x forces overflow-y to
+         compute as auto — vertical overflow can never escape it, whichever row
+         it sits in. .top-chrome owns the safe-area inset for both rows so
+         collapsing row 1 never pulls the rail under the sensor housing.
+
+         The Actions deck's "Wrap tabs" toggle (body.tabs-wrap, off by default) folds
+         these two rows into one wrapping flow instead — see the block comment
+         in css/chrome.css, including why the badge headroom survives the loss
+         of the scrollport. -->
+    <header class="top-chrome">
+        <div class="status-bar">
+            <!-- Identity cluster. Like .chrome-actions below it is
+                 display: contents in the default chrome and a float in the
+                 wrapping one — as one box it keeps its items on a single
+                 centre line, and it stops a tab that cannot fit beside it from
+                 opening a third row of its own. -->
+            <div class="chrome-identity">
+                <span class="brand-lockup" aria-label="Drift Assist">
+                    <svg class="brand-mark" viewBox="0 0 64 64" aria-hidden="true"><path d="M24 8H48Q56 8 56 16V48Q56 56 48 56H24M8 18H39M8 32H39M8 46H39" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/><circle cx="39" cy="18" r="5" fill="currentColor"/><circle cx="39" cy="32" r="5" fill="currentColor"/><circle cx="39" cy="46" r="5" fill="currentColor"/></svg>
+                    <span class="brand-word">driftassist<span>.dev</span></span>
+                </span>
+                <div id="status-dot" class="status-dot"></div>
+                <div class="status-title"></div>
+                <span class="conn-indicator" id="conn-indicator"></span>
+                <div id="status-time" class="status-time"></div>
+                <div id="tmux-ind" class="tmux-indicator"></div>
+            </div>
+            <span class="chrome-spacer"></span>
+            <!-- One box around the right-hand controls. It is display: contents
+                 in the default chrome, so these stay direct flex children of
+                 .status-bar and nothing about row 1 changes. It exists for the
+                 wrapping mode (body.tabs-wrap), where the cluster is floated to
+                 the top right and the tabs flow around it — a float needs a
+                 single box. Studio's trigger lives beside the terminal now. -->
+            <div class="chrome-actions">
+                <button class="btn-actions" id="btn-actions" onclick="toggleActionsDeck()" aria-expanded="false" aria-controls="actions-deck" title="Open all actions"><span class="actions-menu-bars" aria-hidden="true">&#8801;</span>Actions</button>
+            </div>
+        </div>
+
+        <div class="session-rail">
+            <!-- When chrome is collapsed this replaces the identity controls while
+                 the session strip remains available in the rail. -->
+            <div id="chrome-grabber" onclick="toggleChrome(false)" title="Show status bar">
+                <span class="grab-dot" id="grab-dot"></span>
+                <span class="grab-handle"></span>
+                <span class="grab-badge" id="grab-badge"></span>
+            </div>
+            <div class="session-tabs" id="session-tabs">
+                <span class="session-tabs-empty">No sessions</span>
+            </div>
+            <!-- Desktop scroll arrows, shown by js/tabs.js only for a fine pointer
+                 and only toward the side that has more tabs. -->
+            <button type="button" class="tabs-scroll-btn tabs-scroll-left" id="tabs-scroll-left" onclick="scrollTabStrip(-1)" aria-label="Scroll session tabs left" title="Scroll tabs left" hidden><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3.5 5.5 8l4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+            <button type="button" class="tabs-scroll-btn tabs-scroll-right" id="tabs-scroll-right" onclick="scrollTabStrip(1)" aria-label="Scroll session tabs right" title="Scroll tabs right" hidden><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        </div>
+    </header>
+
+    <!-- Open-access alarm strip: in flow, so it pushes the app down. -->
+    <div class="access-strip" id="access-strip" aria-hidden="true" onclick="accessClose()"></div>
+
+    <!-- Drawer overlay -->
+    <div class="drawer-overlay" id="drawer-overlay" onclick="closeDrawers()"></div>
+
+    <!-- Left drawer: Claude Code + Terminal + Modes -->
+    <div class="drawer-left" id="drawer-left">
+        <div class="drawer-header">
+            <span>More Keys</span>
+            <div class="drawer-header-actions">
+                <button class="combo-toggle" id="combo-toggle" aria-pressed="false" onclick="toggleKeyCombo()">Any key</button>
+                <button class="drawer-close" onclick="closeLeftDrawer()">&times;</button>
+            </div>
+        </div>
+        <!-- "Any key": sticky Ctrl/Alt/Shift, then one tap sends one combo through
+             /key's combo grammar (shared/key_combo.py) and clears them. No data-key
+             here: js/keylabels.js relabels and hides [data-key] buttons per agent. -->
+        <div class="combo-panel" id="combo-panel">
+            <div class="hk-grid combo-mods">
+                <button class="hk-btn hk-dim combo-mod" data-mod="ctrl" aria-pressed="false" onclick="toggleComboMod('ctrl')"><span class="hk-label">Ctrl</span></button>
+                <button class="hk-btn hk-dim combo-mod" data-mod="alt" aria-pressed="false" onclick="toggleComboMod('alt')"><span class="hk-label">Alt</span></button>
+                <button class="hk-btn hk-dim combo-mod" data-mod="shift" aria-pressed="false" onclick="toggleComboMod('shift')"><span class="hk-label">Shift</span></button>
+            </div>
+            <input class="combo-char" id="combo-char" type="text" maxlength="1" autocomplete="off"
+                   autocapitalize="off" autocorrect="off" spellcheck="false"
+                   placeholder="Type one character to send" aria-label="Character to send">
+            <div class="combo-status" id="combo-status" aria-live="polite"></div>
+            <div class="hk-group-label">Function</div>
+            <div class="hk-grid">
+                <button class="hk-btn hk-dim" onclick="sendCombo('F1')"><span class="hk-label">F1</span></button>
+                <button class="hk-btn hk-dim" onclick="sendCombo('F2')"><span class="hk-label">F2</span></button>
+                <button class="hk-btn hk-dim" onclick="sendCombo('F3')"><span class="hk-label">F3</span></button>
+                <button class="hk-btn hk-dim" onclick="sendCombo('F4')"><span class="hk-label">F4</span></button>
+                <button class="hk-btn hk-dim" onclick="sendCombo('F5')"><span class="hk-label">F5</span></button>
+                <button class="hk-btn hk-dim" onclick="sendCombo('F6')"><span class="hk-label">F6</span></button>
+                <button class="hk-btn hk-dim" onclick="sendCombo('F7')"><span class="hk-label">F7</span></button>
+                <button class="hk-btn hk-dim" onclick="sendCombo('F8')"><span class="hk-label">F8</span></button>
+                <button class="hk-btn hk-dim" onclick="sendCombo('F9')"><span class="hk-label">F9</span></button>
+                <button class="hk-btn hk-dim" onclick="sendCombo('F10')"><span class="hk-label">F10</span></button>
+                <button class="hk-btn hk-dim" onclick="sendCombo('F11')"><span class="hk-label">F11</span></button>
+                <button class="hk-btn hk-dim" onclick="sendCombo('F12')"><span class="hk-label">F12</span></button>
+            </div>
+            <div class="hk-group-label">Special</div>
+            <div class="hk-grid">
+                <button class="hk-btn hk-dim" onclick="sendCombo('Escape')"><span class="hk-label">Esc</span></button>
+                <button class="hk-btn hk-dim" onclick="sendCombo('Tab')"><span class="hk-label">Tab</span></button>
+                <button class="hk-btn hk-dim" onclick="sendCombo('Enter')"><span class="hk-label">Enter</span></button>
+                <button class="hk-btn hk-dim" onclick="sendCombo('BSpace')"><span class="hk-label">Bksp</span></button>
+                <button class="hk-btn hk-dim hk-wide" onclick="sendCombo('Space')"><span class="hk-label">Space</span></button>
+                <button class="hk-btn hk-dim" onclick="sendCombo('Insert')"><span class="hk-label">Ins</span></button>
+                <button class="hk-btn hk-dim" onclick="sendCombo('Delete')"><span class="hk-label">Del</span></button>
+                <button class="hk-btn hk-dim" onclick="sendCombo('Home')"><span class="hk-label">Home</span></button>
+                <button class="hk-btn hk-dim" onclick="sendCombo('End')"><span class="hk-label">End</span></button>
+                <button class="hk-btn hk-dim" onclick="sendCombo('PgUp')"><span class="hk-label">PgUp</span></button>
+                <button class="hk-btn hk-dim" onclick="sendCombo('PgDn')"><span class="hk-label">PgDn</span></button>
+                <button class="hk-btn hk-dim" onclick="sendCombo('Left')"><span class="hk-label">&#9664;</span></button>
+                <button class="hk-btn hk-dim" onclick="sendCombo('Up')"><span class="hk-label">&#9650;</span></button>
+                <button class="hk-btn hk-dim" onclick="sendCombo('Down')"><span class="hk-label">&#9660;</span></button>
+                <button class="hk-btn hk-dim" onclick="sendCombo('Right')"><span class="hk-label">&#9654;</span></button>
+            </div>
+        </div>
+        <div class="hk-group-label" id="hk-cmd-label">Claude Code</div>
+        <div class="hk-grid" id="hk-cmd-grid">
+            <button class="hk-btn hk-cyan" onclick="typeCmd('/compact')"><span class="hk-label">/compact</span></button>
+            <button class="hk-btn hk-cyan" onclick="typeCmd('/clear')"><span class="hk-label">/clear</span></button>
+            <button class="hk-btn hk-cyan" onclick="typeCmd('/help')"><span class="hk-label">/help</span></button>
+            <button class="hk-btn hk-cyan" onclick="typeCmd('/context')"><span class="hk-label">/context</span></button>
+            <button class="hk-btn hk-cyan" onclick="typeCmd('/cost')"><span class="hk-label">/cost</span></button>
+            <button class="hk-btn hk-cyan" onclick="typeCmd('/status')"><span class="hk-label">/status</span></button>
+            <button class="hk-btn hk-cyan" onclick="typeCmd('/model')"><span class="hk-label">/model</span></button>
+            <button class="hk-btn hk-cyan" onclick="typeCmd('/config')"><span class="hk-label">/config</span></button>
+        </div>
+        <div class="hk-group-label">Terminal</div>
+        <div class="hk-grid">
+            <button class="hk-btn hk-dim" data-key="ctrl+l" onclick="sendKey('ctrl+l')"><span class="hk-label">Ctrl+L</span><span class="hk-sub">clear</span></button>
+            <button class="hk-btn hk-dim" data-key="ctrl+r" onclick="sendKey('ctrl+r')"><span class="hk-label">Ctrl+R</span><span class="hk-sub">search</span></button>
+            <button class="hk-btn hk-dim" data-key="Tab" onclick="sendKey('Tab')"><span class="hk-label">Tab</span><span class="hk-sub">complete</span></button>
+            <button class="hk-btn hk-dim" data-key="ctrl+d" onclick="sendKey('ctrl+d')"><span class="hk-label">Ctrl+D</span><span class="hk-sub">exit</span></button>
+            <button class="hk-btn hk-dim" data-key="ctrl+u" onclick="sendKey('ctrl+u')"><span class="hk-label">Ctrl+U</span><span class="hk-sub">del line</span></button>
+            <button class="hk-btn hk-dim" data-key="ctrl+a" onclick="sendKey('ctrl+a')"><span class="hk-label">Ctrl+A</span><span class="hk-sub">home</span></button>
+            <button class="hk-btn hk-dim" data-key="ctrl+e" onclick="sendKey('ctrl+e')"><span class="hk-label">Ctrl+E</span><span class="hk-sub">end</span></button>
+            <button class="hk-btn hk-dim" data-key="ctrl+k" onclick="sendKey('ctrl+k')"><span class="hk-label">Ctrl+K</span><span class="hk-sub">del fwd</span></button>
+        </div>
+        <div class="hk-group-label">Modes</div>
+        <div class="hk-grid">
+            <button class="hk-btn hk-amber" data-key="shift+Tab" onclick="sendKey('shift+Tab')"><span class="hk-label">Shift+Tab</span><span class="hk-sub">perm mode</span></button>
+            <button class="hk-btn hk-amber" data-key="ctrl+o" onclick="sendKey('ctrl+o')"><span class="hk-label">Ctrl+O</span><span class="hk-sub">verbose</span></button>
+            <button class="hk-btn hk-amber" data-key="ctrl+t" onclick="sendKey('ctrl+t')"><span class="hk-label">Ctrl+T</span><span class="hk-sub">tasks</span></button>
+            <button class="hk-btn hk-amber" data-key="ctrl+g" onclick="sendKey('ctrl+g')"><span class="hk-label">Ctrl+G</span><span class="hk-sub">editor</span></button>
+            <button class="hk-btn hk-amber" data-key="alt+period" onclick="sendKey('alt+period')"><span class="hk-label">Alt+.</span><span class="hk-sub">reason +</span></button>
+            <button class="hk-btn hk-amber" data-key="alt+comma" onclick="sendKey('alt+comma')"><span class="hk-label">Alt+,</span><span class="hk-sub">reason -</span></button>
+            <button class="hk-btn hk-amber" data-key="alt+r" onclick="sendKey('alt+r')"><span class="hk-label">Alt+R</span><span class="hk-sub">raw</span></button>
+            <button class="hk-btn hk-amber" data-key="ctrl+y" onclick="sendKey('ctrl+y')"><span class="hk-label">Ctrl+Y</span><span class="hk-sub">resume</span></button>
+            <button class="hk-btn hk-amber" data-key="ctrl+slash" onclick="sendKey('ctrl+slash')"><span class="hk-label">Ctrl+/</span><span class="hk-sub">model</span></button>
+        </div>
+        <!-- Ctrl+T drops Codex into a modal transcript pager whose only exits are
+             keys Assist did not expose, so a phone could enter it and not get out.
+             Labels avoid "End"/"Home" on purpose: the red End button below kills
+             tmux, and two buttons reading End on one screen is a bad mis-tap. -->
+        <div class="hk-group-label" data-agent-only="codex">Transcript (Ctrl+T)</div>
+        <div class="hk-grid" data-agent-only="codex">
+            <button class="hk-btn hk-dim" data-key="Page_Up" onclick="sendKey('Page_Up')"><span class="hk-label">Page &#9650;</span><span class="hk-sub">page up</span></button>
+            <button class="hk-btn hk-dim" data-key="Page_Down" onclick="sendKey('Page_Down')"><span class="hk-label">Page &#9660;</span><span class="hk-sub">page dn</span></button>
+            <button class="hk-btn hk-dim" data-key="Home" onclick="sendKey('Home')"><span class="hk-label">Top</span><span class="hk-sub">jump</span></button>
+            <button class="hk-btn hk-dim" data-key="End" onclick="sendKey('End')"><span class="hk-label">Bottom</span><span class="hk-sub">jump</span></button>
+            <button class="hk-btn hk-dim" data-key="q" onclick="sendKey('q')"><span class="hk-label">q</span><span class="hk-sub">close</span></button>
+        </div>
+        <!-- Composer prefixes. Each one was typed into a live pane and kept only
+             where something actually opened; see js/keylabels.js for what was
+             refuted on Cursor. enter:false — the point is to open the CLI's own
+             picker and leave you in the composer. -->
+        <div class="hk-group-label" data-agent-only="codex cursor">Prefixes</div>
+        <div class="hk-grid" data-agent-only="codex cursor">
+            <button class="hk-btn hk-cyan" data-agent-only="codex" onclick="typePrefix('@')"><span class="hk-label">@</span><span class="hk-sub">files</span></button>
+            <button class="hk-btn hk-cyan" data-agent-only="codex cursor" onclick="typePrefix('!')"><span class="hk-label">!</span><span class="hk-sub">shell</span></button>
+            <button class="hk-btn hk-cyan" data-agent-only="codex cursor" onclick="typePrefix('/')"><span class="hk-label">/</span><span class="hk-sub">commands</span></button>
+            <button class="hk-btn hk-cyan" data-agent-only="codex" onclick="typePrefix('?')"><span class="hk-label">?</span><span class="hk-sub">shortcuts</span></button>
+        </div>
+        <div class="hk-group-label">Session</div>
+        <div class="hk-grid">
+            <button class="hk-btn hk-red" id="term-kill-btn" onclick="killSession(); closeLeftDrawer();"><span class="hk-label">End</span><span class="hk-sub">kill tmux</span></button>
+        </div>
+        <div class="hk-group-label">Access</div>
+        <div class="hk-grid">
+            <button class="hk-btn hk-red" onclick="toggleAccessSheet(true); closeLeftDrawer();"><span class="hk-label">Open</span><span class="hk-sub">add a device</span></button>
+        </div>
+    </div>
+
+    <!-- Bottom drawer: history -->
+    <div class="drawer-bottom" id="drawer-bottom">
+        <div class="drawer-header">
+            <div class="drawer-tabs">
+                <button class="drawer-tab active" data-tab="prompts" onclick="switchHistTab('prompts')">Prompts</button>
+                <button class="drawer-tab" data-tab="commands" onclick="switchHistTab('commands')">Cmds</button>
+                <button class="drawer-tab" data-tab="favs" onclick="switchHistTab('favs')">Favs</button>
+            </div>
+            <button class="drawer-close" onclick="closeBottomDrawer()">&times;</button>
+        </div>
+        <div class="filter-row">
+            <input type="text" id="hist-filter" class="hist-filter" placeholder="Filter…" autocomplete="off" autocapitalize="off" spellcheck="false">
+            <button class="hist-filter-clear" id="hist-filter-clear" onclick="clearHistFilter()" aria-label="Clear filter">&times;</button>
+        </div>
+        <div class="list-area" id="list-area"></div>
+        <button class="clear-btn" id="clear-btn" onclick="clearHistory()">Clear History</button>
+    </div>
+
+    <!-- Tab pull-out: every tab, tucked-into-zZ ones included (slides up when
+         the strip's pill is tapped) -->
+    <div class="stale-sheet" id="stale-sheet" aria-hidden="true">
+        <div class="stale-sheet-header">
+            <span class="stale-sheet-title">All tabs <span class="stale-sheet-count" id="stale-sheet-count">0</span><span class="stale-sheet-sub" id="stale-sheet-sub"></span></span>
+            <button class="stale-sheet-tuck" id="stale-sheet-tuck" onclick="toggleIdleTucking()">auto-tuck</button>
+            <button class="stale-sheet-tuck" onclick="openPurgeIdle()">Purge idle…</button>
+            <button class="drawer-close" onclick="closeStaleSheet()">&times;</button>
+        </div>
+        <div class="stale-sheet-body" id="stale-sheet-body"></div>
+        <div class="purge-panel" id="purge-panel" hidden>
+            <div class="purge-controls">
+                <button class="stale-sheet-tuck" onclick="closePurgeIdle()">Back</button>
+                <label>Idle over <select id="purge-idle" onchange="changePurgeThreshold()">
+                    <option value="3600">1h</option><option value="14400">4h</option>
+                    <option value="43200">12h</option><option value="86400" selected>24h</option>
+                    <option value="259200">3d</option>
+                </select></label>
+                <button class="purge-kill" id="purge-kill" onclick="killPurgeSelected()" disabled>Kill 0 sessions</button>
+            </div>
+            <div class="purge-status" id="purge-status" role="status"></div>
+            <div class="stale-sheet-body" id="purge-rows"></div>
+        </div>
+    </div>
+
+    <!-- Connect-to-Studio sheet (◇ when not connected) -->
+    <div class="studio-sheet" id="studio-sheet" aria-hidden="true">
+        <div class="studio-sheet-header">
+            <span class="studio-sheet-title">&#9671; Connect to Studio</span>
+            <button class="drawer-close" onclick="closeStudioConnect()">&times;</button>
+        </div>
+        <div class="studio-sheet-body">
+            <p class="studio-sheet-copy">Studio is the design hub your agents report into &mdash; specs,
+               blocking questions, tasks and QA gates, reviewable from anywhere. Connect Assist to
+               answer your agents' questions right from this screen.</p>
+            <div class="studio-field">
+                <label for="studio-web-base">Studio URL (web)</label>
+                <input id="studio-web-base" type="url" inputmode="url" autocapitalize="off" spellcheck="false" placeholder="https://studio.example.com">
+            </div>
+            <div class="studio-field">
+                <label for="studio-api-base">API URL</label>
+                <input id="studio-api-base" type="url" inputmode="url" autocapitalize="off" spellcheck="false" placeholder="http://127.0.0.1:8090">
+            </div>
+            <div class="studio-field">
+                <label for="studio-api-token">API token</label>
+                <input id="studio-api-token" type="password" autocomplete="off" placeholder="leave blank to keep the saved token">
+            </div>
+            <button class="studio-cta" onclick="studioConnectSave()">Test connection &amp; save</button>
+            <div class="studio-connect-result" id="studio-connect-result"></div>
+        </div>
+    </div>
+
+    <!-- Temporary open access: pick how long the window stays open. -->
+    <div class="access-sheet" id="access-sheet" aria-hidden="true">
+        <div class="access-sheet-header">
+            <span class="access-sheet-title">&#9888; Open access temporarily</span>
+            <button class="drawer-close" onclick="toggleAccessSheet(false)">&times;</button>
+        </div>
+        <div class="access-sheet-body">
+            <p class="access-sheet-copy">The next device on <code id="access-networks">&mdash;</code>
+               that loads this page gets signed in and stays signed in. The window then closes
+               &mdash; it admits <strong>one</strong> device, and only the sign-in page.</p>
+            <div class="access-presets">
+                <button class="access-preset" onclick="accessOpen(1)">1 min</button>
+                <button class="access-preset" onclick="accessOpen(5)">5 min</button>
+                <button class="access-preset" onclick="accessOpen(15)">15 min</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- A new device is asking to be let in. Modal on purpose: a security
+         decision must be answered or left to expire, never swiped away. -->
+    <div class="approve-backdrop" id="approve-backdrop" aria-hidden="true"></div>
+    <div class="approve-sheet" id="approve-sheet" role="dialog" aria-modal="true"
+         aria-labelledby="approve-sheet-title" aria-hidden="true">
+        <div class="approve-sheet-header">
+            <span class="approve-sheet-title" id="approve-sheet-title">&#9888; Approve new device?</span>
+        </div>
+        <div class="approve-sheet-body" id="approve-sheet-body"></div>
+    </div>
+
+    <div class="content">
+        <!-- The display bezel that used to live here is gone: pane capture mode
+             now lives in .term-info, while the session rail carries the active-
+             session identity that .term-toggle-status used to spell out. The
+             deck and panels below stay inside .term-panel so their terminal-
+             relative stacking behaviour is unchanged. -->
+        <div class="term-panel" id="term-panel">
+            <div class="studio-backdrop" id="studio-backdrop" onclick="toggleStudioPanel()" aria-hidden="true"></div>
+            <div class="actions-deck" id="actions-deck">
+                <div class="actions-deck-header">
+                    <span class="actions-deck-title">Actions</span>
+                    <span class="actions-deck-hint">One menu &middot; verbs first &middot; scope underneath</span>
+                    <button class="actions-deck-close" onclick="closeActionsDeck()" aria-label="Close actions">&#x2715;</button>
+                </div>
+                <div class="actions-groups">
+                    <section class="actions-group" aria-labelledby="actions-see-move">
+                        <h4 id="actions-see-move">See &amp; move</h4>
+                        <div class="actions-grid">
+                            <button class="actions-item term-font-btn" data-glyph="A&#8722;" onclick="termFontSmaller(); closeActionsDeck();">Smaller</button>
+                            <button class="actions-item term-font-btn" data-glyph="A+" onclick="termFontLarger(); closeActionsDeck();">Larger</button>
+                            <button class="actions-item term-font-btn" data-glyph="&#8596;" id="btn-fit" onclick="toggleFitMenu(); closeActionsDeck();" title="Fit terminal to screen">Fit</button>
+                            <button class="actions-item term-search-toggle" data-glyph="&#8981;" onclick="toggleTermSearch(); closeActionsDeck();" title="Search this terminal">Search</button>
+                            <button class="actions-item btn-insert" data-glyph="I" id="btn-insert" onclick="sendInsertMode(); closeActionsDeck();" title="Send 'i' to enter insert mode">Insert</button>
+                            <button class="actions-item term-chrome-btn" data-glyph="&#9652;" id="term-chrome-btn" onclick="toggleChrome(); closeActionsDeck();" title="Hide status bar">Hide bar</button>
+                        </div>
+                    </section>
+                    <section class="actions-group" aria-labelledby="actions-act-here">
+                        <h4 id="actions-act-here">Act here</h4>
+                        <div class="actions-grid">
+                            <button class="actions-item btn-info" data-glyph="i" id="btn-info" onclick="toggleClaudeInfo(); closeActionsDeck();" title="Claude session info">Session info</button>
+                            <button class="actions-item plus-autoyes attention" data-glyph="&#10003;" id="btn-autoyes" onclick="toggleAutoYes(); closeActionsDeck();">Auto-Yes</button>
+                            <button class="actions-item term-chrome-btn" data-glyph="&#8630;" id="btn-tabwrap" onclick="toggleTabWrap(); closeActionsDeck();" title="Let session tabs share the status bar and wrap onto a second row">Wrap tabs</button>
+                        </div>
+                    </section>
+                    <section class="actions-group" aria-labelledby="actions-open-workspace">
+                        <h4 id="actions-open-workspace">Open workspace</h4>
+                        <div class="actions-grid">
+                            <button class="actions-item workspace plus-proj" data-glyph="&#9638;" onclick="toggleProjects(); closeActionsDeck();">Projects</button>
+                            <button class="actions-item workspace plus-git" data-glyph="&#9314;" id="btn-git" onclick="toggleGitPanel(); closeActionsDeck();">Git</button>
+                            <button data-parked style="display:none" class="actions-item workspace plus-container" data-glyph="&#11041;" onclick="toggleContainerPanel(); closeActionsDeck();">Container</button>
+                            <button class="actions-item workspace plus-studio" onclick="closeActionsDeck(); openStudio();">Studio</button>
+                            <button class="actions-item workspace plus-skills" data-glyph="/" onclick="toggleSkillsPanel(); closeActionsDeck();">/Skills</button>
+                            <button data-parked style="display:none" class="actions-item workspace plus-auto" data-glyph="&#9654;" id="btn-auto" onclick="toggleAutoPanel(); closeActionsDeck();">Automate</button>
+                            <button class="actions-item workspace plus-settings" data-glyph="&#9881;" onclick="toggleSettingsPanel(); closeActionsDeck();">Settings</button>
+                            <button class="actions-item workspace" data-glyph="&#8635;" onclick="openSoftwareUpdate()"><span id="update-menu-label">Software updates</span></button>
+                        </div>
+                    </section>
+                </div>
+            </div>
+
+            <div class="term-search hidden" id="term-search">
+                <input type="text" class="term-search-input" id="term-search-input" placeholder="Search..." oninput="onTermSearch()">
+                <span class="term-search-count" id="term-search-count"></span>
+                <button class="term-search-nav" onclick="termSearchPrev()">&#9650;</button>
+                <button class="term-search-nav" onclick="termSearchNext()">&#9660;</button>
+                <button class="term-search-close" onclick="closeTermSearch()">&#x2715;</button>
+            </div>
+
+            <div class="fit-menu" id="fit-menu">
+                <button class="fit-item" data-cols="auto" onclick="fitMenuPick('auto')" title="Fit to viewport">Auto</button>
+                <button class="fit-item" data-cols="58" onclick="fitMenuPick(58)">Phone 58</button>
+                <button class="fit-item" data-cols="100" onclick="fitMenuPick(100)">Compact 100</button>
+                <button class="fit-item" data-cols="160" onclick="fitMenuPick(160)">Wide 160</button>
+                <button class="fit-item" data-cols="200" onclick="fitMenuPick(200)">Desktop 200</button>
+                <button class="fit-item fit-follow" onclick="fitMenuUnpin()" title="Unpin window size so it follows whatever terminal you tmux attach (removes the padding dots). Next Fit re-pins it.">Follow attach</button>
+                <div class="fit-custom">
+                    <input type="number" class="fit-custom-input" id="fit-custom-input" min="40" max="400" placeholder="cols" inputmode="numeric">
+                    <span class="fit-custom-x">&times;</span>
+                    <input type="number" class="fit-custom-input" id="fit-custom-rows" min="10" max="600" placeholder="rows" inputmode="numeric">
+                    <button class="fit-item fit-apply" onclick="fitMenuApplyCustom()">Apply</button>
+                </div>
+            </div>
+
+            <div class="claude-info-bar" id="claude-info-bar">
+                <div class="ci-row">
+                    <span class="ci-context" id="ci-context"></span>
+                    <span class="ci-sep">·</span>
+                    <span class="ci-duration" id="ci-duration"></span>
+                    <span class="ci-cost" id="ci-cost"></span>
+                    <span class="ci-block" id="ci-block"></span>
+                </div>
+                <div class="ci-row">
+                    <span class="ci-task" id="ci-task"></span>
+                    <span class="ci-sep">·</span>
+                    <span class="ci-files" id="ci-files"></span>
+                    <span class="ci-tasks-count" id="ci-tasks-count"></span>
+                    <span class="ci-sep">·</span>
+                    <span class="ci-branch" id="ci-branch"></span>
+                    <span class="ci-effort hidden" id="ci-effort" title="Studio project / effort for this pane"></span>
+                    <span class="ci-model" id="ci-model"></span>
+                </div>
+            </div>
+
+            <div class="git-panel" id="git-panel">
+                <div class="git-row">
+                    <button class="git-btn git-status" onclick="gitStatus()">Status</button>
+                    <button class="git-btn git-push" onclick="gitPush()">Push</button>
+                    <button class="git-btn git-venv" onclick="createVenv()">.venv</button>
+                    <button class="git-btn git-close" onclick="toggleGitPanel()">&#x2715;</button>
+                </div>
+                <div class="git-row">
+                    <input type="text" class="git-commit-input" id="git-commit-msg" placeholder="Commit message..." enterkeyhint="done">
+                    <button class="git-btn git-commit" onclick="gitCommitPushConfirm()">Commit &amp; push</button>
+                </div>
+            </div>
+
+            <div class="cmd-panel" id="cmd-panel">
+                <div class="cmd-panel-header">
+                    <span class="cmd-panel-title">Saved Commands</span>
+                    <button class="cmd-panel-close" onclick="toggleCmdPanel()">&#x2715;</button>
+                </div>
+                <div class="cmd-list" id="cmd-list"></div>
+            </div>
+
+            <div class="auto-panel" id="auto-panel">
+                <div class="auto-panel-header">
+                    <span class="auto-panel-title">Automate Run</span>
+                    <button class="auto-panel-close" onclick="toggleAutoPanel()">&#x2715;</button>
+                </div>
+                <div class="auto-panel-body">
+                    <textarea class="auto-prompt" id="auto-prompt" rows="3" placeholder="What should Claude do?"></textarea>
+                    <div class="auto-controls">
+                        <label class="auto-check-label">
+                            <input type="checkbox" class="auto-check" id="auto-continuous" checked>
+                            <span>Continuous</span>
+                        </label>
+                        <label class="auto-timeout-label" id="auto-iter-label">
+                            Runs
+                            <input type="number" class="auto-timeout" id="auto-iterations" value="1" min="1" max="999" disabled>
+                        </label>
+                        <label class="auto-timeout-label">
+                            Idle
+                            <input type="number" class="auto-timeout" id="auto-timeout" value="10" min="1" max="120">
+                            <span class="auto-timeout-unit">min</span>
+                        </label>
+                        <label class="auto-timeout-label">
+                            Stop@
+                            <input type="time" class="auto-timeout auto-stop-after" id="auto-stop-after" value="">
+                        </label>
+                        <label class="auto-timeout-label">
+                            Cmd
+                            <select class="auto-timeout auto-claude-cmd" id="auto-claude-cmd">
+                                <option value="">default</option>
+                                <option value="claude">claude</option>
+                                <option value="npx @anthropic-ai/claude-code">npx</option>
+                            </select>
+                        </label>
+                        <button class="auto-run-btn" id="auto-run-btn" onclick="automateRun()">Run</button>
+                        <button class="auto-stop-btn hidden" id="auto-stop-btn" onclick="automateStop()">Stop</button>
+                    </div>
+                    <div class="auto-status hidden" id="auto-status"></div>
+                    <div class="auto-proj-settings" id="auto-proj-settings">
+                        <button class="auto-proj-toggle" onclick="toggleProjectSettings()">
+                            <span class="auto-proj-arrow" id="auto-proj-arrow">&#9654;</span>
+                            <span>Project Settings</span>
+                            <span class="auto-proj-name" id="auto-proj-name"></span>
+                        </button>
+                        <div class="auto-proj-body hidden" id="auto-proj-body"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="container-panel" id="container-panel">
+                <div class="container-panel-header">
+                    <span class="container-panel-title">Container</span>
+                    <button class="container-panel-close" onclick="toggleContainerPanel()">&#x2715;</button>
+                </div>
+                <div class="container-panel-body">
+                    <div class="ctr-section" id="ctr-status">
+                        <div class="ctr-status-loading">Loading...</div>
+                    </div>
+                    <button class="ctr-section-toggle" onclick="toggleCtrSection('packages')">
+                        <span class="ctr-arrow" id="ctr-arrow-packages">&#9654;</span>
+                        <span>Packages</span>
+                    </button>
+                    <div class="ctr-section-body hidden" id="ctr-body-packages"></div>
+                    <button class="ctr-section-toggle" onclick="toggleCtrSection('extensions')">
+                        <span class="ctr-arrow" id="ctr-arrow-extensions">&#9654;</span>
+                        <span>Extensions</span>
+                    </button>
+                    <div class="ctr-section-body hidden" id="ctr-body-extensions"></div>
+                    <button class="ctr-section-toggle" onclick="toggleCtrSection('build')">
+                        <span class="ctr-arrow" id="ctr-arrow-build">&#9654;</span>
+                        <span>Build</span>
+                    </button>
+                    <div class="ctr-section-body hidden" id="ctr-body-build"></div>
+                </div>
+            </div>
+
+            <div class="studio-panel" id="studio-panel" role="complementary" aria-label="Studio context" aria-hidden="true">
+                <div class="studio-panel-header">
+                    <span class="studio-panel-title"><img class="studio-brand-mark" src="/icons/studio-confluence.svg?v=1" alt="" aria-hidden="true">Studio <span id="studio-panel-session"></span></span>
+                    <span class="studio-state" id="studio-state"></span>
+                    <button class="studio-panel-close" onclick="toggleStudioPanel()" aria-label="Close Studio context">&#x2715;</button>
+                </div>
+                <div class="studio-panel-body" id="studio-body"></div>
+            </div>
+
+            <div class="settings-panel" id="settings-panel">
+                <div class="settings-header">
+                    <div class="settings-server-info">
+                        <div class="settings-server-label">Server</div>
+                        <div class="settings-server-detail" id="settings-server-detail">--</div>
+                    </div>
+                    <button class="settings-restart-btn" id="settings-restart-btn" onclick="restartServer()">RESTART</button>
+                    <button class="cmd-panel-close" onclick="toggleSettingsPanel()">&#x2715;</button>
+                </div>
+                <div class="settings-body" id="settings-body">
+                    <!-- Rendered by js/settings.js -->
+                </div>
+                <div class="settings-footer">
+                    <span class="settings-reset" onclick="resetAllSettings()">Reset All to Defaults</span>
+                </div>
+            </div>
+
+            <div class="skills-panel" id="skills-panel">
+                <div class="skills-panel-header">
+                    <span class="skills-panel-title">/ Skills</span>
+                    <button class="skills-panel-close" onclick="toggleSkillsPanel()">&#x2715;</button>
+                </div>
+                <div class="skills-list" id="skills-list"></div>
+            </div>
+
+            <div class="term-projects hidden" id="term-projects">
+                <div class="proj-header-row">
+                    <input type="text" class="term-filter" id="term-filter" placeholder="Filter projects..." oninput="filterProjects()">
+                    <button class="explore-btn" id="explore-btn" onclick="pickFolderNative()">Browse</button>
+                </div>
+                <div class="term-project-grid" id="term-project-grid"></div>
+            </div>
+
+            <div class="term-display hidden" id="term-display">
+                <div class="term-info" id="term-info">
+                    <button class="term-tui-chip hidden" id="term-tui-chip" onclick="cycleTuiMode()" title="Terminal mode — tap to override auto-detect">TUI</button>
+                    <span class="term-info-cmd" id="term-info-cmd"></span>
+                    <button class="opencode-open hidden" id="opencode-open" title="Read an OpenCode conversation">Output</button>
+                    <span class="term-info-dim" id="term-info-dim"></span>
+                    <!-- TUI panes have no browser-side scrollback (alt screen),
+                         so history is paged inside the app. Shown only for TUI. -->
+                    <span class="term-tui-nav hidden" id="term-tui-nav">
+                        <button class="tui-nav-btn" onclick="tuiPage(true)" title="Page up through the transcript">&#9650;</button>
+                        <button class="tui-nav-btn" onclick="tuiPage(false)" title="Page down through the transcript">&#9660;</button>
+                        <button class="tui-nav-btn" id="term-tui-end" onclick="tuiJumpEnd()" title="Jump to the latest output">End</button>
+                    </span>
+                </div>
+                <div class="term-load-more" id="term-load-more" onclick="loadMore()">Load more &#8593;</div>
+                <pre class="term-content" id="term-content"></pre>
+                <div class="term-new-output" id="term-new-output" onclick="resumeTerminal()">New output &#8595;</div>
+            </div>
+
+            <section class="opencode-output hidden" id="opencode-output" aria-label="OpenCode output">
+                <div class="opencode-header">
+                    <div class="opencode-toolbar">
+                        <button id="opencode-terminal">Terminal</button>
+                        <strong>OpenCode output</strong>
+                        <button id="opencode-refresh">Refresh</button>
+                    </div>
+                    <label class="opencode-picker">Conversation
+                        <select id="opencode-session"><option value="">Choose conversation…</option></select>
+                    </label>
+                    <p class="opencode-hint">Choose again here after switching conversations in OpenCode. Input still goes to the pane.</p>
+                    <div class="opencode-meta" id="opencode-meta"></div>
+                    <div class="opencode-identity" id="opencode-identity"></div>
+                </div>
+                <div class="opencode-scroll" id="opencode-scroll">
+                    <button id="opencode-older" hidden>Show older messages</button>
+                    <div id="opencode-messages"></div>
+                </div>
+                <div class="opencode-footer">
+                    <span class="opencode-status" id="opencode-status" role="status"></span>
+                    <button id="opencode-latest">Latest</button>
+                </div>
+            </section>
+
+            <div class="cmd-output" id="cmd-output">
+                <div class="cmd-output-header">
+                    <span class="cmd-output-dot" id="cmd-output-dot"></span>
+                    <span class="cmd-output-label" id="cmd-output-label">Command</span>
+                    <button class="cmd-input-toggle" id="cmd-input-toggle" onclick="toggleInputTarget()" title="Toggle keyboard target">&#9650;</button>
+                    <button class="cmd-output-close" onclick="closeCmdOutput()">&#x2715;</button>
+                </div>
+                <div class="cmd-output-content" id="cmd-output-content">
+                    <pre class="cmd-output-pre" id="cmd-output-pre"></pre>
+                </div>
+            </div>
+
+            <!-- More: the left drawer's trigger. It sits on the bottom-left corner
+                 of the view above, so it stays just above the composer and rides
+                 on top of any prompt or auto-yes bar docked there. -->
+            <div class="more-tab-dock">
+                <button class="more-tab" id="more-tab" onclick="toggleLeftDrawer()">More</button>
+                <button type="button" id="btn-studio" class="studio-dock" onclick="openStudio()" aria-label="Open Studio context" aria-controls="studio-panel" aria-expanded="false" title="Open Studio context"><img class="studio-brand-mark" src="/icons/studio-confluence.svg?v=1" alt="" aria-hidden="true"><span class="studio-label">Studio</span><span id="studio-badge" class="studio-badge hidden" aria-hidden="true"></span><span id="studio-lock" class="studio-lock hidden" aria-hidden="true">!</span><span class="studio-chevron" aria-hidden="true">&#8249;</span></button>
+            </div>
+
+            <div class="smart-actions" id="smart-actions">
+                <div class="smart-actions-header">
+                    <div class="smart-actions-label" id="smart-actions-label">Action required</div>
+                    <button class="smart-actions-close" onclick="dismissSmartActions()">&#x2715;</button>
+                </div>
+                <div class="smart-actions-grid" id="smart-actions-grid"></div>
+            </div>
+            <div class="autoyes-picker" id="autoyes-picker">
+                <span class="ay-pick-label">Auto-Yes delay</span>
+                <button class="ay-pick-btn" onclick="ayPickAdjust(-1)">&minus;</button>
+                <span class="ay-pick-val" id="ay-pick-val">5</span>
+                <button class="ay-pick-btn" onclick="ayPickAdjust(1)">+</button>
+                <span class="ay-pick-unit">sec</span>
+                <button class="ay-pick-go" id="ay-pick-go" onclick="ayPickConfirm()">Start</button>
+                <button class="ay-pick-off" id="ay-pick-off" onclick="ayPickTurnOff()" style="display:none">Off</button>
+                <button class="ay-pick-x" onclick="ayPickCancel()">&times;</button>
+                <span class="ay-pick-hint" id="ay-pick-hint"></span>
+                <div class="ay-pick-shell">
+                    <span class="ay-pick-shell-label">Shell panes</span>
+                    <button class="ay-pick-shell-tog" id="ay-pick-shell" onclick="ayPickShellToggle()" aria-pressed="false">OFF</button>
+                    <span class="ay-pick-shell-hint">Off: agent panes only. On: plain shell (y/n) prompts too, while this session is armed here.</span>
+                </div>
+            </div>
+            <!-- A tap anywhere on the bar stops the countdown; STOP is its label. -->
+            <div class="autoyes-countdown" id="autoyes-countdown" onclick="cancelAutoYesCountdown()">
+                <span class="ay-label">5</span>
+                <span class="ay-summary"></span>
+                <div class="ay-track"><div class="ay-progress"></div></div>
+                <button class="ay-cancel" type="button" aria-label="Stop Auto-Yes">STOP</button>
+            </div>
+        </div>
+
+        <input type="file" id="file-input" multiple style="display:none" onchange="onFileSelected(this)">
+        <div class="input-wrap">
+            <textarea id="text-input" placeholder="Speak or type..." enterkeyhint="send"></textarea>
+            <div id="seg-chips" class="seg-chips"></div>
+            <div id="flash" class="flash-overlay"></div>
+            <div id="ac-popup" class="ac-popup"></div>
+        </div>
+        <div id="seg-sheet" class="seg-sheet"></div>
+        <!-- Filled by renderAttachments(): one chip per attached file. -->
+        <div class="attach-bar" id="attach-bar"></div>
+
+        <div class="keys-panel" id="keys-panel">
+            <div class="keys-split">
+                <div class="keys-left">
+                    <div class="hk-group-label">Controls</div>
+                    <div class="hk-grid hk-grid-2col">
+                        <button class="hk-btn hk-amber" data-key="Escape" onclick="sendKey('Escape')"><span class="hk-label">Esc</span><span class="hk-sub">dismiss</span></button>
+                        <button class="hk-btn hk-amber" data-key="Escape Escape" onclick="sendKey('Escape Escape')"><span class="hk-label">Esc x2</span><span class="hk-sub">rewind</span></button>
+                        <button class="hk-btn hk-red" data-key="ctrl+c" onclick="sendKey('ctrl+c')"><span class="hk-label">Ctrl+C</span><span class="hk-sub">cancel</span></button>
+                        <button class="hk-btn hk-red" data-key="ctrl+c ctrl+c" onclick="sendKey('ctrl+c ctrl+c')"><span class="hk-label">Ctrl+C x2</span><span class="hk-sub">exit</span></button>
+                        <button class="hk-btn hk-green hk-wide" data-key="Return" onclick="sendKey('Return')"><span class="hk-label">Enter</span><span class="hk-sub">submit</span></button>
+                    </div>
+                </div>
+                <div class="keys-right">
+                    <div class="hk-group-label">Nav</div>
+                    <div class="dpad">
+                        <button class="hk-btn hk-dim dpad-up" onclick="sendKey('Up')"><span class="hk-label">&#9650;</span></button>
+                        <button class="hk-btn hk-dim dpad-left" onclick="sendKey('Left')"><span class="hk-label">&#9664;</span></button>
+                        <button class="hk-btn hk-dim dpad-down" onclick="sendKey('Down')"><span class="hk-label">&#9660;</span></button>
+                        <button class="hk-btn hk-dim dpad-right" onclick="sendKey('Right')"><span class="hk-label">&#9654;</span></button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="btn-row">
+            <!-- Enter lock, per tab and armed by default. Disarmed, Enter makes
+                 a newline, the IME auto-send timer goes inert, and enterkeyhint
+                 stops advertising a Send key — see js/drafts.js. -->
+            <button class="action-btn btn-enter-lock" id="enter-lock" onclick="toggleEnterLock()"
+                    aria-pressed="false" aria-label="Enter key behaviour"
+                    title="Enter sends &mdash; tap for multi-line">&#8629;</button>
+            <button class="action-btn btn-vault hidden" id="vault-quick-send"
+                    onclick="vaultSendDefault()" aria-label="Send stored secret"
+                    title="Send stored secret">&#128273;</button>
+            <button class="action-btn btn-hist" onclick="toggleBottomDrawer()">Hist</button>
+            <button class="action-btn btn-upload" onclick="triggerUpload()">File</button>
+            <button class="action-btn btn-paste" onclick="doPaste()">Send</button>
+            <button class="action-btn btn-keys" id="btn-keys" onclick="toggleKeysPanel()">Keys</button>
+        </div>
+        <div class="route-indicator" id="route-ind">
+            <span class="route-dot" id="route-dot"></span>
+            <span class="route-label" id="route-label">Desktop (xdotool)</span>
+            <button type="button" class="route-attach" id="route-attach"
+                    onclick="copyAttachCommand()"></button>
+        </div>
+    </div>
+
+    <div id="sel-bar" class="sel-bar">
+        <button id="sel-cancel-btn" class="sel-cancel-btn" onclick="clearSelection()">&times;</button>
+        <button id="sel-copy-btn" class="sel-copy-btn">Copy</button>
+    </div>
+    <div class="restart-overlay" id="restart-overlay">
+        <div class="restart-overlay-content">
+            <div class="restart-spinner"></div>
+            <div class="restart-text">Restarting...</div>
+        </div>
+    </div>
+
+    <script src="/js/state.js?v=6"></script>
+    <script src="/js/target-hold.js?v=1"></script>
+    <script src="/js/poll-sync.js?v=2"></script>
+    <script src="/js/ui.js?v=7"></script>
+    <script src="/js/vault.js?v=3"></script>
+    <script src="/js/input.js?v=13"></script>
+    <script src="/js/autocomplete.js?v=2"></script>
+    <script src="/js/segments.js?v=3"></script>
+    <script src="/js/drafts.js?v=5"></script>
+    <script src="/js/keylabels.js?v=4"></script>
+    <script src="/js/keycombo.js?v=1"></script>
+    <script src="/js/terminal.js?v=32"></script>
+    <script src="/js/opencode.js?v=2"></script>
+    <script src="/js/actions.js?v=19"></script>
+    <script src="/js/commands.js?v=5"></script>
+    <script src="/js/container.js?v=1"></script>
+    <script src="/js/studio.js?v=4"></script>
+    <script src="/js/studio-context.js?v=6"></script>
+    <script src="/js/access.js?v=3"></script>
+    <script src="/js/chrome.js?v=3"></script>
+    <script src="/js/monitor.js?v=10"></script>
+    <script src="/js/notifications.js?v=1"></script>
+    <script src="/js/prompt-popup.js?v=2"></script>
+    <script src="/js/tabs.js?v=11"></script>
+    <script src="/js/updates.js?v=1"></script>
+    <script src="/js/settings.js?v=10"></script>
+    <script src="/js/app.js?v=28"></script>
+    <script src="/js/selection.js?v=2"></script>
+    <script>
+    if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('/sw.js').catch(() => {});
+    }
+    </script>
+</body>
+</html>

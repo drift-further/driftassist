@@ -1,0 +1,9 @@
+.btn-actions.update-attention { position:relative; }
+.btn-actions.update-attention::after { content:''; width:7px; height:7px; border-radius:50%; background:var(--green); position:absolute; top:5px; right:5px; }
+.software-update { padding-bottom:12px; border-bottom:1px solid var(--line); }
+.software-update-version { color:var(--text-muted); font-size:11px; margin:7px 0; overflow-wrap:anywhere; }
+.software-update-status { font-size:12px; color:var(--text); margin:10px 0; line-height:1.5; }
+.software-update-warning { font-size:12px; color:var(--amber); line-height:1.5; }
+.software-update-button { min-height:44px; margin:5px 6px 0 0; padding:0 12px; background:var(--bg-raised); border:1px solid var(--border); border-radius:6px; color:var(--text); font:inherit; font-size:12px; cursor:pointer; }
+.software-update-button:disabled { color:var(--text-muted); cursor:default; }
+.software-update-button[data-update-action="install"], .software-update-button[data-update-action="restart"] { color:var(--green); }

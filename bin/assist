@@ -1,0 +1,742 @@
+#!/usr/bin/env python3
+"""Command-line dispatcher for Drift Assist."""
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+
+SCRIPT_PATH = Path(__file__).resolve()
+ASSIST_HOME = SCRIPT_PATH.parent.parent
+sys.path.insert(0, str(ASSIST_HOME))
+
+
+def _reexec_in_project_venv() -> None:
+    """Re-exec under the project venv, so `assist` works from any shell.
+
+    The shebang is `#!/usr/bin/env python3`, which resolves against the
+    CALLER's PATH — whichever venv the caller happens to have active, else the
+    bare system interpreter. None of those carry this project's dependencies:
+    cli/wait.py imports routes.autoyes, which imports flask, so `assist` died
+    on import for EVERY verb (help included), not only the waiting ones.
+    install.sh provisions .venv next to this script and installs
+    requirements.txt into it — so use that interpreter, and derive its path
+    from __file__ (already symlink-resolved) so a moved or re-cloned repo
+    still works with no hardcoded paths.
+    """
+    venv_dir = ASSIST_HOME / ".venv"
+    venv_python = venv_dir / "bin" / "python3"
+    try:
+        # sys.prefix, NOT a resolved-path comparison: .venv/bin/python3 is a
+        # symlink to python3.12 -> the system interpreter, so resolve()
+        # collapses the venv and the system interpreter onto the same real file
+        # and the check passes for the wrong one. sys.prefix is the venv itself.
+        #
+        # This is the AUTHORITATIVE test and it must come FIRST. The loop guard
+        # below used to be checked ahead of it, on the bare PRESENCE of
+        # ASSIST_VENV_REEXEC — and the assist server carries that variable in
+        # its own environ, so every tmux pane it spawns inherited it, the
+        # wrapper then skipped the re-exec while NOT in the venv, and every verb
+        # died with "missing dependency 'flask'" in that pane.
+        if Path(sys.prefix) == venv_dir:
+            return  # already running inside the project venv
+        # Loop guard, scoped to THIS process: os.execv preserves the pid, so a
+        # stamp written in this exec chain matches getpid(), while a value
+        # inherited from any other process does not and is correctly ignored.
+        if os.environ.get("ASSIST_VENV_REEXEC") == str(os.getpid()):
+            return  # re-executed once already and still not in the venv
+        if not venv_python.is_file():
+            return  # no venv yet; fall through to the legible import error
+    except OSError:
+        return
+    os.environ["ASSIST_VENV_REEXEC"] = str(os.getpid())
+    try:
+        os.execv(str(venv_python), [str(venv_python), str(SCRIPT_PATH), *sys.argv[1:]])
+    except OSError:
+        pass  # exec failed — carry on and let the import decide
+
+
+_reexec_in_project_venv()
+
+try:
+    from cli import (
+        container,
+        expose,
+        http,
+        pair,
+        proc,
+        purge,
+        roster,
+        service,
+        session,
+        update,
+        wait as wait_cli,
+    )
+    from cli.config import ConfigError, resolve
+    from shared.execution_park import FEATURES_PARKED
+except ModuleNotFoundError as exc:  # a legible failure beats a 12-line traceback
+    print(
+        f"assist: missing dependency '{exc.name}' — the CLI needs the project venv at\n"
+        f"  {ASSIST_HOME / '.venv'}\n"
+        f"Create or repair it with:  cd {ASSIST_HOME} && ./install.sh",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+
+HELP_TEXT = """assist — control the Drift Assist web terminal
+
+Usage: assist <command> [args]
+
+Server:
+  start                  Start the server (through the service unit if installed)
+  stop                   Stop the server
+  restart                Restart the server
+  update [--check] [--json]
+                         Check/install an upstream update; restart separately
+  status                 Show server status
+  logs [N | -f | --follow]
+                         Tail last N lines (default 100), or follow
+  service install | uninstall | status
+                         Keep it running across reboots (systemd --user / launchd)
+
+Reach it from your phone:
+  expose [--ip ADDR] [--off]
+                         Listen on this host's LAN address too, allow its
+                         origin in .env, and restart if running
+  pair [--minutes N] [--url URL]
+                         Open a short sign-in window; print the phone URL + QR
+  token                  Print the token file path (and the token, on a terminal)
+
+Config & diagnostics:
+  config                 Print resolved paths, ports, and env
+  roster [ROLE] [--family F]
+                         List model-family commands, or print one command
+  doctor                 Check prerequisites + server health
+  --version              Print the version
+
+Sessions:
+  ls [--json] [--cwd]    List sessions and panes
+  view SESSION [-n N] [--pane P]
+                         Capture a session pane
+  send SESSION [TEXT | --file F] [--enter] [--pane P]
+      [--wait] [--timeout N] [--autoyes]
+                         Send text to a session pane
+  wait SESSION [--timeout N] [--pane P] [--autoyes]
+                         Wait for a session pane to settle
+  launch --session N [--cwd P] [--cols C] [--rows R]
+      [--wait] [--timeout N] [--role R (--family F | --against F)]
+                         Create a bare shell; takes no command
+                         With --role, resolve and send its roster command
+  kill SESSION [--pane P]
+                         Kill a tmux session
+  purge --idle 24h [--yes] [--keep NAME ...] [--json]
+                         Review idle sessions; --yes kills the checked set
+  autoyes SESSION (--on | --off | --status) [--delay N]
+                         Persistently set or inspect auto-yes
+  autoyes --global (--on | --off | --status) [--delay N]
+                         Set or inspect the all-sessions switch
+
+Auto-yes:
+  --autoyes on send/wait is temporary for that one wait and is restored
+  afterward. `assist autoyes` changes the persistent session setting.
+  `assist autoyes --global` arms every AGENT pane (claude/codex/opencode/
+  cursor/gemini) in every session at one delay, including sessions created
+  later. Plain shell panes stay manual unless that session was armed by
+  hand. A session turned off while the switch is on stays off.
+
+Next-step hints:
+  Successful ls/view/send/wait/launch/purge commands print a measured `next:`
+  suggestion to stderr. Set ASSIST_NO_HINTS=1 to suppress it; ls --json
+  suppresses it automatically.
+
+  `send` also prints a `callback:` line offering the wording that asks the
+  receiving agent to report back to your own pane when it finishes or gets
+  stuck — take it or ignore it. The reply address is your tmux session, or
+  ASSIST_REPLY_TO; outside tmux there is nowhere to reply to, so the line
+  is omitted.
+
+Wait exit codes:
+  0   idle    — the pane went quiet, no prompt
+  10  prompt  — quiet because it is asking something (summary printed)
+  75  working — still changing at the deadline; not an error, re-run `assist wait`
+{container}
+Studio (design hub):
+  studio [args]          Run the Studio CLI on PATH (sto, else studio)
+
+Misc:
+  help                   Show this message
+
+Install / reinstall:
+  cd $ASSIST_HOME && ./install.sh
+
+"""
+
+CONTAINER_HELP = """
+Container:
+  container status       Image info + running claude-session-* containers
+  container build        Build the container image (streams log)
+  container config       Print current container build config
+  container extensions   List registered extensions
+  container kill <name>  Kill a running claude-session-* container
+"""
+
+
+def help_text(parked: bool = FEATURES_PARKED) -> str:
+    """The container verbs still dispatch while parked; they are just not offered."""
+    return HELP_TEXT.replace("{container}", "" if parked else CONTAINER_HELP)
+
+
+def version_text() -> str:
+    """pyproject.toml is the one version source; a git checkout adds its commit."""
+    import re
+    import subprocess
+
+    match = re.search(
+        r'^version\s*=\s*"([^"]+)"',
+        (ASSIST_HOME / "pyproject.toml").read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    version = match.group(1) if match else "unknown"
+    try:
+        commit = subprocess.run(
+            ["git", "-C", str(ASSIST_HOME), "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        commit = ""
+    return f"drift-assist {version}" + (f" (git {commit})" if commit else "")
+
+PROCESS_HANDLERS = {
+    "start": proc.start,
+    "stop": proc.stop,
+    "restart": proc.restart,
+    "status": proc.status,
+}
+COMMANDS = {
+    *PROCESS_HANDLERS,
+    "logs",
+    "config",
+    "roster",
+    "doctor",
+    "container",
+    "ls",
+    "view",
+    "send",
+    "wait",
+    "launch",
+    "kill",
+    "purge",
+    "autoyes",
+    "studio",
+    "help",
+    "activate-park-v16",
+    "expose",
+    "pair",
+    "token",
+    "service",
+    "update",
+}
+
+
+class ArgumentError(Exception):
+    """An argparse error that should not produce a traceback."""
+
+
+class AssistArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise ArgumentError(message)
+
+
+def build_parser() -> AssistArgumentParser:
+    parser = AssistArgumentParser(prog="assist", add_help=False)
+    subparsers = parser.add_subparsers(dest="verb", required=True)
+
+    update_parser = subparsers.add_parser('update', help='Check or install an update; restart separately')
+    update_parser.add_argument('--check', action='store_true', help='Check only; leave installed code unchanged')
+    update_parser.add_argument('--json', dest='json_output', action='store_true')
+
+    for verb in PROCESS_HANDLERS:
+        command_parser = subparsers.add_parser(verb, add_help=False)
+        command_parser.add_argument("arguments", nargs=argparse.REMAINDER)
+
+    logs_parser = subparsers.add_parser("logs", add_help=False)
+    logs_parser.add_argument("-f", "--follow", action="store_true")
+    logs_parser.add_argument("lines", nargs="?", default="100")
+
+    ls_parser = subparsers.add_parser(
+        "ls",
+        description="List Assist tmux sessions and panes.",
+    )
+    ls_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="emit the full merged response as JSON and suppress next-step hints",
+    )
+    ls_parser.add_argument(
+        "--cwd",
+        action="store_true",
+        dest="include_cwd",
+        help="include each pane's working directory (one HTTP request per row)",
+    )
+
+    view_parser = subparsers.add_parser(
+        "view",
+        description="Capture and print a session pane.",
+    )
+    view_parser.add_argument(
+        "session",
+        nargs="?",
+        help="tmux session name",
+    )
+    view_parser.add_argument(
+        "-n",
+        dest="lines",
+        metavar="N",
+        type=int,
+        help="capture the last N lines instead of the server default",
+    )
+    view_parser.add_argument(
+        "--pane",
+        default="0.0",
+        metavar="P",
+        help="pane selector within SESSION (default: 0.0)",
+    )
+
+    send_parser = subparsers.add_parser(
+        "send",
+        description="Send text to a session pane, optionally waiting for it to settle.",
+    )
+    send_parser.add_argument(
+        "session",
+        nargs="?",
+        help="tmux session name",
+    )
+    send_parser.add_argument(
+        "text",
+        nargs="?",
+        help="text to send (mutually exclusive with --file)",
+    )
+    send_parser.add_argument(
+        "--file",
+        dest="file_path",
+        metavar="F",
+        help="read text from F, or from stdin when F is -",
+    )
+    send_parser.add_argument(
+        "--enter",
+        action="store_true",
+        help="press Enter after sending the text",
+    )
+    send_parser.add_argument(
+        "--pane",
+        default="0.0",
+        metavar="P",
+        help="pane selector within SESSION (default: 0.0)",
+    )
+    send_parser.add_argument(
+        "--wait",
+        action="store_true",
+        dest="wait_for_completion",
+        help="wait for the pane to settle after sending",
+    )
+    send_parser.add_argument(
+        "--autoyes",
+        action="store_true",
+        help=(
+            "temporarily enable auto-yes for this wait, then restore its "
+            "prior state (requires --wait)"
+        ),
+    )
+    send_parser.add_argument(
+        "--timeout",
+        default=wait_cli.DEFAULT_TIMEOUT,
+        metavar="N",
+        type=float,
+        help=f"wait at most N seconds (default: {wait_cli.DEFAULT_TIMEOUT:g})",
+    )
+
+    wait_parser = subparsers.add_parser(
+        "wait",
+        description="Wait for a session pane to become idle or present a prompt.",
+    )
+    wait_parser.add_argument(
+        "session",
+        nargs="?",
+        help="tmux session name",
+    )
+    wait_parser.add_argument(
+        "--timeout",
+        default=wait_cli.DEFAULT_TIMEOUT,
+        metavar="N",
+        type=float,
+        help=f"wait at most N seconds (default: {wait_cli.DEFAULT_TIMEOUT:g})",
+    )
+    wait_parser.add_argument(
+        "--pane",
+        default="0.0",
+        metavar="P",
+        help="pane selector within SESSION (default: 0.0)",
+    )
+    wait_parser.add_argument(
+        "--autoyes",
+        action="store_true",
+        help=(
+            "temporarily enable auto-yes for this wait, then restore its "
+            "prior state"
+        ),
+    )
+
+    launch_parser = subparsers.add_parser(
+        "launch",
+        description="Create or reuse a bare tmux shell session.",
+    )
+    launch_parser.add_argument(
+        "--session",
+        help="required session name (the server sanitizes tmux-unsafe characters)",
+    )
+    launch_parser.add_argument(
+        "--cwd",
+        help="starting working directory or project name",
+    )
+    launch_parser.add_argument(
+        "--cols",
+        type=int,
+        help="requested pane width in columns",
+    )
+    launch_parser.add_argument(
+        "--rows",
+        type=int,
+        help="requested pane height in rows",
+    )
+    launch_parser.add_argument(
+        "--wait",
+        action="store_true",
+        dest="wait_for_completion",
+        help="wait for the new shell to settle",
+    )
+    launch_parser.add_argument(
+        "--timeout",
+        default=wait_cli.DEFAULT_TIMEOUT,
+        metavar="N",
+        type=float,
+        help=f"wait at most N seconds (default: {wait_cli.DEFAULT_TIMEOUT:g})",
+    )
+    launch_parser.add_argument(
+        "--role",
+        help="resolve and launch this role from roster.toml",
+    )
+    launch_family = launch_parser.add_mutually_exclusive_group()
+    launch_family.add_argument(
+        "--family",
+        metavar="F",
+        help="use family F for --role",
+    )
+    launch_family.add_argument(
+        "--against",
+        metavar="F",
+        help="use the one competing family other than F for --role",
+    )
+
+    purge_parser = subparsers.add_parser(
+        "purge", description="List content-idle sessions; kill only with --yes. "
+        "Pinned, prompt-waiting and in-view sessions are unchecked; Assist server sessions are excluded.",
+    )
+    purge_parser.add_argument("--idle", choices=purge.IDLE_CHOICES, default="24h",
+                              help="idle threshold (default: 24h)")
+    purge_parser.add_argument("--yes", action="store_true", help="kill the checked set after re-checking activity")
+    purge_parser.add_argument("--keep", action="append", default=[], metavar="NAME",
+                              help="uncheck this session; repeat to keep more")
+    purge_parser.add_argument("--json", action="store_true", dest="json_output",
+                              help="machine output; suppress next-step hints")
+
+    kill_parser = subparsers.add_parser(
+        "kill",
+        description="Kill an entire tmux session.",
+    )
+    kill_parser.add_argument(
+        "session",
+        nargs="?",
+        help="tmux session name",
+    )
+    kill_parser.add_argument(
+        "--pane",
+        default="0.0",
+        metavar="P",
+        help="pane selector accepted for session-command consistency (default: 0.0)",
+    )
+
+    autoyes_parser = subparsers.add_parser(
+        "autoyes",
+        description=(
+            "Persistently set or inspect auto-yes for a session. Unlike the "
+            "temporary --autoyes flag on send/wait, this setting is not restored."
+        ),
+    )
+    autoyes_parser.add_argument(
+        "session",
+        nargs="?",
+        help="tmux session name",
+    )
+    autoyes_mode = autoyes_parser.add_mutually_exclusive_group(required=True)
+    autoyes_mode.add_argument(
+        "--on",
+        action="store_const",
+        const="on",
+        dest="mode",
+        help="leave persistent auto-yes enabled",
+    )
+    autoyes_mode.add_argument(
+        "--off",
+        action="store_const",
+        const="off",
+        dest="mode",
+        help="leave persistent auto-yes disabled",
+    )
+    autoyes_mode.add_argument(
+        "--status",
+        action="store_const",
+        const="status",
+        dest="mode",
+        help="print the current persistent state and enabled delay",
+    )
+    autoyes_parser.add_argument(
+        "--delay",
+        metavar="N",
+        type=float,
+        help="delay in seconds with --on (the server clamps it to 0.1-30)",
+    )
+    autoyes_parser.add_argument(
+        # dest is required: `global` is a keyword, so parsed.global will not parse.
+        "--global",
+        dest="global_switch",
+        action="store_true",
+        help=(
+            "act on the all-sessions switch instead of one session: arms every "
+            "agent pane at the global delay, with per-session opt-out"
+        ),
+    )
+
+    roster_parser = subparsers.add_parser(
+        "roster",
+        description=(
+            "List configured role commands, or print one role command for scripts."
+        ),
+    )
+    roster_parser.add_argument(
+        "role",
+        nargs="?",
+        help="role whose command to print",
+    )
+    roster_parser.add_argument(
+        "--family",
+        metavar="F",
+        help="family to select (requires ROLE when supplied)",
+    )
+
+    for verb in (
+        "config",
+        "doctor",
+        "container",
+        "studio",
+        "help",
+    ):
+        command_parser = subparsers.add_parser(verb, add_help=False)
+        command_parser.add_argument("arguments", nargs=argparse.REMAINDER)
+
+    expose_parser = subparsers.add_parser(
+        "expose",
+        description=(
+            "Let a phone on the LAN reach Assist directly: set ASSIST_BIND to this "
+            "host's LAN address (never 0.0.0.0), add its origin to "
+            "ASSIST_ALLOWED_ORIGINS in .env, and restart the server if it is running."
+        ),
+    )
+    expose_parser.add_argument(
+        "--ip",
+        metavar="ADDR",
+        help="LAN address to listen on (default: the default route's source address)",
+    )
+    expose_parser.add_argument(
+        "--off",
+        action="store_true",
+        help="remove ASSIST_BIND, back to loopback only (origins are kept)",
+    )
+
+    pair_parser = subparsers.add_parser(
+        "pair",
+        description=(
+            "Sign a phone in without typing the token: open a short sign-in window "
+            "and print the phone URL and a QR code of it."
+        ),
+    )
+    pair_parser.add_argument(
+        "--minutes",
+        type=float,
+        default=5,
+        metavar="N",
+        help="how long the window stays open (default: 5; the server caps it)",
+    )
+    pair_parser.add_argument(
+        "--url",
+        help="the URL the phone opens, when a proxy fronts Assist under another name",
+    )
+
+    subparsers.add_parser(
+        "token",
+        description="Print the token file path, and the token itself only to a terminal.",
+    )
+
+    service_parser = subparsers.add_parser(
+        "service",
+        description=(
+            "Keep Assist running across reboots with a systemd --user unit "
+            "(Linux) or a launchd agent (macOS)."
+        ),
+    )
+    service_parser.add_argument("action", choices=("install", "uninstall", "status"))
+
+    activation_parser = subparsers.add_parser(
+        "activate-park-v16",
+        description="Perform the receipted new-first park activation.",
+        add_help=False,
+    )
+    activation_parser.add_argument("--resume", action="store_true")
+
+    return parser
+
+
+def main(arguments: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if arguments is None else arguments)
+    verb = argv[0] if argv else "help"
+
+    try:
+        resolved = resolve(
+            SCRIPT_PATH,
+            activation_expected_home=(
+                ASSIST_HOME if verb == "activate-park-v16" else None
+            ),
+        )
+    except ConfigError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    if not argv or verb in {"-h", "--help"}:
+        argv = ["help"]
+        verb = "help"
+    if verb in {"--version", "-V", "version"}:
+        print(version_text())
+        return 0
+
+    if verb not in COMMANDS:
+        proc.print_error(f"Unknown command: {verb} (try: assist help)")
+        return 1
+
+    try:
+        parsed = build_parser().parse_args(argv)
+    except ArgumentError as exc:
+        proc.print_error(str(exc))
+        return 1
+
+    if parsed.verb in PROCESS_HANDLERS:
+        return PROCESS_HANDLERS[parsed.verb](resolved)
+    if parsed.verb == 'update':
+        return update.command(resolved, parsed.check, parsed.json_output)
+    if parsed.verb == "activate-park-v16":
+        return proc.activate_park(resolved, ASSIST_HOME, parsed.resume)
+    if parsed.verb == "logs":
+        return proc.logs(resolved, lines=parsed.lines, follow=parsed.follow)
+    if parsed.verb == "config":
+        return proc.config(resolved)
+    if parsed.verb == "roster":
+        if parsed.family is not None and parsed.role is None:
+            print("assist: --family requires ROLE", file=sys.stderr)
+            return 2
+        return roster.command(resolved.roster_file, parsed.role, parsed.family)
+    if parsed.verb == "doctor":
+        return proc.doctor(resolved)
+    if parsed.verb == "container":
+        return container.dispatch(parsed.arguments)
+    if parsed.verb == "ls":
+        return session.list_sessions(parsed.json_output, parsed.include_cwd)
+    if parsed.verb == "view":
+        return session.view(parsed.session, parsed.pane, parsed.lines)
+    if parsed.verb == "send":
+        return session.send(
+            parsed.session,
+            parsed.text,
+            parsed.file_path,
+            parsed.enter,
+            parsed.pane,
+            parsed.wait_for_completion,
+            parsed.timeout,
+            parsed.autoyes,
+        )
+    if parsed.verb == "wait":
+        return wait_cli.command(
+            parsed.session,
+            parsed.timeout,
+            parsed.pane,
+            parsed.autoyes,
+        )
+    if parsed.verb == "launch":
+        return session.launch(
+            parsed.session,
+            parsed.cwd,
+            parsed.cols,
+            parsed.rows,
+            parsed.wait_for_completion,
+            parsed.timeout,
+            parsed.role,
+            parsed.family,
+            parsed.against,
+            resolved.roster_file,
+        )
+    if parsed.verb == "kill":
+        return session.kill(parsed.session, parsed.pane)
+    if parsed.verb == "purge":
+        return purge.command(parsed.idle, parsed.yes, parsed.keep, parsed.json_output)
+    if parsed.verb == "autoyes":
+        return session.autoyes(
+            parsed.session,
+            parsed.mode,
+            parsed.delay,
+            parsed.global_switch,
+        )
+    if parsed.verb == "studio":
+        return proc.studio(parsed.arguments)
+    if parsed.verb == "expose":
+        return expose.command(resolved, parsed.ip, parsed.off)
+    if parsed.verb == "pair":
+        return pair.command(resolved, parsed.minutes, parsed.url)
+    if parsed.verb == "token":
+        return pair.token(resolved)
+    if parsed.verb == "service":
+        return service.dispatch(
+            resolved, parsed.action, lambda: proc.stop_manual(resolved)
+        )
+    if parsed.verb == "help":
+        print(help_text(), end="")
+        return 0
+    proc.print_error(f"Unknown command: {parsed.verb} (try: assist help)")
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        exit_code = main()
+    except KeyboardInterrupt:
+        exit_code = 130
+    except http.ApiError as exc:
+        exit_code = http.report_error(exc)
+    except wait_cli.WaitError as exc:
+        print(exc, file=sys.stderr)
+        exit_code = exc.exit_code
+    except Exception as exc:
+        proc.print_error(f"{type(exc).__name__}: {exc}")
+        exit_code = 1
+    raise SystemExit(exit_code)

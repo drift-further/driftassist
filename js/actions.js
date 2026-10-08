@@ -1,0 +1,1034 @@
+// actions.js — Smart action detection + rendering (SMART_PATTERNS)
+
+// Auto-Yes: now server-side. UI just toggles and shows countdown.
+let _autoyesState = {};  // session -> bool (mirrors server state)
+let _autoyesDelays = {};  // session -> seconds (per-session active delay, mirrors server)
+let _autoyesCountdown = null;  // { target, remaining, delay, prompt_type } or null
+let _autoyesDelay = (SETTINGS && SETTINGS.autoyes) ? SETTINGS.autoyes.default_delay : 5;  // current delay setting (persists across toggles)
+let _autoyesPickerVisible = false;
+// Mirrors the server's all-sessions switch. While enabled, every agent pane is
+// armed at _autoyesGlobal.delay and the per-session delay picker has no job.
+let _autoyesGlobal = { enabled: false, delay: 5 };
+
+function isAutoYes(session) {
+    return !!_autoyesState[session];
+}
+
+// Show inline delay picker instead of browser prompt()
+// When OFF: picker enables auto-yes ("Start").
+// When ON: picker edits the live delay ("Update") or turns it off ("Off").
+function showAutoYesPicker() {
+    const target = _smartActionTarget || _termTarget;
+    const session = target ? target.split(':')[0] : '';
+    if (!session) return;
+
+    const picker = document.getElementById('autoyes-picker');
+    if (!picker) return;
+    const on = isAutoYes(session);
+    // Prefill with the session's active delay when running, else last-used value
+    if (on && _autoyesDelays[session]) _autoyesDelay = _autoyesDelays[session];
+    _renderAyPickVal();
+    const goBtn = document.getElementById('ay-pick-go');
+    if (goBtn) goBtn.textContent = on ? 'Update' : 'Start';
+    const offBtn = document.getElementById('ay-pick-off');
+    if (offBtn) offBtn.style.display = on ? '' : 'none';
+    const labelEl = picker.querySelector('.ay-pick-label');
+    if (labelEl) labelEl.textContent = on ? 'Change delay' : 'Auto-Yes delay';
+    picker.classList.add('visible');
+    _autoyesPickerVisible = true;
+    _renderAyShell(session);
+    _loadAyShellOk(session);
+}
+
+// "Shell panes" (autoyes.shell_ok, per session). It lives here rather than in
+// the Automate panel, which is hidden while Automate is parked.
+let _ayShellOk = {};  // session -> bool, from that session's project settings
+
+async function _loadAyShellOk(session) {
+    try {
+        const resp = await fetch(`/api/project-settings/${encodeURIComponent(session)}`);
+        const data = await resp.json();
+        if (data.ok && data.settings && data.settings.autoyes) {
+            _ayShellOk[session] = data.settings.autoyes.shell_ok === true;
+        }
+    } catch (e) { /* keep what is shown */ }
+    _renderAyShell(session);
+}
+
+function _renderAyShell(session) {
+    const el = document.getElementById('ay-pick-shell');
+    if (!el) return;
+    const on = !!_ayShellOk[session];
+    el.classList.toggle('active', on);
+    el.textContent = on ? 'ON' : 'OFF';
+    el.setAttribute('aria-pressed', on ? 'true' : 'false');
+}
+
+async function ayPickShellToggle() {
+    const target = _smartActionTarget || _termTarget;
+    const session = target ? target.split(':')[0] : '';
+    const el = document.getElementById('ay-pick-shell');
+    if (!session || !el) return;
+    const next = !_ayShellOk[session];
+    el.disabled = true;
+    try {
+        const resp = await fetch(`/api/project-settings/${encodeURIComponent(session)}`, {
+            method: 'PATCH',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({autoyes: {shell_ok: next}}),
+        });
+        const data = await resp.json();
+        // Shown only as the server saved it, so a refused PATCH never reads as on.
+        if (data.ok && data.settings && data.settings.autoyes) {
+            _ayShellOk[session] = data.settings.autoyes.shell_ok === true;
+            showFlash('ok', _ayShellOk[session] ? 'Shell panes on' : 'Shell panes off');
+        } else {
+            showFlash('err', data.error || 'Save failed');
+        }
+    } catch (e) {
+        showFlash('err', 'Save failed');
+    } finally {
+        el.disabled = false;
+        _renderAyShell(session);
+    }
+}
+
+// Step by 1s at/above 1s, by 100ms below it (min 100ms, max 30s).
+function ayPickAdjust(delta) {
+    let v = _autoyesDelay;
+    if (delta < 0) v -= (v <= 1) ? 0.1 : 1;
+    else           v += (v < 1) ? 0.1 : 1;
+    _autoyesDelay = Math.max(0.1, Math.min(30, Math.round(v * 10) / 10));
+    _renderAyPickVal();
+}
+
+// Render the picker value + unit: seconds at/above 1s, milliseconds below.
+function _renderAyPickVal() {
+    const valEl = document.getElementById('ay-pick-val');
+    const unitEl = document.querySelector('#autoyes-picker .ay-pick-unit');
+    if (valEl) valEl.textContent = _autoyesDelay < 1
+        ? String(Math.round(_autoyesDelay * 1000))
+        : String(_autoyesDelay);
+    if (unitEl) unitEl.textContent = _autoyesDelay < 1 ? 'ms' : 'sec';
+    // Say what arming does, in the picker itself (review ux #7).
+    const hintEl = document.getElementById('ay-pick-hint');
+    if (hintEl) hintEl.textContent = "Answers this session's permission prompts after "
+        + (_autoyesDelay < 1 ? `${Math.round(_autoyesDelay * 1000)} ms.` : `${_autoyesDelay} s.`);
+}
+
+// Format a delay (seconds, possibly fractional) for flash messages.
+function _fmtDelay(d) {
+    return d < 1 ? `${Math.round(d * 1000)}ms` : `${d}s`;
+}
+
+function ayPickConfirm() {
+    const target = _smartActionTarget || _termTarget;
+    const session = target ? target.split(':')[0] : '';
+    document.getElementById('autoyes-picker').classList.remove('visible');
+    _autoyesPickerVisible = false;
+    if (!session) return;
+    if (isAutoYes(session)) {
+        _setAutoYesDelay(session, _autoyesDelay);  // already running — update delay
+    } else {
+        _setAutoYes(session, true, _autoyesDelay);  // off — enable with chosen delay
+    }
+}
+
+function ayPickTurnOff() {
+    const target = _smartActionTarget || _termTarget;
+    const session = target ? target.split(':')[0] : '';
+    document.getElementById('autoyes-picker').classList.remove('visible');
+    _autoyesPickerVisible = false;
+    if (session) _setAutoYes(session, false, null);
+}
+
+function ayPickCancel() {
+    document.getElementById('autoyes-picker').classList.remove('visible');
+    _autoyesPickerVisible = false;
+}
+
+// Update the delay for an already-running session (no toggle off/on)
+async function _setAutoYesDelay(session, delay) {
+    try {
+        const resp = await fetch('/autoyes/set-delay', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ session, delay }),
+        });
+        const data = await resp.json();
+        if (data.ok) {
+            _autoyesDelays[session] = data.delay;
+            showFlash('sent', `Auto-Yes delay → ${_fmtDelay(data.delay)}`);
+        } else {
+            showFlash('error', data.error || 'Failed to update');
+        }
+    } catch (e) {
+        showFlash('error', 'Failed to update');
+    }
+}
+
+// Absolute on/off (/autoyes/set). A toggle computed from this page's view of
+// the state turned Auto-Yes off when the view was stale and it meant on.
+async function _setAutoYes(session, enabled, delay) {
+    try {
+        const body = { session, enabled };
+        if (delay !== null) body.delay = delay;
+        const resp = await fetch('/autoyes/set', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body),
+        });
+        const data = await resp.json();
+        if (data.ok) {
+            _autoyesState[session] = data.enabled;
+            if (data.enabled && delay !== null) _autoyesDelays[session] = delay;
+            else if (!data.enabled) delete _autoyesDelays[session];
+            showFlash('sent', data.enabled
+                ? (delay !== null ? `Auto-Yes ON (${_fmtDelay(delay)})` : 'Auto-Yes ON')
+                : 'Auto-Yes OFF');
+            updateAutoYesUI(session);
+            _getSmartState(_termTarget).key = '';  // force re-render (toggle label changed)
+            if (_termLatestContent) {
+                const info = _paneInfo[_termTarget];
+                const detected = detectSmartActions(
+                    detectionTail(_termLatestContent),
+                    _termTarget,
+                    info && info.agent_kind
+                );
+                renderSmartActions(detected);
+            }
+        }
+    } catch (e) {
+        showFlash('error', 'Failed to toggle');
+    }
+}
+
+// Legacy name — called from +menu and inline toggle
+async function toggleAutoYes() {
+    if (!_autoyesGlobal.enabled) {
+        showAutoYesPicker();
+        return;
+    }
+    // Global switch on: there is one delay and it is not this session's to
+    // pick, so the tap sets the opposite of what the button shows, no picker.
+    const target = _smartActionTarget || _termTarget;
+    const session = target ? target.split(':')[0] : '';
+    if (session) _setAutoYes(session, !isAutoYes(session), null);
+}
+
+function updateAutoYesUI(session) {
+    if (!session && _termTarget) session = _termTarget.split(':')[0];
+    const btn = document.getElementById('btn-autoyes');
+    if (btn) {
+        const active = session ? isAutoYes(session) : false;
+        btn.classList.toggle('active', active);
+        // Say WHY it is on: under the global switch a session nobody touched is
+        // armed, and "(all)" is the difference between that and a hand-armed one.
+        btn.dataset.glyph = active ? '\u26A1' : '\u2713';
+        btn.textContent = active
+            ? (_autoyesGlobal.enabled ? 'Auto-Yes (all)' : 'Auto-Yes')
+            : 'Auto-Yes';
+    }
+    // Arming/disarming is the only moment the bar's slot may change size, and
+    // it happens on a deliberate tap rather than mid-prompt.
+    _syncCountdownReservation();
+}
+
+// Sync auto-yes state from server on load / tab switch
+async function syncAutoYesState() {
+    try {
+        const resp = await fetch('/autoyes/status');
+        const data = await resp.json();
+        _autoyesState = data.sessions || {};
+        _autoyesDelays = data.delays || {};
+        if (data.global) _autoyesGlobal = data.global;
+        // Update countdown if any
+        const target = _smartActionTarget || _termTarget;
+        if (target && data.countdowns && data.countdowns[target]) {
+            const cd = data.countdowns[target];
+            _autoyesCountdown = { target, remaining: cd.remaining, delay: cd.delay || 5, prompt_type: cd.prompt_type, summary: cd.summary || null };
+        } else {
+            _autoyesCountdown = null;
+        }
+    } catch(e) {}
+}
+
+async function cancelAutoYesCountdown() {
+    if (!_autoyesCountdown) return;
+    // Only a cancel the server confirms clears the bar. This used to clear it
+    // and say "Cancelled" whatever came back, so a refused request (a 403, a
+    // dropped connection) looked like a stop while the answer still went out.
+    try {
+        const resp = await fetch('/autoyes/cancel', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ target: _autoyesCountdown.target }),
+        });
+        const data = resp.ok ? await resp.json() : null;
+        if (!data || !data.ok) {
+            showFlash('error', 'Stop failed — answer the prompt by hand');
+            return;
+        }
+        _autoyesCountdown = null;
+        _renderAutoYesCountdown();
+        // cancelled:false means it had already fired or gone.
+        showFlash(data.cancelled ? 'sent' : 'error', data.cancelled ? 'Cancelled' : 'Too late — already answered');
+    } catch(e) {
+        showFlash('error', 'Stop failed — answer the prompt by hand');
+    }
+}
+
+// Handle autoyes WS messages from server
+function handleAutoYesWsMessage(msg) {
+    if (msg.event === 'countdown') {
+        _autoyesCountdown = { target: msg.target, remaining: msg.remaining, delay: msg.delay || 5, prompt_type: msg.prompt_type, summary: msg.summary || null };
+        _renderAutoYesCountdown();
+    } else if (msg.event === 'fired') {
+        _autoyesCountdown = null;
+        _renderAutoYesCountdown();
+        showFlash('sent', 'Auto-Yes sent');
+    } else if (msg.event === 'cancelled') {
+        _autoyesCountdown = null;
+        _renderAutoYesCountdown();
+    }
+}
+
+// Hold the countdown bar's slot open whenever Auto-Yes is armed for the session
+// on screen. Without it the bar appearing mid-prompt lifts the smart-action
+// buttons by its own height, and a tap already in flight lands on the wrong
+// option. See .autoyes-countdown.reserved in css/terminal.css.
+function _syncCountdownReservation() {
+    const bar = document.getElementById('autoyes-countdown');
+    if (!bar) return;
+    const session = (_smartActionTarget || _termTarget || '').split(':')[0];
+    const armed = !!session && typeof isAutoYes === 'function' && isAutoYes(session);
+    bar.classList.toggle('reserved', armed);
+}
+
+let _countdownTimer = null;
+function _renderAutoYesCountdown() {
+    const bar = document.getElementById('autoyes-countdown');
+    if (!bar) return;
+
+    if (_countdownTimer) { clearInterval(_countdownTimer); _countdownTimer = null; }
+    _syncCountdownReservation();
+
+    if (!_autoyesCountdown) {
+        bar.classList.remove('visible');
+        return;
+    }
+
+    const totalDelay = _autoyesCountdown.delay || 5;
+    const summary = _autoyesCountdown.summary || '';
+    const deadline = Date.now() + _autoyesCountdown.remaining * 1000;
+    bar.classList.add('visible');
+
+    // Set summary text once
+    const sumEl = bar.querySelector('.ay-summary');
+    if (sumEl) {
+        const short = summary.length > 50 ? summary.substring(0, 50) + '\u2026' : summary;
+        sumEl.textContent = short;
+        sumEl.title = summary;
+    }
+
+    const update = () => {
+        const leftSec = Math.max(0, (deadline - Date.now()) / 1000);
+        const wholeSeconds = Math.ceil(leftSec);
+        const label = bar.querySelector('.ay-label');
+        const progress = bar.querySelector('.ay-progress');
+        if (label) label.textContent = wholeSeconds > 0 ? String(wholeSeconds) : '0';
+        if (progress) progress.style.width = `${(1 - leftSec / totalDelay) * 100}%`;
+        if (leftSec <= 0) {
+            clearInterval(_countdownTimer);
+            _countdownTimer = null;
+            bar.classList.remove('visible');
+        }
+    };
+    update();
+    _countdownTimer = setInterval(update, 100);
+}
+
+// Check if a detected result qualifies for auto-yes.
+function _isAutoYesCandidate(result) {
+    if (!result) return false;
+    if (result.id === 'permission-yna' || result.id === 'confirm-yn' ||
+        result.id === 'opencode-permission' || result.id === 'cursor-permission' ||
+        result.id === 'cursor-trust' || result.id === 'package-confirm' ||
+        result.id === 'ssh-host-key' || result.id === 'selected-yes') return true;
+    if (result.id !== 'numbered-options') return false;
+    const first = result.actions[0];
+    return first && first.isOption && /^1\.\s*Yes/i.test(first.label);
+}
+
+// --- Numbered-option region bounds (shared by match + getActions) ---------
+// The option block sits between a ──── separator and the menu footer. Claude
+// Code's AskUserQuestion menu draws a SECOND separator between the last real
+// option and the trailing "Chat about this" row, so the separator NEAREST the
+// footer leaves a single option in the region: the two-option gate failed, no
+// smart actions rendered, and the tab never got its ? badge on a question that
+// was genuinely waiting. Walk up through separators and take the first region
+// holding at least two options.
+// Mirrors _option_region_start() in routes/autoyes.py.
+const _OPT_LOOKBACK = 60;
+// The server's detection depth (Settings → Auto-Yes → Detection Depth), refreshed
+// from every /poll so this file windows the pane exactly as the scanner does.
+// Every detection window in this file derives from it, as its server mirror does.
+let _detectionDepth = (typeof SETTINGS !== 'undefined' && SETTINGS && SETTINGS.autoyes
+    && SETTINGS.autoyes.detection_depth) || 8;
+// The input window both detectors read: the option lookback above a footer plus
+// the depth*4 rows a footer may sit above the bottom. Same formula as
+// routes/autoyes.py:detection_window_lines; /poll ships the server's value.
+function _detectionWindowFor(depth) {
+    return Math.max(depth * 4, _OPT_LOOKBACK) + depth * 4 + 1;
+}
+let _detectionWindow = _detectionWindowFor(_detectionDepth);
+const _OPT_RE = /^\s*(?:[^\d\s]\s*)?(\d+)[\.\)]\s+\S/;
+const _OPT_TEXT_RE = /^\s*(?:[^\d\s]\s*)?(\d+)[\.\)]\s+(.+)/;
+const _OPT_SEP_RE = /^[\s]*─{10,}/;
+const _OPT_FOOTER_RE = /(?:Enter to select|Esc to cancel|Navigate)\s*[·•]|Press enter to (?:confirm|continue)/;
+const _SELECTED_YES_RE = /(?:^|\n)\s*❯\s*Yes\b/i;
+
+function _optionCount(lines, startIdx, endIdx) {
+    let count = 0;
+    for (let i = startIdx; i < endIdx; i++) {
+        if (_OPT_RE.test(lines[i])) count++;
+    }
+    return count;
+}
+
+function _findOptionFooter(lines) {
+    for (let i = lines.length - 1; i >= 0; i--) {
+        if (_OPT_FOOTER_RE.test(lines[i])) return i;
+    }
+    return -1;
+}
+
+// An internal divider inside the option block is what tells a long-form
+// AskUserQuestion apart from a Yes/No permission gate — the question splits its
+// "Chat about this" escape hatch off with a second ──── rule. Its options are
+// prose you read in the pane, so it marks the tab and notifies but renders no
+// button wall (five full-width buttons duplicate the pane and bury it).
+function _hasInternalDivider(lines, startIdx, endIdx) {
+    for (let i = startIdx; i < endIdx; i++) {
+        if (_OPT_SEP_RE.test(lines[i])) return true;
+    }
+    return false;
+}
+
+function _anchoredOptionRegionStart(lines, footerIdx) {
+    const floor = Math.max(0, footerIdx - Math.max(_detectionDepth * 4, _OPT_LOOKBACK));
+    for (let i = footerIdx - 1; i >= floor; i--) {
+        if (!_OPT_SEP_RE.test(lines[i])) continue;
+        // A separator that leaves fewer than two options below it is an
+        // internal divider, not the top of the block — keep walking up.
+        if (_optionCount(lines, i + 1, footerIdx) >= 2) return i + 1;
+    }
+    return -1;
+}
+
+function _optionRegionStart(lines, footerIdx) {
+    const anchored = _anchoredOptionRegionStart(lines, footerIdx);
+    return anchored >= 0 ? anchored : Math.max(0, footerIdx - _OPT_LOOKBACK);
+}
+
+// Match routes/autoyes.py:_SELECTED_YES_RE inside the same live footer and
+// option-region bounds used by the server's numbered-menu branch.
+// Whether the option block above the footer is split by a divider. Without a
+// top anchor only a rule BELOW a numbered option counts: that is a question
+// whose top rule scrolled away. A rule with no option above it is the block's
+// own top. Mirrors _has_internal_divider/_has_unanchored_divider in
+// routes/autoyes.py.
+function _blockHasDivider(lines, footerIdx) {
+    const anchored = _anchoredOptionRegionStart(lines, footerIdx);
+    if (anchored >= 0) return _hasInternalDivider(lines, anchored, footerIdx);
+    let seenOption = false;
+    for (let i = _optionRegionStart(lines, footerIdx); i < footerIdx; i++) {
+        if (_OPT_SEP_RE.test(lines[i])) {
+            if (seenOption) return true;
+        } else if (_OPT_RE.test(lines[i])) {
+            seenOption = true;
+        }
+    }
+    return false;
+}
+
+function _isSelectedYesMenu(lines, footerIdx) {
+    if (footerIdx < 0 || (lines.length - 1 - footerIdx) > _detectionDepth * 4) return false;
+    const startIdx = _optionRegionStart(lines, footerIdx);
+    if (_blockHasDivider(lines, footerIdx)) return false;
+    return _SELECTED_YES_RE.test(lines.slice(startIdx, footerIdx + 1).join('\n'));
+}
+
+function _lastNonEmptyLine(tail) {
+    const lines = tail.split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+        if (lines[i].trim()) return lines[i];
+    }
+    return '';
+}
+
+const SMART_PATTERNS = [
+    {
+        id: 'claude-resume',
+        desc: 'Resume Claude session',
+        // PASSIVE: offer the buttons, but never mark the tab or notify.
+        //
+        // Claude Code prints "Resume this session with: claude --resume <uuid>"
+        // as its FAREWELL and drops back to a shell. That text then sits in the
+        // pane's last 6 lines forever, so this pattern used to badge the tab as
+        // needing input permanently — measured 2026-08-10 at 8 of 18 live panes
+        // continuously flagged, every one of them an exited session with nothing
+        // waiting on anybody. It is the dominant source of reaction patterns
+        // firing on panes that are not waiting on anything.
+        //
+        // The offer itself is still useful when you are looking at the pane, so
+        // this is not a deletion: `passive` keeps the action bar and drops only
+        // the pending-question signalling. Distinct from notifyOnly, which is
+        // the opposite trade (mark and notify, but draw no bar).
+        passive: true,
+        // Proper UUID: 8-4-4-4-12 hex, and must be in last 6 lines (not stale scrollback)
+        _uuidRe: /claude\s+--resume\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/,
+        match: function(tail) {
+            const bottom = tail.split('\n').slice(-6).join('\n');
+            return this._uuidRe.test(bottom);
+        },
+        getActions: function(tail) {
+            const bottom = tail.split('\n').slice(-6).join('\n');
+            const m = bottom.match(this._uuidRe);
+            if (!m) return null;
+            return [
+                { label: 'Resume session', claudeCmd: CLAUDE_CMD + ' --resume ' + m[1], restart: true, color: 'green' },
+                { label: 'New session', claudeCmd: CLAUDE_CMD, restart: true, color: 'cyan' },
+            ];
+        }
+    },
+    {
+        id: 'permission-yna',
+        desc: 'Permission prompt',
+        agents: ['claude'],
+        match: (tail) => {
+            // Mirrors _PERMISSION_YNA_MARKER_RE / _PERMISSION_YNA_DIALOG_RE in
+            // routes/autoyes.py — keep the two in step.
+            //
+            // Only the last _detectionDepth lines, which keeps answered prompts
+            // in scrollback out. Within that window the bare markers must END their line: a
+            // live prompt is the last thing written before the cursor waits,
+            // whereas `(y/n/a)` quoted mid-line is an agent displaying a README,
+            // a --help screen, or this repo's own source. The two full option
+            // rows are joined with \s+ rather than .* for the same reason — `.*`
+            // matched the regex source of the pattern itself.
+            const bottom = tail.split('\n').slice(-_detectionDepth).join('\n');
+            return /(?:\(y\/n\/a\)|\[Y\/n\/a\])[ \t]*$/im.test(bottom) ||
+                   /Allow once\s+Always allow\s+Deny/i.test(bottom) ||
+                   /Yes.*\(y\).*Always.*\(a\).*No.*\(n\)/i.test(bottom);
+        },
+        actions: [
+            { label: 'Allow (y)', send: 'y', enter: false, color: 'green' },
+            { label: 'Always (a)', send: 'a', enter: false, color: 'cyan' },
+            { label: 'Deny (n)', send: 'n', enter: false, color: 'red' },
+        ]
+    },
+    {
+        id: 'opencode-permission',
+        desc: 'OpenCode permission',
+        agents: ['opencode'],
+        // OpenCode TUI dialog (verified on 1.18.4): opens with "Allow once"
+        // selected; Left/Right cycle the selection WITH WRAPAROUND and Enter
+        // confirms. y/n keys (and Tab) do nothing — answers are key sequences.
+        // Mirrors routes/autoyes.py:_OPENCODE_PERMISSION_RE.
+        match: (tail) => {
+            const bottom = tail.split('\n').slice(-_detectionDepth).join('\n');
+            return /Allow once\s+Allow always\s+Reject/.test(bottom) &&
+                   /Permission required/.test(tail);
+        },
+        actions: [
+            { label: 'Allow once', send: '', enter: true, color: 'green' },
+            { label: 'Allow always', keys: ['Right'], enter: true, color: 'cyan' },
+            { label: 'Reject', keys: ['Left'], enter: true, color: 'red' },
+        ]
+    },
+    {
+        id: 'cursor-permission',
+        desc: 'Cursor: run command',
+        agents: ['cursor'],
+        // Cursor CLI shell approval (verified live on cursor-agent
+        // 2026.07.23-e383d2b). Its TUI gates only two things — this and the
+        // workspace-trust dialog below; file edits/writes are never gated.
+        //   Run this command?
+        //   Not in allowlist: cat, head
+        //    → Run (once) (y)
+        //      Add Shell(cat), Shell(head) to allowlist? (tab)
+        //      Run Everything (shift+tab)
+        //      Skip & tell the agent what to do instead (esc or n)
+        // The dialog is 8-11 rows tall and an optional "ctrl+r to review
+        // changed files" hint can sit BELOW it, so the window gets a fixed
+        // 14-line floor instead of the 8 used elsewhere. Requiring the header
+        // and the option row together rules out a match on displayed text.
+        // Mirrors routes/autoyes.py:_CURSOR_PERMISSION_*.
+        match: (tail) => {
+            const bottom = tail.split('\n').slice(-Math.max(_detectionDepth, 14)).join('\n');
+            return /Run this command\?/.test(bottom) &&
+                   /Run \(once\)\s*\(y\)/.test(bottom);
+        },
+        actions: [
+            { label: 'Run once (y)', send: 'y', enter: false, color: 'green' },
+            { label: 'Allowlist (tab)', keys: ['Tab'], enter: false, color: 'cyan' },
+            { label: 'Run all (⇧tab)', keys: ['shift+Tab'], enter: false, color: 'amber' },
+            { label: 'Skip (n)', send: 'n', enter: false, color: 'red' },
+        ]
+    },
+    {
+        id: 'cursor-trust',
+        desc: 'Cursor: trust workspace',
+        agents: ['cursor'],
+        // Cursor's launch gate. Unlike every other prompt handled here it is
+        // NOT erased when answered — the box stays on screen with the ▶ marker
+        // gone and the footer replaced by "⏳ Trusting workspace…". The footer
+        // is therefore the liveness signal: matching the "[a] Trust this
+        // workspace" row alone would keep matching after the answer and fire a
+        // stray "a" into the TUI's input box.
+        // Mirrors routes/autoyes.py:_CURSOR_TRUST_*.
+        match: (tail) => {
+            const bottom = tail.split('\n').slice(-Math.max(_detectionDepth, 8)).join('\n');
+            return /\[a\] Trust this workspace/.test(bottom) &&
+                   /Use arrow keys to navigate/.test(bottom);
+        },
+        actions: [
+            { label: 'Trust (a)', send: 'a', enter: false, color: 'green' },
+            { label: 'Quit (q)', send: 'q', enter: false, color: 'red' },
+        ]
+    },
+    {
+        id: 'package-confirm',
+        desc: 'Package manager confirmation',
+        // Package and ssh prompts are shell-layer reactions: keep them
+        // eligible inside agent panes, but require the last non-empty line.
+        // Mirrors routes/autoyes.py:_PACKAGE_CONFIRM_RE.
+        match: (tail) => /(?:Do you want to continue\?\s*\[Y\/n\]|Is this ok\s*\[y\/N\]:?)\s*$/i.test(_lastNonEmptyLine(tail)),
+        actions: [
+            { label: 'Yes (y)', send: 'y', enter: true, color: 'green' },
+            { label: 'No (n)', send: 'n', enter: true, color: 'red' },
+        ]
+    },
+    {
+        id: 'ssh-host-key',
+        desc: 'SSH host key',
+        // Mirrors routes/autoyes.py:_SSH_HOST_KEY_RE.
+        match: (tail) => /Are you sure you want to continue connecting \(yes\/no(?:\/\[fingerprint\])?\)\?\s*$/i.test(_lastNonEmptyLine(tail)),
+        actions: [
+            { label: 'Continue (yes)', send: 'yes', enter: true, color: 'green' },
+            { label: 'Cancel (no)', send: 'no', enter: true, color: 'red' },
+        ]
+    },
+    {
+        id: 'confirm-yn',
+        desc: 'Confirmation',
+        match: (tail) => {
+            // Mirrors routes/autoyes.py: a displayed or echoed form is not an
+            // interactive prompt unless it is the last non-empty line.
+            const line = _lastNonEmptyLine(tail);
+            if (/\(y\/n\/a\)/i.test(line) || /\[Y\/n\/a\]/i.test(line)) return false;
+            return line.match(/\(y\/n\)|\[Y\/n\]|\[y\/N\]|\(yes\/no\)/i);
+        },
+        getActions: (_tail, match) => {
+            const withEnter = /\[Y\/n\]|\[y\/N\]|\(yes\/no\)/i.test(match[0]);
+            return [
+                { label: 'Yes (y)', send: 'y', enter: withEnter, color: 'green' },
+                { label: 'No (n)', send: 'n', enter: withEnter, color: 'red' },
+            ];
+        }
+    },
+    // There is deliberately NO codex-specific approval pattern here. A proposed
+    // first-class pattern used a fixed y/a/p/d/n/c key set; that key set does not
+    // exist on codex-cli 0.147.0. Two independent escalations were triggered on a live pane — a
+    // write outside the workspace, and outbound network — and both rendered the
+    // SAME three-option numbered menu:
+    //     1. Yes, proceed (y)
+    //     2. Yes, and don't ask again for commands that start with `…` (p)
+    //     3. No, and tell Codex what to do differently (esc)
+    //     Press enter to confirm or esc to cancel
+    // No 'a', no 'd', no 'n', no 'c'. Both captures were fed through
+    // routes/autoyes.py::_detect_autoyes_prompt() and came back
+    // ('numbered-yes', '', True, '$ <the command>') — the generic path below
+    // already detects it, answers it correctly, and extracts a better summary
+    // than a bespoke pattern would. Note the comments at the footer bound and
+    // the region floor: this path was tuned FOR that dialog by an earlier
+    // effort. Adding a second matcher would only give it something to disagree
+    // with. (Untested and so not claimed either way: MCP and apply_patch
+    // approvals, which may carry a different option set.)
+    {
+        id: 'selected-yes',
+        desc: 'Confirm selected option',
+        agents: ['claude', 'codex', 'gemini'],
+        match: (tail) => {
+            const lines = tail.split('\n');
+            return _isSelectedYesMenu(lines, _findOptionFooter(lines));
+        },
+        actions: [
+            { label: 'Confirm Yes', send: '', enter: true, color: 'green' },
+        ]
+    },
+    {
+        id: 'numbered-options',
+        desc: 'Select option',
+        agents: ['claude', 'codex', 'gemini'],
+        match: (tail) => {
+            const lines = tail.split('\n');
+            // Find the LAST footer in tail. Claude Code renders its TodoWrite
+            // status panel BELOW the prompt footer when tasks are active, so
+            // the footer is often pushed 10-20 lines up from the bottom.
+            // Bound depth from bottom (depth*4 lines) to skip stale footers in
+            // scrollback. Mirrors routes/autoyes.py:_detect_autoyes_prompt.
+            // "Press enter to confirm" is codex's footer — no separator glyph
+            // and different wording, so the other three forms all miss it.
+            const footerIdx = _findOptionFooter(lines);
+            if (footerIdx >= 0 && (lines.length - 1 - footerIdx) <= _detectionDepth * 4) {
+                // The region floor is 60 lines, not 10. codex's "Yes, and don't
+                // ask again for commands that start with `<command>`" embeds the
+                // command and wraps 25-30 rows, pushing option 1 out of range so
+                // only one option was counted and the bar never appeared.
+                // Mirrors _OPTION_REGION_LOOKBACK in routes/autoyes.py.
+                const sepIdx = _optionRegionStart(lines, footerIdx);
+                return _optionCount(lines, sepIdx, footerIdx) >= 2;
+            }
+            return false;
+        },
+        // Detected (so the tab is marked and a notification fires) but with no
+        // one-tap buttons — see _hasInternalDivider().
+        notifyOnly: (tail) => {
+            const lines = tail.split('\n');
+            const footerIdx = _findOptionFooter(lines);
+            if (footerIdx < 0) return false;
+            return _blockHasDivider(lines, footerIdx);
+        },
+        getActions: (tail) => {
+            const actions = [];
+            const lines = tail.split('\n');
+            const footer = _findOptionFooter(lines);
+            if (footer < 0) return null;
+            const endIdx = footer;
+            // Bound the prompt region above (same walk-up as match(), or the
+            // two would disagree and getActions would return only the options
+            // below an internal divider).
+            const startIdx = _optionRegionStart(lines, endIdx);
+            for (let i = startIdx; i < endIdx; i++) {
+                const m = lines[i].match(_OPT_TEXT_RE);
+                if (m) {
+                    const num = m[1];
+                    const text = m[2].trim();
+                    if (text.length < 2) continue;
+                    const label = text.length > 80 ? text.substring(0, 80) + '\u2026' : text;
+                    actions.push({ label: num + '. ' + label, optNum: num, enter: false, color: 'cyan', isOption: true });
+                }
+            }
+            if (actions.length < 2) return null;
+            // Deduplicate by option number AND text
+            const seenNum = new Set();
+            const seenText = new Set();
+            const deduped = actions.filter(a => {
+                if (seenNum.has(a.optNum)) return false;
+                const normText = a.label.replace(/^\d+\.\s*/, '').trim();
+                if (seenText.has(normText)) return false;
+                seenNum.add(a.optNum);
+                seenText.add(normText);
+                return true;
+            });
+            deduped.sort((a, b) => parseInt(a.optNum) - parseInt(b.optNum));
+            return deduped.slice(0, 5);
+        }
+    },
+];
+
+function _unfreezeAndScroll() {
+    _termPaused = false;
+    _termHasNew = false;
+    document.getElementById('term-new-output').classList.remove('visible');
+    const display = document.getElementById('term-display');
+    if (_termLatestContent) {
+        const pre = document.getElementById('term-content');
+        pre.innerHTML = ansiToHtml(_termLatestContent);
+        _termLastContent = _termLatestContent;
+    }
+    display.scrollTop = display.scrollHeight;
+}
+
+// `content` must be ANSI-stripped; `target` keys the per-pane dismiss state.
+function detectSmartActions(content, target, agentKind) {
+    if (!content) return null;
+    const st = _getSmartState(target);
+    if (st.dismissedContent && content === st.dismissedContent) return null;
+    // Reset dismiss if content changed
+    if (st.dismissedContent && content !== st.dismissedContent) st.dismissedContent = null;
+
+    // Callers pass detectionTail() output; the slice only restates the window.
+    const lines = content.split('\n');
+    const tail = lines.slice(-_detectionWindow).join('\n');
+
+    for (const pattern of SMART_PATTERNS) {
+        if (pattern.agents && !pattern.agents.includes(agentKind)) continue;
+        const match = pattern.match(tail);
+        if (match) {
+            const notifyOnly = !!(pattern.notifyOnly && pattern.notifyOnly(tail));
+            // Static, not a predicate: whether a pattern represents something
+            // WAITING on the human is a property of the pattern, not of the
+            // pane's current text.
+            const passive = !!pattern.passive;
+            if (pattern.getActions) {
+                const actions = pattern.getActions(tail, match);
+                if (actions) return { id: pattern.id, desc: pattern.desc, actions, notifyOnly, passive };
+            } else {
+                return { id: pattern.id, desc: pattern.desc, actions: pattern.actions, notifyOnly, passive };
+            }
+        }
+    }
+    return null;
+}
+
+function renderSmartActions(result, targetOverride) {
+    // The vault's one-tap key shares the terminal-update cadence, but keeps its
+    // own compact composer slot rather than adding another full-width action bar.
+    if (typeof renderVaultQuickSend === 'function') renderVaultQuickSend();
+    // notify-only detections still mark the tab and fire a push, but render no
+    // action bar. Cleared here rather than at the call sites so every caller
+    // (poll scan, WS stream, tab switch) is covered by one rule.
+    if (result && result.notifyOnly) result = null;
+    // Dedupe key must distinguish actions by what they SEND — numbered-options
+    // and claude-resume actions have no `send`, so fall back to optNum/claudeCmd/label.
+    const key = result ? result.id + '|' + result.actions.map(a => a.secret ? '***' : (a.send ?? a.optNum ?? a.claudeCmd ?? a.label)).join(',') : '';
+    const target = targetOverride || _termTarget;
+
+    const st = _getSmartState(target);
+    if (st.key === key && _smartActionTarget === target) return;
+    st.key = key;
+    _smartActionTarget = target;
+
+    const container = document.getElementById('smart-actions');
+    if (!result) {
+        container.classList.remove('visible');
+        return;
+    }
+
+    const label = document.getElementById('smart-actions-label');
+    const grid = document.getElementById('smart-actions-grid');
+
+    // Show label with Auto-Yes toggle when applicable
+    if (_isAutoYesCandidate(result)) {
+        const session = _smartActionTarget ? _smartActionTarget.split(':')[0] : '';
+        const active = isAutoYes(session);
+        label.innerHTML = '';
+        label.appendChild(document.createTextNode(result.desc));
+        const toggle = document.createElement('button');
+        toggle.className = 'sa-autoyes' + (active ? ' active' : '');
+        toggle.textContent = active ? '\u26A1 Auto' : '\u26A1';
+        toggle.addEventListener('click', toggleAutoYes);
+        label.appendChild(toggle);
+    } else {
+        label.textContent = result.desc;
+    }
+
+    grid.innerHTML = '';
+    grid.classList.toggle('sa-vertical', result.id === 'numbered-options');
+
+    for (const action of result.actions) {
+        const btn = document.createElement('button');
+        btn.className = 'sa-btn sa-' + action.color;
+        btn.textContent = action.label;
+        if (action.noop) {
+            btn.style.opacity = '0.5';
+            btn.style.cursor = 'default';
+        } else if (action.restart) {
+            const cmd = action.claudeCmd;
+            btn.addEventListener('click', () => restartClaudeSession(cmd));
+        } else if (action.isOption) {
+            const num = action.optNum;
+            btn.addEventListener('click', () => sendSmartAction(num, true));
+        } else if (action.keys) {
+            const keys = action.keys;
+            const kEnter = action.enter;
+            btn.addEventListener('click', () => sendSmartKeyAction(keys, kEnter));
+        } else {
+            const send = action.send;
+            const enter = action.enter;
+            btn.addEventListener('click', () => sendSmartAction(send, enter));
+        }
+        grid.appendChild(btn);
+    }
+
+    // Guard: suppress scroll-freeze from the layout shift
+    _layoutShifting = true;
+    container.classList.add('visible');
+    // Defer unfreeze to AFTER the layout reflow, so the scroll event
+    // from the height change doesn't re-pause the terminal
+    requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+            _unfreezeAndScroll();
+            _layoutShifting = false;
+        });
+    });
+}
+
+function hideSmartActions() {
+    _getSmartState(_smartActionTarget).key = '';
+    _layoutShifting = true;
+    document.getElementById('smart-actions').classList.remove('visible');
+    requestAnimationFrame(() => {
+        requestAnimationFrame(() => { _layoutShifting = false; });
+    });
+}
+
+function dismissSmartActions() {
+    const target = _smartActionTarget || _termTarget;
+    // Use the content of whichever pane the actions came from (main or split)
+    let content = _termLatestContent;
+    if (target && target !== _termTarget) {
+        const session = _termTarget ? _termTarget.split(':')[0] : '';
+        const split = _splitPanes[session];
+        if (split && split.target === target) content = split.lastContent;
+    }
+    // Store the same stripped tail detection receives (detectionTail) — a raw
+    // capture here would never match and the panel would reappear on the
+    // next poll.
+    _getSmartState(target).dismissedContent = content ? detectionTail(content) : null;
+    hideSmartActions();
+}
+
+// Send a sequence of named keys (e.g. arrow keys to move a TUI dialog's
+// selection), then optionally Enter — for prompts that don't take typed text
+// (OpenCode's permission dialog). Keys must be in the server's TMUX_KEY_MAP.
+async function sendSmartKeyAction(keys, withEnter) {
+    try {
+        const target = _smartActionTarget || getInputTarget();
+        for (const k of keys) {
+            await fetch('/key', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ keys: k, target: target }),
+            });
+        }
+        await sendSmartAction('', withEnter);
+    } catch (e) {
+        showFlash('error', 'Offline');
+    }
+}
+
+async function sendSmartAction(text, withEnter) {
+    try {
+        const target = _smartActionTarget || getInputTarget();
+        const resp = await fetch('/type', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ text: text, enter: !!withEnter, target: target }),
+        });
+        const data = await resp.json();
+        if (data.ok) {
+            showFlash('sent', data.via === 'tmux' ? 'Sent (tmux)' : 'Sent!');
+            hideSmartActions();
+            _unfreezeAndScroll();
+        } else {
+            showFlash('error', data.error || 'Failed');
+        }
+    } catch (e) {
+        showFlash('error', 'Offline');
+    }
+}
+
+async function restartClaudeSession(claudeCmd) {
+    const target = _smartActionTarget || _termTarget;
+    if (!target) { showFlash('error', 'No session'); return; }
+    const session = target.split(':')[0];
+
+    hideSmartActions();
+    showFlash('sent', 'Restarting session\u2026');
+
+    try {
+        // 0. Grab CWD before killing (needed for renamed/duplicated tabs)
+        let sessionCwd = '';
+        try {
+            const cwdResp = await fetch(`/terminal/cwd?session=${encodeURIComponent(session)}`);
+            const cwdData = await cwdResp.json();
+            if (cwdData.ok) sessionCwd = cwdData.cwd;
+        } catch (_) {}
+
+        // 1. Kill the old tmux session
+        await fetch('/terminal/kill', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ session: session }),
+        });
+
+        // Clean up command split pane
+        onSessionKillCommands(session);
+
+        // Brief pause for tmux cleanup
+        await new Promise(r => setTimeout(r, 300));
+
+        // 2. Re-launch via project launcher (venv only, skip init — we'll prompt)
+        //    Pass cwd as fallback for renamed/duplicated tabs whose name != project dir
+        const launchResp = await fetch('/terminal/launch', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ project: session, cwd: sessionCwd, skip_init: true }),
+        });
+        const launchData = await launchResp.json();
+        if (!launchData.ok) {
+            showFlash('error', launchData.error || 'Relaunch failed');
+            return;
+        }
+
+        // Update global target
+        _termTarget = launchData.target;
+        noteTargetChosen(_termTarget, true);
+        _termExpectedIdentity = launchData.expected_target_identity || null;
+        _smartActionTarget = launchData.target;
+        updateTmuxIndicator();
+        try { localStorage.setItem('term_target', _termTarget); } catch(e) {}
+
+        // Set server target
+        await fetch('/terminal/target', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ target: _termTarget }),
+        });
+
+        // Refresh session tabs
+        await loadSessions();
+
+        // 3. Prompt to run init command if configured
+        let initWait = 500; // base wait for venv activation
+        if (launchData.init_cmd && confirm('Run setup commands?\n\n' + launchData.init_cmd)) {
+            await fetch('/terminal/run-init', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ session: session }),
+            });
+            initWait = 1500; // wait for init command to finish
+        }
+        await new Promise(r => setTimeout(r, initWait));
+
+        // 4. Send the claude command
+        const typeResp = await fetch('/type/client-restart', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                text: claudeCmd,
+                enter: true,
+                target: _termTarget,
+                expected_target_identity: _termExpectedIdentity,
+            }),
+        });
+        const typeData = await typeResp.json();
+        if (typeData.ok) {
+            showFlash('sent', 'Claude starting\u2026');
+        } else {
+            showFlash('error', typeData.error || 'Send failed');
+        }
+
+        // Resume terminal capture
+        _termPaused = false;
+        document.getElementById('term-display').classList.remove('hidden');
+        startPolling();
+
+    } catch (e) {
+        showFlash('error', 'Restart failed: ' + e.message);
+    }
+}
