@@ -239,6 +239,7 @@ async function syncAutoYesState() {
     try {
         const resp = await fetch('/autoyes/status');
         const data = await resp.json();
+        if (typeof SplitView !== 'undefined') SplitView.syncCountdowns(data);
         _autoyesState = data.sessions || {};
         _autoyesDelays = data.delays || {};
         if (data.global) _autoyesGlobal = data.global;
@@ -280,6 +281,8 @@ async function cancelAutoYesCountdown() {
 
 // Handle autoyes WS messages from server
 function handleAutoYesWsMessage(msg) {
+    if (typeof SplitView !== 'undefined') SplitView.event(msg);
+    if (typeof SplitView !== 'undefined' && SplitView.enabled) return;
     if (msg.event === 'countdown') {
         _autoyesCountdown = { target: msg.target, remaining: msg.remaining, delay: msg.delay || 5, prompt_type: msg.prompt_type, summary: msg.summary || null };
         _renderAutoYesCountdown();
@@ -785,6 +788,7 @@ function detectSmartActions(content, target, agentKind) {
 }
 
 function renderSmartActions(result, targetOverride) {
+    if (typeof SplitView !== 'undefined' && SplitView.enabled && (targetOverride || _termTarget) !== _termTarget) return;
     // The vault's one-tap key shares the terminal-update cadence, but keeps its
     // own compact composer slot rather than adding another full-width action bar.
     if (typeof renderVaultQuickSend === 'function') renderVaultQuickSend();
@@ -794,7 +798,8 @@ function renderSmartActions(result, targetOverride) {
     if (result && result.notifyOnly) result = null;
     // Dedupe key must distinguish actions by what they SEND — numbered-options
     // and claude-resume actions have no `send`, so fall back to optNum/claudeCmd/label.
-    const key = result ? result.id + '|' + result.actions.map(a => a.secret ? '***' : (a.send ?? a.optNum ?? a.claudeCmd ?? a.label)).join(',') : '';
+    const fingerprint = typeof SplitView !== 'undefined' && SplitView.enabled ? SplitView.promptFingerprint(_termLatestContent) : '';
+    const key = result ? fingerprint + '|' + result.id + '|' + result.actions.map(a => a.secret ? '***' : (a.send ?? a.optNum ?? a.claudeCmd ?? a.label)).join(',') : '';
     const target = targetOverride || _termTarget;
 
     const st = _getSmartState(target);
@@ -826,6 +831,7 @@ function renderSmartActions(result, targetOverride) {
         label.textContent = result.desc;
     }
 
+    if (typeof SplitView !== 'undefined' && SplitView.enabled) label.prepend(document.createTextNode(_termTarget + ' · '));
     grid.innerHTML = '';
     grid.classList.toggle('sa-vertical', result.id === 'numbered-options');
 
@@ -850,6 +856,16 @@ function renderSmartActions(result, targetOverride) {
             const send = action.send;
             const enter = action.enter;
             btn.addEventListener('click', () => sendSmartAction(send, enter));
+        }
+        if (typeof SplitView !== 'undefined' && SplitView.enabled) {
+            const renderedTarget = target;
+            const renderedContent = SplitView.promptFingerprint(_termLatestContent);
+            btn.addEventListener('click', e => {
+                if (renderedTarget !== _termTarget || renderedContent !== SplitView.promptFingerprint(_termLatestContent)) {
+                    e.stopImmediatePropagation();
+                    showFlash('error', 'Prompt changed; choose the current action');
+                }
+            }, true);
         }
         grid.appendChild(btn);
     }
@@ -898,32 +914,35 @@ function dismissSmartActions() {
 async function sendSmartKeyAction(keys, withEnter) {
     try {
         const target = _smartActionTarget || getInputTarget();
+        const identity = typeof inputIdentity === 'function' ? inputIdentity() : {};
         for (const k of keys) {
+            if (typeof SplitView !== 'undefined' && SplitView.enabled && target !== _termTarget) return;
             await fetch('/key', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ keys: k, target: target }),
+                body: JSON.stringify({ keys: k, target: target, ...identity }),
             });
         }
-        await sendSmartAction('', withEnter);
+        if (typeof SplitView !== 'undefined' && SplitView.enabled && target !== _termTarget) return;
+        await sendSmartAction('', withEnter, target, identity);
     } catch (e) {
         showFlash('error', 'Offline');
     }
 }
 
-async function sendSmartAction(text, withEnter) {
+async function sendSmartAction(text, withEnter, pinnedTarget = null, pinnedIdentity = null) {
     try {
-        const target = _smartActionTarget || getInputTarget();
+        const target = pinnedTarget || _smartActionTarget || getInputTarget();
+        const identity = pinnedIdentity || (typeof inputIdentity === 'function' ? inputIdentity() : {});
         const resp = await fetch('/type', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ text: text, enter: !!withEnter, target: target }),
+            body: JSON.stringify({ text: text, enter: !!withEnter, target: target, ...identity }),
         });
         const data = await resp.json();
         if (data.ok) {
             showFlash('sent', data.via === 'tmux' ? 'Sent (tmux)' : 'Sent!');
-            hideSmartActions();
-            _unfreezeAndScroll();
+            if (!(typeof SplitView !== 'undefined' && SplitView.enabled) || target === _termTarget) { hideSmartActions(); _unfreezeAndScroll(); }
         } else {
             showFlash('error', data.error || 'Failed');
         }

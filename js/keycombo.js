@@ -59,7 +59,7 @@ async function sendCombo(key) {
         const resp = await fetch('/key', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({combo: combo, target: getInputTarget()}),
+            body: JSON.stringify({combo: combo, target: getInputTarget(), ...(typeof inputIdentity === 'function' ? inputIdentity() : {})}),
         });
         const data = await resp.json();
         if (data.ok) {

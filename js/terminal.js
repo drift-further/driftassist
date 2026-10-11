@@ -483,6 +483,7 @@ async function loadSessions() {
         _sessionPanes = panes;
 
         container.innerHTML = '';
+        if (typeof SplitView !== 'undefined' && panes.length === 0) SplitView.reconcile(panes,requestedAt);
         if (panes.length === 0) {
             container.innerHTML = '<span class="session-tabs-empty">No sessions</span>';
             return;
@@ -538,6 +539,13 @@ async function loadSessions() {
             tab.onclick = function() { selectTab(p.target); };
             if (p.target === current) tab.classList.add('active');
             container.appendChild(tab);
+        }
+
+        if (typeof SplitView !== 'undefined') SplitView.reconcile(panes, requestedAt);
+        if (typeof SplitView !== 'undefined' && SplitView.enabled) {
+            markActiveTab(_termTarget); SplitView.update();
+            if (typeof _postTabRender === 'function') _postTabRender();
+            return;
         }
 
         // Auto-select if we have a saved target
@@ -604,7 +612,8 @@ const _DOUBLE_TAP_MS = 500;
 // is being typed": a tap is permission to swap the text out, a switch that
 // happens TO you is not.
 function selectTab(target, auto) {
-    if (target === _termTarget && (Date.now() - _lastTabTapTime) < _DOUBLE_TAP_MS) {
+    if (typeof SplitView !== 'undefined' && SplitView.intercept(target)) return;
+    if (!(typeof SplitView !== 'undefined' && SplitView.enabled) && target === _termTarget && (Date.now() - _lastTabTapTime) < _DOUBLE_TAP_MS) {
         _lastTabTapTime = 0;  // consume; require fresh sequence for next clear
         _clearActivePane(target);
         return;
@@ -838,6 +847,7 @@ function _scheduleRender(content, info, target) {
 }
 
 function _doRender(content, info, target) {
+    if (typeof SplitView !== 'undefined' && SplitView.enabled && (target !== _termTarget || SplitView.slots[SplitView.active].dead)) return;
     _lastRenderTime = Date.now();
 
     // Update info bar
@@ -1105,6 +1115,7 @@ function onWsMessage(event) {
 }
 
 function _applyTerminalContent(content, info, target) {
+    if (typeof SplitView !== 'undefined' && SplitView.enabled && SplitView.slots[SplitView.active].dead) return;
     // Reject stale content for wrong target
     if (target && _termTarget && target !== _termTarget) return;
     // Delegate to throttled renderer
@@ -1381,6 +1392,7 @@ function _calcTuiSize() {
 // or the Fit button. Uses _calcTuiSize (exact viewport, no 60-row floor) and acts on
 // the given tab's session even if a real client is attached — it's an explicit ask.
 async function fitTuiToScreen(target) {
+    if (typeof SplitView !== 'undefined' && SplitView.enabled) return SplitView.fit(SplitView.active);
     target = target || _termTarget;
     if (!target || !_paneTui[target]) return;
     const session = target.split(':')[0];
@@ -1414,7 +1426,7 @@ function _tuiSendKey(keys) {
     fetch('/key', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ keys: keys, target: _termTarget }),
+        body: JSON.stringify({ keys: keys, target: _termTarget, ...(typeof inputIdentity === 'function' ? inputIdentity() : {}) }),
     }).catch(function() {});
 }
 
@@ -1556,6 +1568,7 @@ function _openCodeCanPan(display, dx, dy) {
  *  cols=null → auto width (fit viewport). cols=number → that width.
  *  rows=null → auto height (viewport, 60-row floor). rows=number → that exact height (min 10). */
 async function termFitToScreen(cols = null, rows = null, opts = {}) {
+    if (typeof SplitView !== 'undefined' && SplitView.enabled) return SplitView.fit(SplitView.active,cols,rows,opts);
     if (!_termTarget) return;
     const session = _termTarget.split(':')[0];
     const calc = _calcTermSize();

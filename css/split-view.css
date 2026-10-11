@@ -1,0 +1,79 @@
+/* Reuse the current chrome, terminal headers and composer; no parallel shell. */
+.split-views { display:flex; flex:1; min-height:0; gap:6px; }
+.split-main { display:flex; flex-direction:column; flex:1; min-width:0; min-height:0; }
+.split-companion { flex:1; min-width:0; }
+.split-companion[hidden], .split-selector[hidden], .split-destination[hidden], .split-stops[hidden] { display:none; }
+/* Tabs sit on their pane's box: the row cancels the panel gap and each tab drops
+   1px over the box's top border, so tab and pane read as one outline. The
+   selected side is outlined in coral; swap/single sit between the tabs. */
+.split-selector { display:flex; align-items:center; gap:6px; flex-shrink:0; position:relative; z-index:3; margin-bottom:-6px; }
+.split-ctl button, .split-identity, .split-picker button, .split-change, .split-fit, .split-page, #term-info > button:not(.term-tui-chip) { font:inherit; background:var(--bg-raised); border:1px solid var(--border); color:var(--text-dim); border-radius:6px; cursor:pointer; }
+.split-ctl { display:flex; gap:4px; flex-shrink:0; }
+.split-ctl button { min-height:28px; min-width:32px; padding:4px 8px; font-size:10px; }
+.split-tab { flex:1; min-width:0; display:flex; height:34px; position:relative; top:1px; background:var(--bg-term); border:1px solid var(--border); border-bottom:0; border-radius:6px 6px 0 0; color:var(--text-dim); }
+.split-tab.selected { border-color:var(--coral); color:var(--text-strong); }
+.split-tab button { font:10px var(--font); color:inherit; background:none; border:0; cursor:pointer; }
+.split-tab-label { flex:1; min-width:0; padding:0 10px; text-align:left; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.split-tab-menu { flex-shrink:0; width:34px; color:var(--text-dim) !important; border-radius:0 6px 0 0; }
+.split-tab-menu:hover, .split-tab-menu[aria-expanded="true"] { color:var(--text-strong) !important; background:var(--bg-selected) !important; }
+.split-enabled .split-companion { border-color:var(--border); }
+.split-enabled .split-main > .term-display, .split-enabled .split-main > .opencode-output { border-color:var(--coral); }
+.split-views:not(.split-b-active) .split-main > *, .split-views.split-b-active .split-companion { border-top-left-radius:0; }
+.split-views.split-b-active .split-main > *, .split-views:not(.split-b-active) .split-companion { border-top-right-radius:0; }
+.split-menu { position:fixed; z-index:60; overflow:auto; display:flex; flex-direction:column; gap:2px; padding:6px; background:var(--bg-raised); border:1px solid var(--border); border-radius:8px; box-shadow:0 8px 24px #000a; font:11px var(--font); }
+.split-menu[hidden] { display:none; }
+.split-menu-head { padding:4px 6px 6px; font-size:9px; letter-spacing:1px; text-transform:uppercase; color:var(--text-muted); }
+.split-menu button { min-height:36px; padding:6px 8px; text-align:left; font:inherit; color:var(--text); background:none; border:0; border-radius:6px; cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex-shrink:0; }
+.split-menu button:hover:not(:disabled), .split-menu button:focus-visible { background:var(--bg-selected); color:var(--text-strong); }
+.split-menu button:disabled { cursor:default; color:var(--text-muted); }
+.split-menu p { margin:6px; color:var(--text-dim); }
+.split-choice-kind { color:var(--text-dim); }
+.split-menu button:disabled .split-choice-kind { color:var(--text-muted); }
+.split-enabled .term-info { gap:5px; }
+.split-identity { font-size:9px; padding:4px 6px; max-width:60%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; letter-spacing:0; }
+.split-enabled .term-info-cmd { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.split-enabled #term-info-cmd { flex:1; }
+.split-destination { font:10px var(--font); color:var(--text-strong); width:100%; max-width:720px; align-self:center; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-height:14px; }
+.split-enabled .term-content { min-width:max-content; }
+.split-enabled .autoyes-countdown { display:none !important; }
+.split-stops { display:flex; gap:6px; flex-shrink:0; }
+.split-stop-row { display:flex; align-items:center; gap:6px; flex:1; min-width:0; min-height:44px; color:var(--amber); font-size:10px; }
+.split-stop-row span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; }
+.split-stop-row button { min-height:44px; min-width:56px; font:700 11px var(--font); color:var(--red); background:var(--bg-raised); border:1px solid var(--border); border-radius:6px; cursor:pointer; }
+.split-latest, .split-more { font:10px var(--font); color:var(--cyan); background:var(--bg-raised); border:1px solid var(--border); border-radius:6px; min-height:44px; }
+.split-latest { position:sticky; bottom:0; }
+.session-tab.split-visible { background:var(--bg-selected); }
+.session-tab[data-split-slot]::before { content:attr(data-split-slot); font-size:8px; color:var(--text-dim); margin-right:4px; }
+.split-picker { width:min(500px,calc(100vw - 20px)); padding:14px; background:var(--bg-panel); color:var(--text); border:1px solid var(--border); border-radius:8px; font:12px var(--font); }
+.split-picker::backdrop { background:#0009; }
+.split-picker form { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
+.split-picker input { width:100%; padding:12px; border:1px solid var(--border); background:var(--bg-term); color:var(--text); font:inherit; border-radius:6px; margin-bottom:10px; }
+.split-choices { max-height:55dvh; overflow:auto; display:flex; flex-direction:column; gap:6px; }
+.split-picker button { min-height:44px; padding:8px; text-align:left; }
+.split-picker button:disabled { opacity:.5; cursor:default; }
+.split-picker p { font:12px var(--sans); color:var(--text-dim); margin:10px 0 0; }
+.split-picker :focus-visible, .split-selector :focus-visible, .split-menu :focus-visible, .split-identity:focus-visible { outline:2px solid var(--cyan); outline-offset:1px; }
+.split-menu :focus-visible { outline-offset:-2px; }
+@media(max-width:799px) {
+ .split-enabled .split-companion { display:none; }
+ .split-tab { height:44px; }
+ .split-tab button { font-size:9px; }
+ .split-tab-label { padding:0 6px; }
+ .split-tab-menu { width:36px; }
+ /* One pane shows: the unselected tab sits on the selected box's top edge. */
+ .split-tab:not(.selected) { top:0; }
+ .split-tab.selected { flex-grow:2; }
+ .split-ctl button { min-height:40px; min-width:40px; padding:4px 6px; font-size:9px; }
+ .split-menu button { min-height:44px; }
+ .split-enabled .term-info { min-height:44px; height:44px; padding:0 5px; }
+ .split-enabled .term-info button { min-height:44px; font-size:9px; padding:4px 5px; }
+ .split-enabled .input-wrap { min-height:54px; }
+ .split-enabled #text-input { min-height:54px; padding:8px; }
+ .split-stops { gap:4px; }
+ .split-stop-row { font-size:9px; }
+ .split-enabled .term-info-dim { display:none; }
+ .split-enabled .term-content { min-height:0; }
+}
+
+.split-enabled .term-info > button { font:10px var(--font); min-height:32px; padding:4px 6px; }
+@media(max-width:799px) { .split-enabled .term-info > button { min-height:44px; font-size:9px; } }

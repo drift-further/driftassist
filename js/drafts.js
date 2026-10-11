@@ -120,6 +120,14 @@ function _applyDraftToComposer(target, force) {
     input.value = d.text || '';
     _composerSynced = { target: target, text: input.value };
     _attachments = (d.attachments || []).map(a => ({ ...a, uploading: false }));
+    if (typeof SplitView !== 'undefined' && SplitView.enabled) {
+        const record = SplitView.slots.find(r => r.target === target);
+        const tray = record && SplitView.trays.get(record.pane_id);
+        if (tray) {
+            const pending = tray.filter(a => a.uploading);
+            _attachments.push(...pending.filter(a => !_attachments.some(b => b.id === a.id)));
+        }
+    }
     _draftInitFor = target;
     renderAttachments();
     if (typeof renderSegChips === 'function') renderSegChips();
@@ -163,6 +171,7 @@ async function flushDraft(target) {
     if (!target) return;
     const d = _draftCache[target];
     if (!d) return;
+    const seq = _draftSeq[target] || 0;
     if (_draftDirtyFor === target) _draftDirtyFor = null;
     try {
         const resp = await fetch('/api/draft', {
@@ -180,6 +189,7 @@ async function flushDraft(target) {
         });
         const data = await resp.json();
         if (data.ok) {
+            if ((_draftSeq[target] || 0) !== seq) return;
             _draftCache[target] = data.draft;
             _draftRev[target] = data.draft.updated_at;
             // The server now holds this text, so the composer is no longer

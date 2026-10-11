@@ -300,7 +300,7 @@ function connectSplitWs(session) {
                     state.target,
                     state.agentKind
                 );
-                if (detected) renderSmartActions(detected, state.target);
+                if (detected && !(typeof SplitView !== 'undefined' && SplitView.enabled)) renderSmartActions(detected, state.target);
             }
         } catch (e) {}
     };
@@ -365,6 +365,11 @@ function updateInputToggleUI() {
 // ================================================================
 
 function onTabSwitchCommands(newSession) {
+    if (typeof SplitView !== 'undefined' && SplitView.enabled) {
+        _inputToSplit = false;
+        document.getElementById('cmd-output').classList.remove('visible');
+        return;
+    }
     _currentCommandsProject = '';
     _currentCommands = [];
     _inputToSplit = false;

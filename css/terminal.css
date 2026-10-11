@@ -846,10 +846,13 @@ body.tabs-wrap .tabs-scroll-btn { display: none; }
     font-size: 10px; color: var(--text-muted); letter-spacing: 1px;
 }
 
-/* Terminal horizontal scrollbar */
-.term-display::-webkit-scrollbar { height: 8px; }
+/* Terminal scrollbars. The vertical bar is wider than base.css's 4px so it can
+   be grabbed, and its thumb keeps a minimum length on a long scrollback. */
+.term-display::-webkit-scrollbar { width: 12px; height: 8px; }
 .term-display::-webkit-scrollbar-track { background: rgba(9, 12, 14, 0.8); }
 .term-display::-webkit-scrollbar-thumb { background: rgba(131, 215, 162, 0.25); border-radius: 4px; }
+.term-display::-webkit-scrollbar-thumb:vertical { min-height: 48px; border-radius: 6px; }
+.term-display::-webkit-scrollbar-thumb:hover { background: rgba(131, 215, 162, 0.4); }
 .term-display::-webkit-scrollbar-thumb:active { background: rgba(131, 215, 162, 0.5); }
 .term-display { -webkit-overflow-scrolling: touch; touch-action: pan-x pan-y; }
 

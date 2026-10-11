@@ -18,6 +18,7 @@ import shared.tab_state as tab_state
 from shared.agent_identity import resolve_process
 from shared.auth import client_ip
 from shared.tmux import (
+    ExpectedTargetIdentity,
     activate_venv,
     capture_pane,
     create_tmux_session,
@@ -488,6 +489,16 @@ def terminal_set_target():
     return jsonify({"ok": True, "target": state.tmux_target})
 
 
+@terminal_bp.route("/terminal/identity")
+def terminal_identity():
+    """Bind a browser view to a concrete pane generation before it can send."""
+    target = request.args.get("target", "")
+    identity = expected_target_identity(target) if target else None
+    if identity is None:
+        return jsonify({"ok": False, "error": "target_absent"}), 409
+    return jsonify({"ok": True, "identity": identity.as_dict()})
+
+
 @terminal_bp.route("/terminal/resize", methods=["POST"])
 def terminal_resize():
     """Resize a tmux session window to given cols x rows."""
@@ -507,12 +518,26 @@ def terminal_resize():
     # panes are excluded from TUI fit).
     rows = max(10, min(int(rows), 200))
 
+    resize_target = f"={session}"
+    if data.get("target"):
+        identity = expected_target_identity(data["target"])
+        if identity is None:
+            return jsonify({"ok": False, "error": "target_absent"}), 409
+        if "expected_target_identity" in data:
+            try:
+                carried = ExpectedTargetIdentity.from_value(data["expected_target_identity"])
+            except (KeyError, TypeError, ValueError):
+                carried = None
+            if carried != identity:
+                return jsonify({"ok": False, "error": "target_absent"}), 409
+        resize_target = identity.window_id
+
     proc = subprocess.run(
         [
             "tmux",
             "resize-window",
             "-t",
-            f"={session}",
+            tmux_exact_target(resize_target),
             "-x",
             str(cols),
             "-y",

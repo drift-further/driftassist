@@ -213,6 +213,10 @@ async function consolidatedPoll() {
         // Collapsed-chrome grabber mirrors #status-dot / #studio-badge.
         if (typeof syncChromeGrabber === 'function') syncChromeGrabber();
 
+        if (typeof SplitView !== 'undefined' && SplitView.enabled) {
+            syncAutoYesState().then(() => SplitView.update());
+        }
+
         // Orphaned split pane check
         for (const session of Object.keys(_splitPanes)) {
             checkSplitPaneAlive(session);
@@ -361,6 +365,7 @@ function _applySessionsData(panes, activeTarget, requestedAt) {
 
     _sessionPanes = panes;
     container.innerHTML = '';
+    if (typeof SplitView !== 'undefined' && panes.length === 0) SplitView.reconcile(panes,requestedAt || Date.now());
     if (panes.length === 0) {
         container.innerHTML = '<span class="session-tabs-empty">No sessions</span>';
         return;
@@ -412,6 +417,13 @@ function _applySessionsData(panes, activeTarget, requestedAt) {
         tab.onclick = function() { selectTab(p.target); };
         if (p.target === current) tab.classList.add('active');
         container.appendChild(tab);
+    }
+
+    if (typeof SplitView !== 'undefined') SplitView.reconcile(panes, requestedAt || Date.now());
+    if (typeof SplitView !== 'undefined' && SplitView.enabled) {
+        markActiveTab(_termTarget); SplitView.update();
+        if (typeof _postTabRender === 'function') _postTabRender();
+        return;
     }
 
     const hadTarget = !!_termTarget;
@@ -565,7 +577,7 @@ function _applyScanData(scanPanes) {
     const questions = [];
     for (const pane of scanPanes) {
         const isActive = _termOpen && pane.target === _termTarget;
-        if (isActive) {
+        if (isActive || (typeof SplitView !== 'undefined' && SplitView.readable(pane.target))) {
             if (pane.prompt) {
                 questions.push({target: pane.target, session: pane.session, prompt: pane.prompt, inView: true});
             }

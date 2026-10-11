@@ -50,6 +50,18 @@ log = logging.getLogger(__name__)
 _favorites_lock = threading.RLock()
 
 
+def _input_identity(data, target):
+    """A carried browser identity cannot adopt a new pane at the old name."""
+    live = expected_target_identity(target) if target else None
+    if "expected_target_identity" not in data:
+        return live
+    try:
+        carried = ExpectedTargetIdentity.from_value(data["expected_target_identity"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return carried if carried == live else None
+
+
 def _load_favorites():
     """Favorites with stable ids guaranteed, persisting the upgrade if it minted any."""
     with _favorites_lock:
@@ -204,7 +216,7 @@ def _send_key_effect():
 
     target = resolve_target(data)
 
-    expected = expected_target_identity(target) if target else None
+    expected = _input_identity(data, target)
     if expected is None:
         return jsonify({"ok": False, "error": "target_absent"}), 409
     if keys == "ctrl+shift+v":
@@ -243,7 +255,7 @@ def _send_combo(data):
     except ComboError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     target = resolve_target(data)
-    expected = expected_target_identity(target) if target else None
+    expected = _input_identity(data, target)
     if expected is None:
         return jsonify({"ok": False, "error": "target_absent"}), 409
     result = generation_bound_delivery(expected, keys=(tmux_key,))
@@ -316,7 +328,7 @@ def _type_text_effect(require_carried_identity=False):
         except (KeyError, TypeError, ValueError):
             expected = None
     else:
-        expected = expected_target_identity(target) if target else None
+        expected = _input_identity(data, target)
     if expected is None:
         return jsonify({"ok": False, "error": "target_absent"}), 409
     if _prompt_answer_is_stale(data, expected):

@@ -85,6 +85,7 @@ let _layoutShifting = false;    // true during smart-actions show/hide to suppre
 let _inputToSplit = false;
 
 function getInputTarget() {
+    if (typeof SplitView !== 'undefined' && SplitView.enabled) return SplitView.inputTarget();
     if (_inputToSplit) {
         const session = _termTarget ? _termTarget.split(':')[0] : '';
         const state = _splitPanes[session];
@@ -139,4 +140,10 @@ function authLost(resp) {
         location.replace('/login');
     }
     return true;
+}
+
+// Carry the selected pane generation across asynchronous input dispatch.
+function inputIdentity() {
+    if (typeof SplitView === 'undefined' || !SplitView.enabled) return {};
+    return {expected_target_identity: SplitView.slots[SplitView.active].identity};
 }

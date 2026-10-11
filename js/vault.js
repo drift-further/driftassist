@@ -280,7 +280,7 @@ async function vaultSendDefault() {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({text: value, enter: true, expand: false,
-                                  secret: true, target: _termTarget}),
+                                  secret: true, target: _termTarget, ...(typeof inputIdentity === 'function' ? inputIdentity() : {})}),
         });
         const data = await resp.json();
         if (data.ok) {

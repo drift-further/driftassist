@@ -59,11 +59,13 @@ function addAttachment(file) {
         size: file.size,
         path: null,
         uploading: true,
+        owner: typeof _draftTarget === 'function' ? _draftTarget() : _termTarget,
     };
     _attachments.push(entry);
     renderAttachments();
     // The tray travels with the tab's draft, so every mutation is a draft edit.
     if (typeof saveDraftSoon === 'function') saveDraftSoon();
+    if (typeof SplitView !== 'undefined' && SplitView.enabled) SplitView.trays.set(SplitView.slots[SplitView.active].pane_id,_attachments);
     _uploadAttachment(entry, file);
 }
 
@@ -83,6 +85,17 @@ async function _uploadAttachment(entry, file) {
     } catch (e) {
         _attachments = _attachments.filter(a => a.id !== entry.id);
         showFlash('error', file.name + ': upload failed');
+    }
+    if (typeof SplitView !== 'undefined' && SplitView.enabled && entry.owner !== _draftTarget()) {
+        const record = SplitView.slots.find(r => r.target === entry.owner);
+        const tray = record && SplitView.trays.get(record.pane_id);
+        if (tray && tray.includes(entry)) {
+            const kept = tray.filter(a => a !== entry || !!entry.path);
+            SplitView.trays.set(record.pane_id,kept);
+            _draftCache[entry.owner] = {..._draftEntry(entry.owner), attachments:kept.filter(a=>a.path).map(a=>({...a}))};
+            _bumpDraftSeq(entry.owner); flushDraft(entry.owner);
+        }
+        return;
     }
     renderAttachments();
     // Only now does the entry carry a path, which is the part the draft can
@@ -110,6 +123,12 @@ function renderAttachments() {
 
 async function doPaste() {
     if (_sending) return;
+    if (typeof SplitView !== 'undefined' && SplitView.enabled &&
+            (SplitView.slots[SplitView.active].dead || !SplitView.slots[SplitView.active].identity)) {
+        showFlash('error','Choose a live pane before sending'); return;
+    }
+    const sendTarget = getInputTarget();
+    const sendIdentity = typeof inputIdentity === 'function' ? inputIdentity() : {};
     // The tab whose draft this message IS. Captured up front: a tab switch
     // mid-send must not clear the wrong tab's draft. Note this is _termTarget,
     // not getInputTarget() — input routing can aim the send at a split pane,
@@ -125,6 +144,7 @@ async function doPaste() {
     // a split. In the F2 direction (main prompt, ordinary split) that only gives
     // user-typed text the stricter secret posture; unlike the vault key, this
     // path never selects and injects a stored value on the user's behalf.
+    const sendTray = _attachments.slice();
     const hasAttachments = !!_attachments.length;
     let secret = !hasAttachments
         && typeof _isPasswordPrompt === 'function'
@@ -138,7 +158,7 @@ async function doPaste() {
     if (!raw && !_attachments.length) {
         // Empty send = press Enter in terminal
         if (_termTarget) {
-            try { await fetch('/type', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text: '', enter: true, target: getInputTarget()}) }); } catch(e) {}
+            try { await fetch('/type', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text: '', enter: true, target: getInputTarget(), ...(typeof inputIdentity === 'function' ? inputIdentity() : {})}) }); } catch(e) {}
         }
         return;
     }
@@ -182,6 +202,18 @@ async function doPaste() {
         }
     }
 
+    function restoreFailedSend() {
+        if (typeof SplitView !== 'undefined' && SplitView.enabled) {
+            const owner = SplitView.slots.find(r => r.target === draftTarget);
+            if (owner) SplitView.trays.set(owner.pane_id,sendTray);
+        }
+        if (draftTarget === _draftTarget()) { input.value = raw; _attachments = sendTray; renderAttachments(); }
+        else if (!secret) {
+            _draftCache[draftTarget] = {..._draftEntry(draftTarget),text:raw,attachments:sendTray};
+            _bumpDraftSeq(draftTarget); flushDraft(draftTarget);
+        }
+    }
+
     // Step 3: send combined text
     try {
         const resp = await fetch('/type', {
@@ -191,7 +223,7 @@ async function doPaste() {
             // composer opts in — the quick-action command buttons POST here too and
             // must keep sending shell text byte-for-byte.
             body: JSON.stringify({text: finalText, enter: true, expand: expand,
-                                  secret: secret, target: getInputTarget()}),
+                                  secret: secret, target: sendTarget, ...sendIdentity}),
         });
         const data = await resp.json();
         if (data.ok) {
@@ -211,19 +243,21 @@ async function doPaste() {
             if (typeof clearDraftAfterSend === 'function') clearDraftAfterSend(draftTarget);
         } else {
             showFlash('error', data.error || 'Failed');
-            input.value = raw;
+            if (draftTarget === _draftTarget()) input.value = raw;
+            restoreFailedSend();
             // Assigning .value does not fire the input event that owns the chip
             // strip, so restore the derived UI from the same token text too.
             if (typeof renderSegChips === 'function') renderSegChips();
             // Put it back so a failed send is not lost, but never persist a
             // password to the server-side draft store.
-            if (!secret && typeof saveDraftSoon === 'function') saveDraftSoon();
+            if (!secret && typeof saveDraftSoon === 'function' && draftTarget === _draftTarget()) saveDraftSoon();
         }
     } catch (e) {
         showFlash('error', 'Offline');
-        input.value = raw;
+        if (draftTarget === _draftTarget()) input.value = raw;
+        restoreFailedSend();
         if (typeof renderSegChips === 'function') renderSegChips();
-        if (!secret && typeof saveDraftSoon === 'function') saveDraftSoon();
+        if (!secret && typeof saveDraftSoon === 'function' && draftTarget === _draftTarget()) saveDraftSoon();
     } finally {
         _sending = false;
     }
@@ -290,7 +324,7 @@ async function sendKey(keys) {
         const resp = await fetch('/key', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({keys: keys, target: getInputTarget()}),
+            body: JSON.stringify({keys: keys, target: getInputTarget(), ...(typeof inputIdentity === 'function' ? inputIdentity() : {})}),
         });
         const data = await resp.json();
         if (data.ok) {
@@ -309,7 +343,7 @@ async function typeCmd(cmd) {
         const resp = await fetch('/type', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({text: cmd, enter: true, target: getInputTarget()}),
+            body: JSON.stringify({text: cmd, enter: true, target: getInputTarget(), ...(typeof inputIdentity === 'function' ? inputIdentity() : {})}),
         });
         const data = await resp.json();
         if (data.ok) {
@@ -334,7 +368,7 @@ async function typePrefix(ch) {
         const resp = await fetch('/type', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({text: ch, enter: false, no_history: true, target: getInputTarget()}),
+            body: JSON.stringify({text: ch, enter: false, no_history: true, target: getInputTarget(), ...(typeof inputIdentity === 'function' ? inputIdentity() : {})}),
         });
         const data = await resp.json();
         if (data.ok) {
@@ -389,7 +423,7 @@ async function sendInsertMode() {
         const resp = await fetch('/type', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ text: 'i', enter: false, target: getInputTarget() }),
+            body: JSON.stringify({ text: 'i', enter: false, target: getInputTarget(), ...(typeof inputIdentity === 'function' ? inputIdentity() : {}) }),
         });
         const data = await resp.json();
         if (data.ok) {
