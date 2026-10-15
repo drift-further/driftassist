@@ -259,6 +259,18 @@ class RealTmuxComboTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 200, response.get_json())
                 self.wait_for(expected)
 
+    def test_every_printable_character_arrives_as_itself(self):
+        # The More keys sheet puts all 94 one tap away (tests/test_more_keys.py),
+        # and several (`;` `#` `{` `-` `~` `$` `"` `\`) mean something to tmux's
+        # own command parser, so each is pinned byte for byte.
+        for code in range(0x21, 0x7f):
+            character = chr(code)
+            with self.subTest(key=character):
+                response = self.client.post(
+                    "/key", json={"target": self.pane_id, "combo": combo(character)})
+                self.assertEqual(response.status_code, 200, response.get_json())
+                self.wait_for(character.encode())
+
     def test_a_refused_combo_types_nothing(self):
         response = self.client.post("/key", json={
             "target": self.pane_id, "combo": combo("BSpace", ctrl=True)})

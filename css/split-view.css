@@ -16,6 +16,8 @@
 .split-tab-label { flex:1; min-width:0; padding:0 10px; text-align:left; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .split-tab-menu { flex-shrink:0; width:34px; color:var(--text-dim) !important; border-radius:0 6px 0 0; }
 .split-tab-menu:hover, .split-tab-menu[aria-expanded="true"] { color:var(--text-strong) !important; background:var(--bg-selected) !important; }
+.split-popout { flex-shrink:0; width:34px; font-size:17px !important; border-radius:4px; }
+.split-popout:hover { color:var(--text-strong); background:var(--bg-selected); }
 .split-enabled .split-companion { border-color:var(--border); }
 .split-enabled .split-main > .term-display, .split-enabled .split-main > .opencode-output { border-color:var(--coral); }
 .split-views:not(.split-b-active) .split-main > *, .split-views.split-b-active .split-companion { border-top-left-radius:0; }
@@ -77,3 +79,28 @@
 
 .split-enabled .term-info > button { font:10px var(--font); min-height:32px; padding:4px 6px; }
 @media(max-width:799px) { .split-enabled .term-info > button { min-height:44px; font-size:9px; } }
+
+/* A temporary overlay of the existing terminal and composer. The two slots,
+   transports and drafts stay alive; only the browser's layout changes. Keep
+   it below drawers so History, More and other composer tools still work. */
+.split-popout-backdrop { position:fixed; inset:0; z-index:39; background:#0009; }
+.split-popout-backdrop[hidden], .split-popout-bar[hidden] { display:none; }
+.split-popped-out .content {
+    position:fixed; inset:12px; z-index:40;
+    background:var(--bg); border:1px solid var(--border); border-radius:8px;
+    box-shadow:0 12px 48px #0009;
+}
+.split-popout-bar { display:flex; align-items:center; gap:12px; flex-shrink:0; min-height:44px; }
+.split-popout-bar strong { flex:1; min-width:0; font:12px var(--font); color:var(--text-strong); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.split-popout-bar button { flex-shrink:0; min-height:44px; padding:6px 12px; font:11px var(--font); color:var(--text); background:var(--bg-raised); border:1px solid var(--border); border-radius:6px; cursor:pointer; }
+.split-popout-bar button:hover { background:var(--bg-selected); }
+.split-popout-bar button:focus-visible { outline:2px solid var(--cyan); outline-offset:1px; }
+.split-popped-out .split-selector, .split-popped-out .split-companion { display:none; }
+.split-popped-out .split-main > .term-display, .split-popped-out .split-main > .opencode-output { border-radius:8px; }
+@media(max-width:799px) {
+ .split-popout { width:36px; }
+ .split-popped-out .content { inset:4px; padding-top:max(4px,env(safe-area-inset-top)); }
+ .split-popout-bar { gap:6px; }
+ .split-popout-bar strong { font-size:10px; }
+ .split-popout-bar button { padding:6px 8px; font-size:10px; }
+}

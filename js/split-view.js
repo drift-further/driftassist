@@ -137,7 +137,10 @@ class PaneView {
     snapshot() {
         if (!this.record) return;
         Object.assign(this.record,{content:this.content,displayContent:this.displayContent,paused:this.paused,
-            lines:this.lines,top:this.element.scrollTop,left:this.element.scrollLeft});
+            lines:this.lines});
+        // A hidden companion has no scroll box (mobile or popout). Keep the
+        // last visible position instead of replacing it with zero.
+        if (this.element.clientWidth) Object.assign(this.record,{top:this.element.scrollTop,left:this.element.scrollLeft});
     }
     close() {
         this.generation++;
@@ -150,6 +153,7 @@ class PaneView {
 
 const SplitView = {
     enabled:false, active:0, slots:[], switching:false, chosenAt:0, restored:false,
+    poppedOut:false,
     countdowns:new Map(), trays:new Map(),
     init() {
         const display = document.getElementById('term-display');
@@ -166,7 +170,7 @@ const SplitView = {
         this.grid.before(this.selector);
         // Each tab sits on its own pane's box. The label selects the side (or, on the
         // side already selected, opens the menu); ▾ always opens the pane menu.
-        const tab = slot => `<div class="split-tab" data-slot="${slot}"><button type="button" class="split-tab-label"></button><button type="button" class="split-tab-menu" aria-haspopup="menu" aria-expanded="false" aria-label="Change pane ${slot ? 'B':'A'}">▾</button></div>`;
+        const tab = slot => `<div class="split-tab" data-slot="${slot}"><button type="button" class="split-tab-label"></button><button type="button" class="split-popout" aria-label="Pop out pane ${slot ? 'B':'A'}" title="Pop out pane ${slot ? 'B':'A'}">↗</button><button type="button" class="split-tab-menu" aria-haspopup="menu" aria-expanded="false" aria-label="Change pane ${slot ? 'B':'A'}">▾</button></div>`;
         this.selector.innerHTML = tab(0) + '<div class="split-ctl"><button type="button" data-swap aria-label="Swap pane positions" title="Swap sides">⇄</button><button type="button" data-single>Single</button></div>' + tab(1);
         this.selector.querySelectorAll('.split-tab').forEach(t => {
             const slot = Number(t.dataset.slot);
@@ -175,7 +179,15 @@ const SplitView = {
                 else { this.closeMenu(); this.activate(slot); }
             };
             t.querySelector('.split-tab-menu').onclick = () => this.toggleMenu(slot);
+            t.querySelector('.split-popout').onclick = () => this.openPopout(slot);
         });
+        this.popoutBar = document.createElement('div'); this.popoutBar.className = 'split-popout-bar'; this.popoutBar.hidden = true;
+        this.popoutBar.innerHTML = '<strong></strong><button type="button" title="Back to split (Esc)">Back to split <span aria-hidden="true">×</span></button>';
+        document.querySelector('.content').prepend(this.popoutBar);
+        this.popoutBar.querySelector('button').onclick = () => this.closePopout();
+        this.popoutBackdrop = document.createElement('div'); this.popoutBackdrop.className = 'split-popout-backdrop'; this.popoutBackdrop.hidden = true;
+        this.popoutBackdrop.onclick = () => this.closePopout();
+        document.body.appendChild(this.popoutBackdrop);
         this.selector.querySelector('[data-swap]').onclick = () => { this.closeMenu(); this.swap(); };
         this.selector.querySelector('[data-single]').onclick = () => { this.closeMenu(); this.exit(); };
         this.menu = document.createElement('div'); this.menu.className = 'split-menu'; this.menu.setAttribute('role','menu'); this.menu.hidden = true;
@@ -207,6 +219,11 @@ const SplitView = {
             this.activate(this.active);
         });
         document.addEventListener('keydown', e => {
+            if (this.poppedOut && e.key === 'Escape' && !e.isComposing && !e.defaultPrevented && !document.querySelector('dialog[open]')) {
+                // Let a drawer dismiss first; autocomplete consumes its own Esc.
+                if (document.getElementById('drawer-overlay').classList.contains('visible')) { closeDrawers(); return; }
+                e.preventDefault(); this.closePopout(); return;
+            }
             if (this.enabled && !e.isComposing && e.altKey && e.shiftKey && ['ArrowLeft','ArrowRight'].includes(e.key) && !this.dialog.open) {
                 e.preventDefault(); this.activate(e.key === 'ArrowLeft' ? 0 : 1);
             }
@@ -351,8 +368,53 @@ const SplitView = {
         return true;
     },
     swap() { if (!this.enabled) return; this.slots.reverse(); this.active = 1-this.active; this.update(); },
+    openPopout(slot) {
+        if (!this.enabled || !this.slots[slot]) return;
+        if (!this.poppedOut) {
+            this.popoutReturnPane = this.slots[this.active].pane_id;
+            this.popoutTrigger = this.selector.querySelector(`.split-tab[data-slot="${slot}"] .split-popout`);
+        }
+        this.closeMenu(); this.activate(slot);
+        this.snapshot(); this.other.snapshot();
+        this.poppedOut = true;
+        this.updatePopout(); this.restoreViewScroll();
+        // Focus the return control, not the composer: opening for a read should
+        // not summon the phone keyboard or submit anything.
+        this.popoutBar.querySelector('button').focus({preventScroll:true});
+    },
+    closePopout(restoreOwner=true) {
+        if (!this.poppedOut) return;
+        this.snapshot(); this.other.snapshot();
+        this.poppedOut = false;
+        this.updatePopout(); this.restoreViewScroll();
+        const slot = this.slots.findIndex(r => r.pane_id === this.popoutReturnPane && !r.dead);
+        if (restoreOwner && slot >= 0) this.activate(slot);
+        this.restoreViewScroll();
+        if (this.popoutTrigger) this.popoutTrigger.focus({preventScroll:true});
+        this.popoutReturnPane = null; this.popoutTrigger = null;
+    },
+    updatePopout() {
+        document.body.classList.toggle('split-popped-out',this.poppedOut);
+        this.popoutBar.hidden = this.popoutBackdrop.hidden = !this.poppedOut;
+        if (this.poppedOut) this.popoutBar.querySelector('strong').textContent = `Popout · ${this.active ? 'B':'A'} · ${this.slots[this.active].target}`;
+    },
+    restoreViewScroll() {
+        // Expanding/collapsing a scroll box is layout, not a user's scroll.
+        // Keep frozen transcripts frozen and following transcripts at the end.
+        _autoScrolling = true; this.other.programmatic = true;
+        const main = document.getElementById('term-display'), r = this.slots[this.active];
+        main.scrollTop = r.paused ? r.top || 0 : main.scrollHeight;
+        main.scrollLeft = r.left || 0;
+        const other = this.other.element, companion = this.other.record;
+        if (companion && other.clientWidth) {
+            other.scrollTop = companion.paused ? companion.top || 0 : other.scrollHeight;
+            other.scrollLeft = companion.left || 0;
+        }
+        requestAnimationFrame(() => { _autoScrolling = false; this.other.programmatic = false; });
+    },
     exit() {
         if (this.slots[this.active].dead) { showFlash('error','Select a surviving pane before leaving split view'); return; }
+        this.closePopout(false);
         this.snapshot(); this.enabled = false; this.other.close(); this.closeMenu();
         this.update(); this.persist();
         onTabSwitchCommands((_termTarget || '').split(':')[0]);
@@ -362,7 +424,7 @@ const SplitView = {
         const r = this.slots[this.active];
         return r && !r.dead && r.identity ? r.target : '%split-view-unavailable';
     },
-    readable(target) { return this.enabled && this.slots.some((r,i) => !r.dead && r.target === target && (innerWidth >= 800 || i === this.active)); },
+    readable(target) { return this.enabled && this.slots.some((r,i) => !r.dead && r.target === target && ((!this.poppedOut && innerWidth >= 800) || i === this.active)); },
     update() {
         document.body.classList.toggle('split-enabled',this.enabled);
         this.selector.hidden = this.destination.hidden = this.identity.hidden = this.change.hidden = !this.enabled;
@@ -370,6 +432,7 @@ const SplitView = {
         this.main.style.order = this.active; this.other.element.style.order = 1-this.active;
         if (!this.enabled) { this.main.style.order = ''; this.stopStrip.hidden = true; document.querySelector('.btn-paste').textContent = 'Send'; this.setInputDisabled(false); return; }
         const current = this.slots[this.active], other = this.slots[1-this.active];
+        this.updatePopout();
         this.identity.textContent = `${this.active ? 'B':'A'} · INPUT HERE`;
         markActiveTab(current.target);
         this.other.element.querySelector('.split-identity').textContent = `${this.active ? 'A':'B'} · ${other.target}${other.dead ? ' · Pane ended':' · View only'}`;

@@ -177,6 +177,9 @@
     max-height: 85vh; overflow-y: auto; -webkit-overflow-scrolling: touch;
 }
 .studio-sheet.visible { transform: translateY(0); }
+/* Closed, the sheet sits just below the viewport and its shadow would still
+   reach up over the page bottom (and the More keys sheet), so it casts none. */
+.studio-sheet:not(.visible) { box-shadow: none; }
 .studio-sheet-header {
     display: flex; align-items: center; justify-content: space-between;
     padding: 10px 12px; border-bottom: 1px solid rgba(182, 156, 242, 0.2);

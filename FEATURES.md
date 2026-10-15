@@ -113,8 +113,10 @@ Where: File.
 
 ### Keys
 Esc, Tab, arrows, Ctrl-C and the other keys a phone keyboard lacks. Any key builds a
-Ctrl/Alt/Shift combination and sends it in one tap.
-Where: Keys.
+Ctrl/Alt/Shift combination and sends it in one tap. More keys opens a full keyboard
+(letters, symbols, F1–F12, Home/End/PgUp/PgDn) with sticky Ctrl/Alt/Shift, short enough
+to leave the pane in view.
+Where: Keys → More keys.
 
 ### Autocomplete
 Type `@` for a file path or `/` for a skill, and pick from the list.

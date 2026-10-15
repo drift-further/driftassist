@@ -370,3 +370,50 @@
 .combo-char::placeholder { color: var(--text-muted); font-size: 11px; }
 .combo-status { min-height: 14px; padding: 4px 0 2px; font-size: 10px; color: var(--text-dim); }
 .combo-status.armed { color: var(--amber); }
+
+/* More keys (js/keycombo.js): the button at the foot of the inline Keys panel,
+   and the sheet it opens. The sheet carries no backdrop and stays short, so the
+   pane above it stays live and readable while keys go in. */
+.kb-open { display: flex; align-items: baseline; justify-content: center; gap: 8px; width: 100%; margin-top: 2px; padding: 8px 2px; }
+.kb-open .hk-label { display: inline; }
+.kb-open .hk-sub { display: inline; margin-top: 0; }
+.kb-open.active { color: var(--text-strong); background: var(--bg-selected); border-color: #3a4650; }
+.kb-sheet {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 45;
+    width: 100%; max-width: 720px; margin: 0 auto; box-sizing: border-box;
+    padding: 6px 8px max(8px, env(safe-area-inset-bottom));
+    background: var(--bg-bar); border-top: 1px solid var(--border);
+    box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.6);
+    transform: translateY(100%); visibility: hidden;
+    transition: transform 0.2s ease-out, visibility 0s linear 0.2s;
+    touch-action: manipulation;
+}
+.kb-sheet.visible { transform: translateY(0); visibility: visible; transition: transform 0.2s ease-out; }
+@media (min-width: 721px) {
+    .kb-sheet { border: 1px solid var(--border); border-bottom: none; border-radius: 8px 8px 0 0; }
+}
+.kb-head { display: flex; align-items: center; gap: 10px; min-height: 36px; }
+.kb-title {
+    flex-shrink: 0; font-size: 8px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 1.5px; color: var(--text-muted);
+}
+.kb-status { flex: 1; min-width: 0; padding: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.kb-bar { display: flex; gap: 4px; margin: 4px 0 6px; }
+.kb-bar .hk-btn { flex: 1; min-height: 38px; padding: 0 2px; }
+.kb-bar-gap { flex: 0 0 8px; }
+.kb-layer-btn[aria-pressed="true"] { color: var(--text-strong); background: var(--bg-selected); border-color: #3a4650; }
+.kb-sheet .hk-btn:not([aria-pressed="true"]) { background: var(--bg-raised); }
+.kb-sheet .hk-btn:active { background: var(--bg-selected); }
+/* Four key rows on every layer, so switching layers never moves the sheet. */
+.kb-layers { min-height: 176px; }
+.kb-layer[hidden] { display: none; }
+.kb-row { display: grid; gap: 4px; margin-bottom: 4px; }
+.kb-key { min-height: 40px; padding: 0 1px; }
+.kb-key .hk-label { font-size: 13px; font-weight: 600; }
+.kb-sheet .hk-btn .hk-label { font-size: 11px; }
+.kb-row .kb-key .hk-label { font-size: 14px; }
+.kb-base { display: flex; gap: 4px; }
+.kb-base .kb-key { flex: 3; }
+.kb-base .kb-space { flex: 8; }
+.kb-sheet:has(.combo-mod[data-mod="shift"][aria-pressed="true"]) .kb-alpha .hk-label { text-transform: uppercase; }
+.kb-sheet:has(.combo-mod[data-mod="shift"][aria-pressed="true"]) .kb-shiftless { opacity: 0.3; pointer-events: none; }

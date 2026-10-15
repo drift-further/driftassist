@@ -1229,6 +1229,9 @@ body.tabs-wrap .tabs-scroll-btn { display: none; }
     transform: translateY(0);
     pointer-events: auto;
 }
+/* Closed, the sheet sits just below the viewport and its shadow would still
+   reach up over the page bottom (and the More keys sheet), so it casts none. */
+.stale-sheet:not(.open) { box-shadow: none; }
 .stale-sheet-header {
     display: flex;
     align-items: center;
