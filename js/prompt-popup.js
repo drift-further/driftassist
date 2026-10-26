@@ -27,7 +27,7 @@ document.body.appendChild(_promptPopupHost);
 const _promptPopups = new Map();
 // Keys already shown in this browser, per kind. A prompt pops once however long
 // it waits; a new sudo (new pid) or a new prompt (new fingerprint) pops again.
-const _promptPopupSeen = {sudo: new Set(), question: new Set()};
+const _promptPopupSeen = {sudo: new Set(), question: new Set(), delegate: new Set()};
 // key -> {kind, build}: live prompts waiting for a slot. Shared by both kinds and
 // kept in arrival order, so a sudo already waiting is not overtaken by questions
 // that arrive later.
@@ -50,7 +50,7 @@ function _syncPromptPopups(kind, entries) {
     const seen = _promptPopupSeen[kind];
     const live = new Set(entries.map(entry => entry.key));
     for (const key of seen) {
-        if (!live.has(key)) seen.delete(key);
+        if (kind !== 'delegate' && !live.has(key)) seen.delete(key);
     }
     for (const [key, pending] of _promptPopupPending) {
         if (pending.kind === kind && !live.has(key)) _promptPopupPending.delete(key);
@@ -107,6 +107,7 @@ function _showPromptPopup(kind, key, spec) {
     const actions = document.createElement('div');
     actions.className = 'prompt-popup-actions';
     actions.appendChild(_promptPopupButton(key, spec.button.label, 'pp-' + spec.button.color, spec.button.run));
+    if (spec.extraButton) actions.appendChild(_promptPopupButton(key, spec.extraButton.label, 'pp-cyan', spec.extraButton.run));
     el.appendChild(actions);
     el.appendChild(_promptPopupButton(key, '×', 'prompt-popup-close', () => {}));
 
@@ -229,4 +230,57 @@ function _questionPopupSpec(q) {
         detail: q.prompt.summary || q.detected.desc,
         button: {label: 'Open tab', color: 'cyan', run: () => selectTab(q.target)},
     };
+}
+
+// Delegate alerts are snapshots, never consumed on the server. Keep keys for
+// this page's lifetime, including alerts that disappeared between polls.
+function _applyDelegateAlerts(panes) {
+    const entries = [];
+    for (const pane of panes || []) {
+        const alert = pane.delegate?.state && pane.delegate.alert;
+        if (!alert?.key) continue;
+        sendDelegateNotification(pane);
+        if (!(Number(alert.at) * 1000 > _pageLoadedAt)) {
+            _promptPopupSeen.delegate.add('delegate:' + alert.key);
+            continue;
+        }
+        entries.push({key: 'delegate:' + alert.key,
+            inView: (_termOpen && pane.target === _termTarget) ||
+                (typeof SplitView !== 'undefined' && SplitView.readable(pane.target)),
+            build: () => _delegatePopupSpec(pane)});
+    }
+    _syncPromptPopups('delegate', entries);
+}
+
+function _delegatePopupSpec(pane) {
+    const d = pane.delegate, alert = d.alert;
+    const verb = {WAITING: 'waiting', FINISHED: 'finished', DEAD: 'exited'}[String(alert.state).toUpperCase()] || 'waiting';
+    const parent = d.parent_session ? shortName(d.parent_session) + ' › ' : '';
+    const spec = {
+        title: 'Delegate ' + verb + ' · ' + parent + shortName(pane.session),
+        detail: alert.detail || alert.reason || '',
+        button: {label: 'Open tab', color: 'cyan', run: () => selectTab(pane.target)},
+    };
+    if (String(alert.state).toUpperCase() === 'DEAD' && pane.resume?.line) {
+        spec.extraButton = {label: 'Copy resume', run: () => {
+            const ok = copyToClipboard(pane.resume.line);
+            showFlash(ok ? 'copied' : 'error', ok ? 'Resume copied' : 'Copy failed');
+        }};
+    }
+    return spec;
+}
+
+function applyDelegateMark(tab, pane) {
+    if (!tab || !pane.delegate?.state) return;
+    const d = pane.delegate;
+    for (const name of ['done', 'idle', 'has-prompt', 'running', 'idle-fade-1', 'idle-fade-2', 'idle-fade-3', 'idle-expired']) tab.classList.remove(name);
+    for (const selector of ['.tab-badge', '.tab-idle-time', '.delegate-mark']) tab.querySelector(selector)?.remove();
+    tab.classList.add('delegate-tab');
+    const state = ['stale', 'unknown'].includes(d.health) ? 'unknown' : d.state.toLowerCase();
+    const mark = document.createElement('span');
+    mark.className = 'delegate-mark delegate-' + state;
+    mark.textContent = {waiting: '?', finished: '✓', dead: '×', working: '●'}[state] || '○';
+    mark.title = d.state + ' · ' + d.health + (d.reason ? ' · ' + d.reason : '');
+    mark.setAttribute('aria-label', mark.title);
+    tab.appendChild(mark);
 }

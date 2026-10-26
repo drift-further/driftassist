@@ -71,7 +71,7 @@ def command(resolved, minutes: float, url: str | None = None) -> int:
         )
         return 1
     try:
-        response = http.post("/access/open", {"minutes": minutes})
+        response = http.post("/access/open", {"minutes": minutes, "source": "pair"})
     except http.ApiError as exc:
         if exc.status == 400:
             proc.print_error(

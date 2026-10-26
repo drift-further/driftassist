@@ -3,11 +3,11 @@
 import os
 import shlex
 import subprocess
-from pathlib import Path
 
 from flask import Blueprint, jsonify, request
 
 from shared import execution_park as park
+from shared import paths
 from shared import state
 
 settings_bp = Blueprint("settings_bp", __name__)
@@ -226,7 +226,7 @@ def _restart_server_effect(cmd):
     # record and can report success without replacing this server.
     restart_home = None
     if argv in (["assist", "restart"], ["karen", "assist", "restart"]):
-        restart_home = Path(state.DATA_DIR).resolve()
+        restart_home = paths.APP_ROOT
         argv = [
             str(restart_home / ".venv" / "bin" / "python3"),
             "-m", "cli.update", "--restart-installed",

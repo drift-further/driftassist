@@ -712,3 +712,22 @@ function updateClaudeInfo(meta) {
     const modelEl = document.getElementById('ci-model');
     modelEl.textContent = meta.model || '';
 }
+
+// Browser-local deduplication: a second browser receives the same snapshot.
+const _delegateNotificationSeen = new Set();
+function sendDelegateNotification(pane) {
+    const alert = pane.delegate?.alert;
+    if (!alert?.key || _delegateNotificationSeen.has(alert.key)) return;
+    _delegateNotificationSeen.add(alert.key);
+    if ((_termOpen && pane.target === _termTarget) ||
+        (typeof SplitView !== 'undefined' && SplitView.readable(pane.target))) return;
+    if (!window.isSecureContext || _notifPermission !== 'granted' ||
+        !(Number(alert.at) * 1000 > _pageLoadedAt)) return;
+    try {
+        const n = new Notification('Assist — ' + shortName(pane.session), {
+            body: alert.state + ': ' + (alert.detail || alert.reason || ''),
+            tag: 'assist-delegate-' + pane.pane_id, renotify: true,
+        });
+        n.onclick = () => { window.focus(); selectTab(pane.target); n.close(); };
+    } catch (e) {}
+}

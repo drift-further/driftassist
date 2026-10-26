@@ -266,6 +266,19 @@ const SplitView = {
         this.dialog.querySelector('input').value = ''; this.choices(); this.dialog.showModal();
         this.dialog.querySelector('input').focus();
     },
+    // Tab right-click: the tab in view opens the picker; any other tab goes
+    // straight into the slot not being typed into, beside the tab in view.
+    openWith(target) {
+        const pane = _sessionPanes.find(p => p.target === target);
+        if (!pane || !pane.pane_id || target === _termTarget) { this.openPicker(this.enabled ? 1-this.active : 1); return; }
+        if (this.slots.some(r => !r.dead && r.pane_id === pane.pane_id)) { showFlash('sent','Already in split view'); return; }
+        if (!this.enabled) {
+            const current = _sessionPanes.find(p => p.target === _termTarget);
+            if (!current || !current.pane_id) return;
+            this.slots = [this.record(current)]; this.active = 0;
+        }
+        this.choose(pane, this.enabled ? 1-this.active : 1);
+    },
     choices() {
         const list = this.dialog.querySelector('.split-choices'); list.replaceChildren();
         this.fillChoices(list,this.dialog.querySelector('input').value.toLowerCase(),this.pickerSlot,false);

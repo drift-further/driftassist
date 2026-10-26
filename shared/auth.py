@@ -7,20 +7,28 @@ trust boundary, not input validation, the thing that has to hold: anyone who
 can reach the port can run anything.
 
 A single shared secret gates the whole app. It is generated on first start and
-written to `auth_token` beside the code (0600, gitignored), so a fresh install
+written to `auth_token` in the install's config dir (0600; beside the code on
+the legacy layout, gitignored), so a fresh install
 needs no configuration step — the operator reads it out of the file or the
 startup log once and logs in from the phone.
 
-The browser never stores the raw token. It gets a cookie holding an HMAC of it,
-which is what the server compares against; a token presented directly — in the
-`X-Assist-Token` header, for curl and the CLI — is compared to the real value.
-Both comparisons are constant-time. The header is the only accepted carrier for
-the raw secret: see request_authenticated() for why a query string is not.
+The browser never stores the raw token. Each signed-in browser is a device in
+shared/devices.py and holds a cookie bound to that device: `v2.<id>.<mac>`,
+where the mac is an HMAC of the id keyed by the token. Revoking one device
+stops its cookie without touching any other; rotating the token still stops
+them all. A token presented directly — in the `X-Assist-Token` header, for curl
+and the CLI — is compared to the real value. Both comparisons are
+constant-time. The header is the only accepted carrier for the raw secret: see
+request_authenticated() for why a query string is not.
 
 A second way in exists for onboarding: a temporary open-access window. It is
 not an auth bypass — it admits one client from a configured LAN range to `GET
-/` and hands it the same cookie a token login would, then closes. Four limits
-apply at once: endpoint, network, single use, and a monotonic deadline.
+/` and mints it a device, then closes. Four limits apply at once: endpoint,
+network, single use, and a monotonic deadline.
+
+Lock order: shared.devices takes its own lock and then, inside it, at most one
+of `_window_lock` / `_requests_lock`. Nothing here may reach for the devices
+lock while holding either of those (tests/test_devices.py guards it).
 """
 
 import hmac
@@ -38,23 +46,38 @@ COOKIE_NAME = "assist_auth"
 HEADER_NAME = "X-Assist-Token"
 
 # Ten years: this is a single-user tool on a phone that must not be asked to
-# re-authenticate mid-session. Revocation is deleting `auth_token` and
-# restarting — every issued cookie stops matching, because the HMAC key changed.
+# re-authenticate mid-session. Revocation is per device (shared/devices.py);
+# deleting `auth_token` and restarting remains the way to stop every cookie at
+# once, because the HMAC key changed.
 COOKIE_MAX_AGE = 10 * 365 * 24 * 3600
 
-_TOKEN_PATH = Path(
-    os.environ.get(
-        "ASSIST_AUTH_TOKEN_PATH",
-        str(Path(__file__).resolve().parent.parent / "auth_token"),
-    )
-).resolve()
+# Resolved at first use, not import: where the token lives depends on the
+# install's layout (shared/paths.py), which an entry path checks first. Tests
+# set this directly.
+_TOKEN_PATH = None
 _token_cache = None
+
+
+def token_path():
+    """auth_token: ASSIST_AUTH_TOKEN_PATH, else the install's config dir."""
+    global _TOKEN_PATH
+    if _TOKEN_PATH is None:
+        from shared import paths
+
+        _TOKEN_PATH = paths.token_path().resolve()
+    return _TOKEN_PATH
 
 # Open-access window. `_window_deadline` is a time.monotonic() value so a clock
 # correction cannot extend it; None means closed. `_last_onboard` holds one
 # pending report for the UI and is cleared by the first /poll that carries it.
 _window_lock = threading.Lock()
 _window_deadline = None
+# Set while shared.devices writes the record for the admission this window is
+# about to grant; a second navigation finds the window taken. `_window_source`
+# is what the device record says it came through ("pair" when `assist pair`
+# opened it).
+_window_reservation = None
+_window_source = "window"
 _last_onboard = None
 _last_onboard_at = 0.0  # monotonic, for the TTL below
 _onboard_seq = 0
@@ -74,8 +97,9 @@ def get_token():
     if _token_cache:
         return _token_cache
 
-    if _TOKEN_PATH.exists():
-        existing = _TOKEN_PATH.read_text(encoding="utf-8").strip()
+    path = token_path()
+    if path.exists():
+        existing = path.read_text(encoding="utf-8").strip()
         if existing:
             _token_cache = existing
             return _token_cache
@@ -83,7 +107,7 @@ def get_token():
     token = secrets.token_urlsafe(32)
     # Mode at CREATE time: a plain open() would leave the secret world-readable
     # for the length of the write (same reasoning as state.atomic_write_json).
-    fd = os.open(_TOKEN_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(token + "\n")
     _token_cache = token
@@ -95,19 +119,59 @@ def print_startup_token_notice(output=None):
     destination = output if output is not None else sys.stdout
     token = get_token()
     if bool(getattr(destination, "isatty", lambda: False)()):
-        message = f"[assist] auth token: {token}  (file: {_TOKEN_PATH})"
+        message = f"[assist] auth token: {token}  (file: {token_path()})"
     else:
-        message = f"[assist] auth token file: {_TOKEN_PATH}"
+        message = f"[assist] auth token file: {token_path()}"
     print(message, file=destination, flush=True)
 
 
-def cookie_value():
-    """The value a logged-in browser holds — a derivative, not the secret."""
-    return hmac.new(get_token().encode(), b"assist-auth-v1", sha256).hexdigest()
+COOKIE_VERSION = "v2"
+
+
+def device_cookie_mac(device_id):
+    """The per-device mac: an HMAC of the id, keyed by the token."""
+    msg = ("assist-auth-v2:" + device_id).encode()
+    return hmac.new(get_token().encode(), msg, sha256).hexdigest()
+
+
+def device_cookie(device_id):
+    """The value a signed-in browser holds — a derivative, never the secret."""
+    return f"{COOKIE_VERSION}.{device_id}.{device_cookie_mac(device_id)}"
+
+
+def parse_device_cookie(value):
+    """(device_id, mac) for a well-formed v2 cookie whose mac verifies, else None.
+
+    The v1 value (one HMAC shared by every browser) is not accepted: it could
+    not tell two browsers apart, so it could never be revoked one at a time.
+    """
+    parts = (value or "").split(".")
+    if len(parts) != 3 or parts[0] != COOKIE_VERSION or not parts[1]:
+        return None
+    device_id, mac = parts[1], parts[2]
+    if not hmac.compare_digest(mac, device_cookie_mac(device_id)):
+        return None
+    return device_id, mac
+
+
+def header_authenticated(request):
+    """True if the raw token arrived in X-Assist-Token."""
+    presented = request.headers.get(HEADER_NAME)
+    return bool(presented) and hmac.compare_digest(presented, get_token())
+
+
+def request_device(request):
+    """The device record behind this request's cookie, or None."""
+    from shared import devices
+
+    cookie = request.cookies.get(COOKIE_NAME)
+    if not cookie or parse_device_cookie(cookie) is None:
+        return None
+    return devices.authenticate(cookie, ip=client_ip(request))
 
 
 def request_authenticated(request):
-    """True if this request carries a valid cookie or the token itself.
+    """True if this request carries a valid device cookie or the token itself.
 
     Header only for the raw token — never a `?token=` query parameter. A URL is
     the one place a credential gets copied somewhere Assist does not control:
@@ -120,13 +184,9 @@ def request_authenticated(request):
     page fetched that way renders unstyled while every stylesheet 401s. Use
     `X-Assist-Token` on the request (or on the browser context, for Playwright).
     """
-    cookie = request.cookies.get(COOKIE_NAME)
-    if cookie and hmac.compare_digest(cookie, cookie_value()):
+    if request_device(request) is not None:
         return True
-    presented = request.headers.get(HEADER_NAME)
-    if presented and hmac.compare_digest(presented, get_token()):
-        return True
-    return False
+    return header_authenticated(request)
 
 
 def token_matches(candidate):
@@ -134,11 +194,11 @@ def token_matches(candidate):
     return bool(candidate) and hmac.compare_digest(candidate.strip(), get_token())
 
 
-def set_auth_cookie(response):
-    """Give this response the logged-in cookie. One definition, two callers."""
+def set_auth_cookie(response, device_id):
+    """Give this response the cookie for `device_id`. One definition, three issuers."""
     response.set_cookie(
         COOKIE_NAME,
-        cookie_value(),
+        device_cookie(device_id),
         max_age=COOKIE_MAX_AGE,
         httponly=True,
         samesite="Lax",
@@ -239,11 +299,12 @@ def is_onboarding_navigation(request):
     return dest is None or dest == "document"
 
 
-def open_window(seconds):
+def open_window(seconds, source="window"):
     """Start (or restart) the window. Returns the new state."""
-    global _window_deadline
+    global _window_deadline, _window_source
     with _window_lock:
         _window_deadline = time.monotonic() + seconds
+        _window_source = "pair" if source == "pair" else "window"
     print(
         f"[assist] access window open for {int(seconds)}s "
         f"(networks: {_networks_raw()})",
@@ -263,19 +324,58 @@ def close_window():
     return window_state()
 
 
-def consume_window(ip, user_agent=""):
-    """Spend the window on one in-scope client. True if this caller won it.
+def window_admissible(ip):
+    """True if the window is open, unreserved, and `ip` is in scope.
 
-    The check-and-clear is a single critical section, so two devices racing
-    `GET /` cannot both be admitted. The scope test sits outside the lock
-    because it reads settings, not window state.
+    A lookup only: shared.devices calls it before its capacity check, then
+    reserve_window() — both under the devices lock, so no other admission can
+    slip between them.
     """
-    global _window_deadline, _last_onboard, _last_onboard_at, _onboard_seq
     if not ip_in_scope(ip):
         return False
     with _window_lock:
+        return (
+            _window_deadline is not None
+            and time.monotonic() < _window_deadline
+            and _window_reservation is None
+        )
+
+
+def reserve_window(ip):
+    """Hold the window for one admission. Returns (token, source) or None.
+
+    The check-and-reserve is a single critical section, so two devices racing
+    `GET /` cannot both be admitted. The scope test sits outside the lock
+    because it reads settings, not window state.
+    """
+    global _window_reservation
+    if not ip_in_scope(ip):
+        return None
+    with _window_lock:
         if _window_deadline is None or time.monotonic() >= _window_deadline:
+            return None
+        if _window_reservation is not None:
+            return None
+        _window_reservation = object()
+        return _window_reservation, _window_source
+
+
+def release_window_reservation(token):
+    """The device record could not be written: the window is as it was."""
+    global _window_reservation
+    with _window_lock:
+        if _window_reservation is token:
+            _window_reservation = None
+
+
+def consume_reserved_window(token, ip, user_agent=""):
+    """Spend the window on the admission that reserved it. True if it was ours."""
+    global _window_deadline, _window_reservation
+    global _last_onboard, _last_onboard_at, _onboard_seq
+    with _window_lock:
+        if _window_reservation is not token:
             return False
+        _window_reservation = None
         _window_deadline = None
         _onboard_seq += 1
         _last_onboard = {
@@ -339,6 +439,12 @@ _request_last_create = {}   # ip -> monotonic of its last create, for the cooldo
 # not an operator knob — hence a constant rather than a setting.
 _REQUEST_DENIED_GRACE = 20
 
+# A redeemed approval stays re-pollable this long, returning the SAME device's
+# cookie: the response that carried it can be lost, and the claim is a secret
+# only the requesting browser holds. Measured from redemption, not from the
+# request's deadline, so an approval just before expiry keeps the full window.
+CLAIM_REPLAY_SEC = 60
+
 
 def _request_cfg():
     """(ttl_seconds, max_pending, cooldown_seconds) from settings.
@@ -369,8 +475,19 @@ def _request_cfg():
 
 
 def _prune_requests(now):
-    """Drop expired and finished records. Caller holds _requests_lock."""
+    """Drop expired and finished records. Caller holds _requests_lock.
+
+    A reserved record (its device is being written) is never pruned, and a
+    redeemed one lives until its replay window closes, whatever the request
+    deadline says. Pruning drops the claim association, never the device.
+    """
     for rid, rec in list(_requests.items()):
+        if rec.get("reserved"):
+            continue
+        if rec.get("redeemed_by"):
+            if now >= rec["redeemed_at"] + CLAIM_REPLAY_SEC:
+                del _requests[rid]
+            continue
         if now >= rec["deadline"]:
             del _requests[rid]
         elif (
@@ -466,35 +583,64 @@ def decide_request(rid, approve):
     return True
 
 
-def request_status(claim, ip):
-    """What the waiting device is told. Consumes the record on approval.
+def lookup_claim(claim, ip):
+    """What a waiting device's claim stands for, without changing anything.
 
-    "expired" is also the answer to an unknown, replayed or IP-mismatched
+    None is also the answer to an unknown, replayed-out or IP-mismatched
     claim: a caller that cannot prove it made the request learns nothing about
-    whether one exists.
+    whether one exists. Otherwise a snapshot: id, status, remaining_sec, and
+    for a redeemed claim `redeemed_by` (the device id).
     """
     if not claim:
-        return {"status": "expired", "remaining_sec": 0}
-
+        return None
     now = time.monotonic()
     with _requests_lock:
         _prune_requests(now)
-        found = None
         for rec in _requests.values():
             if rec["ip"] == ip and hmac.compare_digest(rec["claim"], claim):
-                found = rec
-                break
-        if found is None:
-            return {"status": "expired", "remaining_sec": 0}
-        status = found["status"]
-        remaining = max(0, math.ceil(found["deadline"] - now))
-        if status == "approved":
-            del _requests[found["id"]]   # single use
+                return {
+                    "id": rec["id"],
+                    "status": rec["status"],
+                    "remaining_sec": max(0, math.ceil(rec["deadline"] - now)),
+                    "redeemed_by": rec.get("redeemed_by"),
+                    "reserved": bool(rec.get("reserved")),
+                }
+    return None
 
-    return {
-        "status": status,
-        "remaining_sec": remaining if status == "pending" else 0,
-    }
+
+def reserve_claim(rid):
+    """Hold an approved, unredeemed claim for one admission. True if held."""
+    with _requests_lock:
+        rec = _requests.get(rid)
+        if (
+            rec is None
+            or rec["status"] != "approved"
+            or rec.get("redeemed_by")
+            or rec.get("reserved")
+        ):
+            return False
+        rec["reserved"] = True
+        return True
+
+
+def release_claim(rid):
+    """The device record could not be written: the approval stands, unspent."""
+    with _requests_lock:
+        rec = _requests.get(rid)
+        if rec is not None:
+            rec["reserved"] = False
+
+
+def redeem_claim(rid, device_id):
+    """Spend a reserved claim on `device_id`; it stays re-pollable for a minute."""
+    with _requests_lock:
+        rec = _requests.get(rid)
+        if rec is None or not rec.get("reserved"):
+            return False
+        rec["reserved"] = False
+        rec["redeemed_by"] = device_id
+        rec["redeemed_at"] = time.monotonic()
+        return True
 
 
 def pending_requests():

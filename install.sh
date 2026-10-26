@@ -8,7 +8,7 @@
 #     cd ~/.local/share/drift-assist
 #     ./install.sh
 #
-# Idempotent — safe to re-run. Never overwrites an existing .env.
+# Idempotent — safe to re-run. Never overwrites an existing env file.
 #
 set -euo pipefail
 umask 077
@@ -91,11 +91,19 @@ print(1 if m and (int(m[1]), int(m[2])) >= (3, 2) else 0)
 [[ "$TMUX_OK" == "1" ]] || err "tmux 3.2+ required (found $TMUX_VER; upgrade with: $TMUX_HINT)"
 ok "tmux $TMUX_VER"
 
-for required in serve.py pyproject.toml requirements.lock env.example roster.example.toml bin/assist bin/statusline.sh assist-ctl cli/__init__.py shared/state.py routes/__init__.py index.html; do
+for required in serve.py pyproject.toml requirements.lock env.example roster.example.toml bin/assist bin/statusline.sh assist-ctl cli/__init__.py shared/state.py shared/paths.py routes/__init__.py index.html; do
     [[ -f "$SCRIPT_DIR/$required" ]] || err "Incomplete Assist source: missing $required"
 done
 python3 -c 'import ensurepip, venv' &>/dev/null || err "python3-venv not found (install with: $PY_HINT)"
-[[ -w "$SCRIPT_DIR" ]] || err "Repo directory is not writable: $SCRIPT_DIR"
+# The checkout must be writable only to create .venv, and for an install that
+# keeps its state in it (the legacy layout, recognised by a checkout .env).
+# A fresh install keeps settings, the token and state in the XDG config and
+# data dirs (shared/paths.py).
+checkout_writable_ok() {
+    [[ -w "$SCRIPT_DIR" ]] && return 0
+    [[ -d "$SCRIPT_DIR/.venv" && -w "$SCRIPT_DIR/.venv" && ! -f "$SCRIPT_DIR/.env" ]]
+}
+checkout_writable_ok || err "Repo directory is not writable: $SCRIPT_DIR"
 if [[ "$DEPENDENCIES_ONLY" == "0" && ( -e "$BIN_TARGET" || -L "$BIN_TARGET" ) ]]; then
     [[ ! -d "$BIN_TARGET" || -L "$BIN_TARGET" ]] || err "CLI destination is a directory: $BIN_TARGET"
     existing="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve())' "$BIN_TARGET")"
@@ -162,9 +170,9 @@ fi
 
 command -v curl >/dev/null && ok "curl" || warn "curl not found — assist CLI will fall back to python for HTTP"
 
-# Repo directory writability — server writes settings, history, state files here
-[[ -w "$SCRIPT_DIR" ]] || err "Repo directory is not writable: $SCRIPT_DIR"
-ok "repo directory writable"
+# Repo directory writability — only for .venv and a legacy-layout install
+checkout_writable_ok || err "Repo directory is not writable: $SCRIPT_DIR"
+ok "repo directory writable (or only .venv needs to be)"
 
 # ---- [2/8] create venv + install deps --------------------------------------
 say "[2/8] Creating Python venv and installing dependencies"
@@ -188,14 +196,33 @@ if [[ "$DEPENDENCIES_ONLY" == "1" ]]; then
     exit 0
 fi
 
-# ---- [3/8] seed .env -------------------------------------------------------
-say "[3/8] Seeding .env"
+# ---- [3/8] runtime layout + env file ----------------------------------------
+say "[3/8] Runtime layout and env file"
 
-if [[ ! -f "$SCRIPT_DIR/.env" ]]; then
-    cp "$SCRIPT_DIR/env.example" "$SCRIPT_DIR/.env"
-    ok "created .env from env.example"
+# shared/paths.py decides where settings, the token and state live. An existing
+# install (a checkout .env, or any state file in the checkout) stays on the
+# legacy layout until `assist migrate-state`; a fresh one gets install.json and
+# the XDG config and data dirs.
+PATHS_PY=(python3 -I "$SCRIPT_DIR/shared/paths.py")
+LAYOUT="$("${PATHS_PY[@]}" layout --checkout "$SCRIPT_DIR")" || err "runtime layout refused (see above)"
+if [[ "$LAYOUT" == "legacy" && ! -f "$SCRIPT_DIR/.env" ]]; then
+    if LAYOUT="$("${PATHS_PY[@]}" select-xdg --checkout "$SCRIPT_DIR")"; then
+        ok "fresh install: state in the XDG config and data dirs (install.json written)"
+    else
+        LAYOUT=legacy
+        ok "existing state in the checkout: legacy layout kept"
+    fi
 else
-    ok ".env already exists (not overwritten)"
+    ok "layout: $LAYOUT"
+fi
+ENV_FILE="$("${PATHS_PY[@]}" env-file --checkout "$SCRIPT_DIR")" || err "could not resolve the env file"
+
+if [[ ! -f "$ENV_FILE" ]]; then
+    cp "$SCRIPT_DIR/env.example" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+    ok "created $ENV_FILE from env.example"
+else
+    ok "$ENV_FILE already exists (not overwritten)"
 fi
 
 # ---- [4/8] record install location -----------------------------------------
@@ -426,7 +453,7 @@ fi
 
 # ---- [8/8] done ------------------------------------------------------------
 say "[8/8] Install complete"
-PORT="$(bash -c 'set -a; source "$1/.env" >/dev/null 2>&1; echo "${ASSIST_PORT:-8089}"' _ "$SCRIPT_DIR")"
+PORT="$(bash -c 'set -a; source "$1" >/dev/null 2>&1; echo "${ASSIST_PORT:-8089}"' _ "$ENV_FILE")"
 if [[ "${SERVICE_INSTALLED:-0}" == "1" ]]; then
     START_STEP="Already running as a service (assist service status)"
 else

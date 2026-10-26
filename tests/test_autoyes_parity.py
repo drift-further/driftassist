@@ -247,6 +247,13 @@ console.log(JSON.stringify({
         // a WebSocket frame, each through detectionTail (js/app.js, terminal.js).
         return [answers(detectionTail(wire)), answers(detectionTail(stream))];
     }),
+    // The attention decision (spec 7185 §4.4): is there a prompt a human has
+    // to look at? Compared as a boolean against routes/autoyes.py:observe_attention.
+    attention: corpus.map(([k, wire, stream]) => {
+        kind = k;
+        return [observeAttention(detectionTail(wire), k) !== null,
+                observeAttention(detectionTail(stream), k) !== null];
+    }),
 }));
 """
 
@@ -284,6 +291,65 @@ class DetectorParityTests(unittest.TestCase):
 
     def test_the_corpus_covers_both_directions(self):
         self.assertEqual({want is None for *_x, want in _cases()}, {True, False})
+
+
+_DELEGATE_FIXTURES = ROOT / "tests" / "fixtures" / "delegates"
+
+
+def _attention_corpus():
+    """The answer corpus plus the menus the answer detector refuses by design,
+    and their quoted twins: the same menu above an idle composer."""
+    from tests.test_delegate_attention import CLAUDE_IDLE_COMPOSER, CODEX_IDLE_COMPOSER
+    rows = [(name, kind, tail) for name, kind, tail, _want in CORPUS]
+    for name, kind, composer in (("claude-ask", "claude", CLAUDE_IDLE_COMPOSER),
+                                 ("claude-permission", "claude", CLAUDE_IDLE_COMPOSER),
+                                 ("codex-faster-model", "codex", CODEX_IDLE_COMPOSER),
+                                 ("codex-approval", "codex", CODEX_IDLE_COMPOSER)):
+        tail = (_DELEGATE_FIXTURES / f"{name}.txt").read_text().rstrip("\n")
+        rows.append((name, kind, tail))
+        rows.append((f"{name} quoted above an idle composer", kind, tail + "\n" + composer))
+    return rows
+
+
+class AttentionParityTests(unittest.TestCase):
+    """observe_attention (server) and observeAttention (browser) agree on
+    whether a human has to look, over the answer corpus and the menu fixtures,
+    at both depths and through the wire and the stream."""
+
+    def _server(self, tail, kind, depth):
+        from routes.autoyes import observe_attention
+        with _depth_patch(depth):
+            return observe_attention(_capture(tail, ansi=False), kind) is not None
+
+    def test_server_and_browser_agree_on_every_fixture(self):
+        for depth in DEPTHS:
+            rows = _attention_corpus()
+            entries = []
+            for name, kind, tail in rows:
+                raw = _capture(tail, ansi=True)
+                entries.append([kind, _wire_tail(raw, depth), raw])
+            got = _client(depth, entries)["attention"]
+            for (name, kind, tail), (wire, stream) in zip(rows, got):
+                with self.subTest(depth=depth, fixture=name):
+                    want = self._server(tail, kind, depth)
+                    self.assertEqual(wire, want, "via /poll")
+                    self.assertEqual(stream, want, "via the stream")
+
+    def test_the_attention_corpus_covers_both_directions(self):
+        from routes.autoyes import observe_attention
+        with _depth_patch(DEPTHS[0]):
+            seen = {observe_attention(_capture(t, ansi=False), k) is not None
+                    for _n, k, t in _attention_corpus()}
+        self.assertEqual(seen, {True, False})
+
+    def test_the_quoted_menus_are_negative_and_the_live_ones_positive(self):
+        from routes.autoyes import observe_attention
+        with _depth_patch(DEPTHS[0]):
+            for name, kind, tail in _attention_corpus():
+                if name.startswith(("claude-", "codex-")):
+                    with self.subTest(fixture=name):
+                        got = observe_attention(_capture(tail, ansi=False), kind) is not None
+                        self.assertEqual(got, "quoted" not in name)
 
 
 class InputWindowContractTests(unittest.TestCase):

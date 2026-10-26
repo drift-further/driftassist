@@ -125,7 +125,7 @@ body.tabs-wrap .top-chrome {
        identity band is allowed a row of its own only where it is too full to
        hold a tab (see the phone override at the end of this file). Change
        --wrap-rows to move the cap; the max-height follows. */
-    --wrap-row: 50px;
+    --wrap-row: 54px;
     --wrap-rows: 2;
     display: block;
     white-space: normal;

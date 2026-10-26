@@ -119,7 +119,7 @@ class ExposeCommandTests(unittest.TestCase):
     def _resolved(self, tmp):
         home = Path(tmp)
         (home / ".env").write_text("")
-        return SimpleNamespace(home=home, port=8089)
+        return SimpleNamespace(home=home, port=8089, env_file=home / ".env", layout_error=None)
 
     def _run(self, resolved, running, ip="10.20.30.40"):
         out = io.StringIO()
@@ -185,6 +185,8 @@ class RestartSeesTheEditedBindTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         home = Path(tmp.name)
         shutil.copy2(ROOT / "assist-ctl", home / "assist-ctl")
+        (home / "shared").mkdir()  # assist-ctl resolves its env file through this
+        shutil.copy2(ROOT / "shared" / "paths.py", home / "shared" / "paths.py")
         (home / ".env").write_text(env_text)
         seen = {}
 
@@ -204,7 +206,7 @@ class RestartSeesTheEditedBindTests(unittest.TestCase):
                     mock.patch.object(expose.proc, "restart", side_effect=restart_observer), \
                     redirect_stdout(out), redirect_stderr(io.StringIO()):
                 code = expose.command(
-                    SimpleNamespace(home=home, port=8089), **command_args
+                    SimpleNamespace(home=home, port=8089, env_file=home / ".env", layout_error=None), **command_args
                 )
         return code, seen, out.getvalue()
 

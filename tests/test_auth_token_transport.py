@@ -47,9 +47,32 @@ class TokenTransportTests(unittest.TestCase):
         req = _FakeRequest(headers={auth.HEADER_NAME: self.TOKEN})
         self.assertTrue(auth.request_authenticated(req))
 
-    def test_cookie_is_accepted(self):
-        req = _FakeRequest(cookies={auth.COOKIE_NAME: auth.cookie_value()})
-        self.assertTrue(auth.request_authenticated(req))
+    def test_device_cookie_is_accepted(self):
+        import tempfile
+
+        from shared import devices
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            devices, "DEVICES_FILE", Path(tmp) / "devices.json"
+        ):
+            devices.reload()
+            try:
+                record = devices.admit(devices.TokenLogin(), ip="127.0.0.1", ua="test")
+                cookie = auth.device_cookie(record["id"])
+                req = _FakeRequest(cookies={auth.COOKIE_NAME: cookie})
+                req.remote_addr = "127.0.0.1"
+                self.assertTrue(auth.request_authenticated(req))
+            finally:
+                devices.reload()
+
+    def test_shared_v1_cookie_is_rejected(self):
+        """The one-cookie-for-every-browser value is refused (effort 621)."""
+        import hashlib
+        import hmac
+
+        v1 = hmac.new(self.TOKEN.encode(), b"assist-auth-v1", hashlib.sha256).hexdigest()
+        req = _FakeRequest(cookies={auth.COOKIE_NAME: v1})
+        self.assertFalse(auth.request_authenticated(req))
 
     def test_query_string_token_is_rejected(self):
         """?token=<secret> must not authenticate — the secret leaks via the URL."""

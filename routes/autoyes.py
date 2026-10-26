@@ -5,6 +5,7 @@ import logging
 import re
 import subprocess
 import time
+import unicodedata
 
 from flask import Blueprint, jsonify, request
 
@@ -706,6 +707,204 @@ def _prompt_identity(tail, prompt_type, agent_kind):
     ).hexdigest()
 
 
+# --- Attention: a human-facing prompt, apart from answer eligibility (spec 7185 §4.4) ---
+#
+# An idle composer row. A live claude or codex dialog replaces the composer
+# (observed 2026-10-25 on claude 2.1.310 and codex 0.164.0: the permission
+# dialog, an AskUserQuestion and a codex approval all left no composer below the
+# footer — tests/fixtures/delegates/META.json). So a composer BELOW a prompt's
+# footer means the prompt is quoted or historical, and the observation is None.
+# Claude's composer is a `❯` between two ──── rules; a `❯ 1. Yes` / `❯ Yes`
+# option row is not one. Codex's is `› Ask Codex to do anything`; `› 1. Yes,
+# proceed` is an option row.
+_CLAUDE_COMPOSER_RE = re.compile(r"^\s*❯(?:\s|$)(?!\s*(?:\d+[.)]|Yes\b))")
+_CODEX_COMPOSER_RE = re.compile(r"^\s*›\s+(?!\d+[.)])")
+_ATTENTION_KINDS = ("claude", "codex", "gemini")
+# A working-chrome ROW, by shape: a status glyph, one word (`Working`,
+# `Pondering…`), then a parenthesised status that holds `esc to interrupt` and
+# ends the row; or codex's `Working (` with its timer. A question that only
+# mentions the phrase is not chrome.
+_WORKING_CHROME_RE = re.compile(
+    r"^\s*[^\w\s]\s*\w+(?:…|\.{3})?\s*\((?=[^()\n]*\besc to interrupt\b)[^()\n]*\)\s*$"
+    r"|^\W*Working \(\d"
+)
+
+
+def _composer_below(lines, below, agent_kind):
+    """True when an idle composer row sits below row `below`."""
+    for i in range(below + 1, len(lines)):
+        ln = lines[i]
+        if agent_kind == "codex":
+            if _CODEX_COMPOSER_RE.match(ln):
+                return True
+        elif _CLAUDE_COMPOSER_RE.match(ln):
+            above = i - 1 >= 0 and _OPTION_SEP_RE.match(lines[i - 1])
+            under = i + 1 < len(lines) and _OPTION_SEP_RE.match(lines[i + 1])
+            if above and under:
+                return True
+    return False
+
+
+def _attention_region(tail, agent_kind):
+    """(kind, answer, start, end, lines, summary) for the prompt on screen, or None.
+
+    `kind` is answerable / menu / question; `start`..`end` is the dialog's own
+    span in `lines` (the detection window): from _request_start for an
+    answerable prompt, else from the top of the numbered block (its ──── anchor
+    when there is one, else the contiguous non-blank rows above option 1) to the
+    footer. The composer guard is applied here, so both the observation and
+    the key share it.
+    """
+    depth = detection_depth()
+    window = detection_window(tail, depth)
+    lines = window.split("\n")
+    term = None
+    for i in range(len(lines) - 1, -1, -1):
+        if _PROMPT_TERMINATOR_RE.search(lines[i]):
+            term = i
+            break
+    answer = _detect_autoyes_prompt(tail, agent_kind)
+    if answer:
+        below = term
+        if below is None:
+            # A prompt whose last row is not a terminator (cursor's dialog):
+            # the composer guard looks under its last non-blank row.
+            below = len(lines) - 1
+            while below > 0 and not lines[below].strip():
+                below -= 1
+        if _composer_below(lines, below, agent_kind):
+            return None
+        start = _request_start(lines, below, answer[0], agent_kind) if term is not None else None
+        if start is None:
+            start = _numbered_block_start(lines, below, depth)
+        return ("answerable", answer, start, below, lines, answer[3])
+    if agent_kind not in _ATTENTION_KINDS:
+        return None
+    last_footer = None
+    for m in _NUMBERED_FOOTER_RE.finditer(window):
+        last_footer = m
+    if not last_footer:
+        return None
+    footer_line = window.count("\n", 0, last_footer.start())
+    if (len(lines) - 1 - footer_line) > depth * 4:
+        return None
+    search_floor = max(0, footer_line - max(depth * 4, _OPTION_REGION_LOOKBACK))
+    region_start = max(0, footer_line - _OPTION_REGION_LOOKBACK)
+    anchored = _option_region_start(lines, footer_line, search_floor)
+    if anchored is not None:
+        region_start = anchored
+        divider = _has_internal_divider(lines, region_start, footer_line)
+    else:
+        divider = _has_unanchored_divider(lines, region_start, footer_line)
+    if sum(1 for ln in lines[region_start:footer_line] if _OPTION_LINE_RE.match(ln)) < 2:
+        return None
+    if _composer_below(lines, footer_line, agent_kind):
+        return None
+    kind = "question" if divider else "menu"
+    start = _numbered_block_start(lines, footer_line, depth)
+    return (kind, None, start, footer_line, lines, _extract_summary(window, "numbered"))
+
+
+def _numbered_block_start(lines, footer_line, depth):
+    """Top of a numbered dialog: the row under its ──── anchor, else the first
+    row of the contiguous non-blank block above its first option row. When a
+    blank row separates option 1 from the text above it, that text is the
+    question: step over the blank rows and take its block (one block only, so
+    transcript further up stays out)."""
+    search_floor = max(0, footer_line - max(depth * 4, _OPTION_REGION_LOOKBACK))
+    anchored = _option_region_start(lines, footer_line, search_floor)
+    if anchored is not None:
+        return anchored
+    floor = max(0, footer_line - _OPTION_REGION_LOOKBACK)
+    first = None
+    for i in range(floor, footer_line):
+        if _OPTION_LINE_RE.match(lines[i]):
+            first = i
+            break
+    if first is None:
+        return floor
+    start = first
+    while start > floor and lines[start - 1].strip():
+        start -= 1
+    if start == first and start > floor:
+        above = start - 1
+        while above > floor and not lines[above].strip():
+            above -= 1
+        top = above
+        while top > floor and lines[top - 1].strip():
+            top -= 1
+        # Agent working chrome (codex's ticking `Working (…)` timer) is not
+        # the question: keyed, it would change every second. Leading chrome
+        # rows are skipped; a block that is only chrome is not taken.
+        while top <= above and _WORKING_CHROME_RE.match(lines[top]):
+            top += 1
+        if lines[above].strip() and top <= above:
+            start = top
+    return start
+
+
+def observe_attention(tail, agent_kind, pane_width=None):
+    """A prompt a human has to look at, or None. Never changes what Auto-Yes
+    answers: `answer` is exactly _detect_autoyes_prompt's result."""
+    found = _attention_region(tail, agent_kind)
+    if found is None:
+        return None
+    kind, answer, start, end, lines, summary = found
+    return {
+        "kind": kind,
+        "answer": answer,
+        "summary": summary,
+        "key": _region_key(kind, lines, start, end, pane_width),
+    }
+
+
+_BOX_EDGE_RE = re.compile(r"^[│┃┌┐└┘├┤╭╮╰╯]|[│┃┌┐└┘├┤╭╮╰╯]$")
+
+
+def _display_width(row):
+    width = 0
+    for ch in row:
+        if unicodedata.combining(ch):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
+
+
+def _region_key(kind, lines, start, end, pane_width):
+    """`kind` + md5 of the dialog's exact text (spec §4.8). Rows are joined
+    with nothing between them only where a row's display width equals
+    pane_width and the next row is non-empty: the capture's own proof of a
+    hard wrap. Indentation and runs of spaces are kept as they are."""
+    # A terminator row cut by the width continues on the rows below it.
+    if pane_width:
+        while end + 1 < len(lines) and _display_width(lines[end].rstrip()) == pane_width \
+                and lines[end + 1].strip():
+            end += 1
+    rows = [ln.rstrip() for ln in lines[start:end + 1]]
+    joined = []
+    i = 0
+    while i < len(rows):
+        row = _BOX_EDGE_RE.sub("", rows[i])
+        # Width is judged on the row as captured, border glyphs included.
+        while pane_width and i + 1 < len(rows) and _display_width(rows[i]) == pane_width \
+                and rows[i + 1].strip():
+            i += 1
+            row += _BOX_EDGE_RE.sub("", rows[i])
+        joined.append(row)
+        i += 1
+    digest = hashlib.md5("\n".join(joined).encode("utf-8", "replace")).hexdigest()
+    return f"{kind}:{digest}"
+
+
+def attention_key(tail, agent_kind, pane_width=None):
+    """The attention key for the prompt on screen, or None when there is none."""
+    found = _attention_region(tail, agent_kind)
+    if found is None:
+        return None
+    kind, _answer, start, end, lines, _summary = found
+    return _region_key(kind, lines, start, end, pane_width)
+
+
 def prompt_fingerprint(tail):
     """A stable identity for the prompt on screen.
 
@@ -907,6 +1106,39 @@ def _deliver_autoyes_answer(expected, send_text, with_enter, still_on_screen=Non
     return park.perform(park.Intent.AUTOYES_ANSWER, effect)
 
 
+def _set_disposition(target, pane_id, request_id, status, now, failed=None):
+    """Record what this tick did about the prompt on `target` (spec 7185 §4.5).
+    Reporting only, under autoyes_lock. `failed_deliveries` counts consecutive
+    failed deliveries for the same request_id: 0 after a success or a new
+    request; `probe_failing_since` holds across consecutive probe failures.
+    Both carry over only for the same pane AND request: a replacement pane at
+    this target showing the same prompt text starts its own history."""
+    prev = state.autoyes_disposition.get(target)
+    same = bool(
+        prev
+        and request_id is not None
+        and prev.get("request_id") == request_id
+        and prev.get("pane_id") == pane_id
+    )
+    count = prev.get("failed_deliveries", 0) if same else 0
+    if failed is True:
+        count += 1
+    elif failed is False:
+        count = 0
+    since = None
+    if status == "probe-failed":
+        since = prev.get("probe_failing_since") if same and prev.get("status") == "probe-failed" else None
+        since = since if since is not None else now
+    state.autoyes_disposition[target] = {
+        "pane_id": pane_id,
+        "request_id": request_id,
+        "status": status,
+        "at": now,
+        "failed_deliveries": count,
+        "probe_failing_since": since,
+    }
+
+
 def _autoyes_scan_tick():
     """One scan cycle for auto-yes."""
     global_on = state.get_setting("autoyes", "all_sessions") == "on"
@@ -926,7 +1158,7 @@ def _autoyes_scan_tick():
             "-a",
             "-F",
             "#{session_name}\t#{window_index}\t#{pane_index}\t"
-            "#{pane_pid}\t#{pane_current_command}",
+            "#{pane_pid}\t#{pane_current_command}\t#{pane_id}",
         ],
         capture_output=True,
         text=True,
@@ -942,6 +1174,7 @@ def _autoyes_scan_tick():
                 state.autoyes_answered.clear()
                 state.autoyes_sessions.clear()
                 state.autoyes_delays.clear()
+                state.autoyes_disposition.clear()
         return
 
     now = time.time()
@@ -973,6 +1206,9 @@ def _autoyes_scan_tick():
         for t in list(state.autoyes_answered):
             if t not in live_targets:
                 state.autoyes_answered.pop(t, None)
+        for t in list(state.autoyes_disposition):
+            if t not in live_targets:
+                state.autoyes_disposition.pop(t, None)
         # autoyes_cancelled is NOT pruned here: nothing but two quiet scans of
         # the target releases a cancel (judge3 #1). A dead pane's entry waits
         # for its name to be reused and seen quiet, which fails safe.
@@ -1004,6 +1240,7 @@ def _autoyes_scan_tick():
             continue
 
         target = f"{parts[0]}:{parts[1]}.{parts[2]}"
+        pane_id = parts[5] if len(parts) > 5 else ""
 
         # Resolve identity BEFORE capturing. resolve_process walks the pane's
         # process tree from /proc behind a cache and needs no pane content, so a
@@ -1076,6 +1313,7 @@ def _autoyes_scan_tick():
             # Vetoed: drop any pending countdown and nothing else.
             with state.autoyes_lock:
                 state.autoyes_countdowns.pop(target, None)
+                _set_disposition(target, pane_id, None, "vetoed", now)
             continue
 
         # A prompt is detected but its request's dialog cannot be placed
@@ -1084,6 +1322,7 @@ def _autoyes_scan_tick():
         if pident is None:
             with state.autoyes_lock:
                 state.autoyes_countdowns.pop(target, None)
+                _set_disposition(target, pane_id, None, "withheld", now)
             continue
 
         # A prompt is up but its pane could not be identified (the control
@@ -1092,6 +1331,8 @@ def _autoyes_scan_tick():
         # what used to lose a cancel and answer on the next tick (rel #2).
         detected_identity = expected_target_identity(target)
         if detected_identity is None:
+            with state.autoyes_lock:
+                _set_disposition(target, pane_id, pident, "probe-failed", now)
             continue
 
         with state.autoyes_lock:
@@ -1100,6 +1341,7 @@ def _autoyes_scan_tick():
             # or a row below the footer revived it (judge2 #1); leaving a prompt
             # to the human is the safe way to be wrong.
             if state.autoyes_cancelled.get(target):
+                _set_disposition(target, pane_id, pident, "cancelled", now)
                 continue
 
             log.info("autoyes: detected %s on %s", detected[0], target)
@@ -1109,6 +1351,7 @@ def _autoyes_scan_tick():
                 if now - answered[1] < 3.0:
                     # Recently fired — y is still being processed
                     state.autoyes_countdowns.pop(target, None)
+                    _set_disposition(target, pane_id, pident, "recent", now)
                     continue
                 else:
                     # Same hash but too old — new prompt or send failed
@@ -1140,6 +1383,8 @@ def _autoyes_scan_tick():
                         with_enter,
                         prompt_type,
                     )
+                else:
+                    _set_disposition(target, pane_id, pident, "countdown", now)
             else:
                 # Re-check enablement: a toggle-off mid-tick must not recreate a
                 # phantom countdown that's never cleaned up. Every toggle writes
@@ -1169,7 +1414,9 @@ def _autoyes_scan_tick():
                     "prompt_type": detected[0],
                     "summary": summary,
                     "expected_target_identity": detected_identity.as_dict(),
+                    "pane_id": pane_id,
                 }
+                _set_disposition(target, pane_id, pident, "countdown", now)
                 broadcast_event = (target, "countdown", detected[0])
 
         # Send keystrokes outside the lock (subprocess + sleep)
@@ -1186,6 +1433,7 @@ def _autoyes_scan_tick():
             if result.ok:
                 with state.autoyes_lock:
                     state.autoyes_answered[target] = (pident, now)
+                    _set_disposition(target, pane_id, pident, "fired", now, failed=False)
                 broadcast_event = (target, "fired", prompt_type)
                 log.info(
                     "autoyes: FIRED %s on %s (send=%r enter=%r)",
@@ -1195,6 +1443,8 @@ def _autoyes_scan_tick():
                     with_enter,
                 )
             else:
+                with state.autoyes_lock:
+                    _set_disposition(target, pane_id, pident, result.status, now, failed=True)
                 broadcast_event = (target, result.status, prompt_type)
                 log.info("autoyes: %s on %s", result.status, target)
 
@@ -1274,6 +1524,7 @@ def rename_autoyes_session(old, new):
             state.autoyes_answered,
             state.autoyes_cancelled,
             state.autoyes_cancel_quiet,
+            state.autoyes_disposition,
         ):
             for target in [t for t in by_target if t.startswith(old_prefix)]:
                 by_target[new_prefix + target[len(old_prefix):]] = by_target.pop(target)

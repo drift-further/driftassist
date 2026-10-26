@@ -108,7 +108,12 @@ _classify(
     "routes/poll.py:_run_git",
     "routes/poll.py:get_claude_meta",
     "routes/poll.py:consolidated_poll",
+    "routes/poll.py:_capture_tail",
 )
+# The watcher observes panes and publishes options/wakes; neither path delivers input.
+_classify("fixed:observe", "routes/delegates.py:_capture", "routes/delegates.py:api_resume")
+_classify("fixed:no_delivery", "routes/delegates.py:tick", "routes/delegates.py:_publish_channel",
+          "shared/delegate_channel.py:publish")
 _classify("intent:configured_cli_proxy", "routes/poll.py:_cli_proxy_effect")
 _classify("intent:configured_restart", "routes/settings.py:_restart_server_effect")
 
@@ -327,6 +332,7 @@ class ExecutionParkInventoryTests(unittest.TestCase):
             ROOT / "shared" / "tmux.py",
             ROOT / "shared" / "opencode.py",
             ROOT / "shared" / "studio_context.py",
+            ROOT / "shared" / "delegate_channel.py",
         ]
         for path in sources:
             relative = path.relative_to(ROOT).as_posix()

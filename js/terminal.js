@@ -475,111 +475,7 @@ async function loadSessions() {
         // Arrives sorted by the server's tab state — apply the doc first so the
         // pin markers this render sets are in step with the order.
         if (typeof _applyTabState === 'function') _applyTabState(data.tab_state);
-        const panes = data.sessions || [];
-        const container = document.getElementById('session-tabs');
-        const current = _termTarget || data.active_target || '';
-
-        // Store pane list for reference
-        _sessionPanes = panes;
-
-        container.innerHTML = '';
-        if (typeof SplitView !== 'undefined' && panes.length === 0) SplitView.reconcile(panes,requestedAt);
-        if (panes.length === 0) {
-            container.innerHTML = '<span class="session-tabs-empty">No sessions</span>';
-            return;
-        }
-
-        // Group panes: detect teams (sessions with agent sub-panes)
-        const teamSessions = new Set();
-        for (const p of panes) {
-            if (p.agent_name) teamSessions.add(p.session);
-        }
-
-        for (const p of panes) {
-            const isAgent = !!p.agent_name;
-            // Mirrors _applySessionsData() in app.js — keep the two in sync.
-            const isSubpane = !isAgent && !!p.is_subpane;
-            const isTeamLead = !isAgent && teamSessions.has(p.session);
-            const aName = agentDisplayName(p);
-            const aColor = _agentColors[p.agent_color] || '';
-
-            const tab = document.createElement('button');
-            tab.className = 'session-tab';
-            if (isAgent) tab.classList.add('agent-tab');
-            if (isSubpane) tab.classList.add('agent-tab', 'subpane-tab');
-            if (isTeamLead) tab.classList.add('team-lead-tab');
-            tab.dataset.target = p.target;
-            if (p.agent_name) tab.dataset.agentName = p.agent_name;
-
-            // Label: agent name (short) or session·pane for unnamed sibling panes
-            const label = aName || (isSubpane ? shortName(p.session) + '·' + p.pane : shortName(p.session));
-            tab.textContent = label;
-
-            // Agent color: left border accent
-            if (isAgent && aColor) {
-                tab.style.borderLeftWidth = '3px';
-                tab.style.borderLeftColor = aColor;
-            }
-
-            // Attention dot
-            const dot = document.createElement('span');
-            dot.className = 'tab-dot';
-            tab.appendChild(dot);
-
-            // Mirrors _applySessionsData() in app.js — keep the two in sync.
-            // Guarded: app.js loads after terminal.js, so the symbol only
-            // exists by the time this runs, which is the same pattern
-            // _postTabRender and _applyTabState already use here.
-            if (typeof applyTabModel === 'function') applyTabModel(tab, p);
-
-            // Restore prompt indicator if previously detected
-            if (_sessionPrompts[p.target]) {
-                tab.classList.add('has-prompt');
-            }
-            tab.onclick = function() { selectTab(p.target); };
-            if (p.target === current) tab.classList.add('active');
-            container.appendChild(tab);
-        }
-
-        if (typeof SplitView !== 'undefined') SplitView.reconcile(panes, requestedAt);
-        if (typeof SplitView !== 'undefined' && SplitView.enabled) {
-            markActiveTab(_termTarget); SplitView.update();
-            if (typeof _postTabRender === 'function') _postTabRender();
-            return;
-        }
-
-        // Auto-select if we have a saved target
-        if (current && panes.some(p => p.target === current)) {
-            _termTarget = current;
-            noteTargetListed(current);
-        } else if (current && panes.length > 0 && targetMissingIsStale(current, requestedAt)) {
-            // Missing only because this list predates a pane we just created —
-            // keep it. Mirrors _applySessionsData() in app.js — keep the two in sync.
-            _termTarget = current;
-        } else if (current && panes.length > 0) {
-            // Viewed pane vanished (e.g. a subagent pane exited): fall back to
-            // that session's first surviving pane rather than a dead target.
-            // Mirrors _applySessionsData() in app.js — keep the two in sync.
-            const sess = current.split(':')[0];
-            const fallback = panes.find(p => p.session === sess) || panes[0];
-            selectTab(fallback.target, true);   // automatic, not a tap — see selectTab
-            return;
-        } else if (panes.length > 0 && !_termTarget) {
-            _termTarget = panes[0].target;
-        }
-
-        if (_termTarget) {
-            markActiveTab(_termTarget);
-            updateTmuxIndicator();
-            document.getElementById('term-display').classList.remove('hidden');
-        }
-
-        if (typeof _modelSeenSweep === 'function') _modelSeenSweep(panes, _termTarget);
-
-        // Same hooks _applySessionsData runs — pin and draft markers on this
-        // render path too.
-        if (typeof _renderDraftMarks === 'function') _renderDraftMarks();
-        if (typeof _postTabRender === 'function') _postTabRender();
+        _applySessionsData(data.sessions || [], data.active_target || '', requestedAt);
     } catch(e) {}
 }
 
@@ -632,6 +528,7 @@ function selectTab(target, auto) {
     // Selecting a snoozed tab wakes it (covers any selection path).
     if (typeof _wakeSnoozed === 'function') _wakeSnoozed(target);
     markActiveTab(target);
+    if (typeof delegateSelectTarget === 'function') delegateSelectTarget(target);
     // The key panels describe whichever CLI this tab is running.
     if (typeof applyKeyLabels === 'function') applyKeyLabels(target);
     _termPaused = false;

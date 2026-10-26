@@ -1,21 +1,23 @@
 // sw.js — Service worker for Assist (network-first for static assets, cache fallback when offline)
 // Browsers register this only in a secure context (with a loopback exception),
 // so it is inert on the current plain-HTTP phone origin until TLS lands.
-const VERSION = 'assist-v3-065';
+const VERSION = 'assist-v3-073';
 const STATIC_CACHE = 'assist-static-' + VERSION;
 const STATIC_URLS = [
     '/',
     '/icons/assist-live-threads.svg?v=2',
     '/icons/studio-confluence.svg?v=1',
     '/icons/assist-live-threads-180.png?v=2',
+    '/js/prepaint.js?v=1',
+    '/js/actions-registry.js?v=3',
     '/css/fonts.css',
     '/css/base.css?v=2',
     '/css/status-bar.css?v=6',
     '/css/input.css?v=9',
-    '/css/terminal.css?v=19',
+    '/css/terminal.css?v=23',
     '/css/split-view.css?v=3',
     '/css/opencode.css?v=2',
-    '/css/chrome.css?v=6',
+    '/css/chrome.css?v=7',
     '/css/studio.css?v=10',
     '/js/studio.js?v=4',
     '/js/studio-context.js?v=6',
@@ -27,21 +29,23 @@ const STATIC_URLS = [
     '/js/target-hold.js?v=1',
     '/js/poll-sync.js?v=2',
     '/js/ui.js?v=7',
-    '/js/tabs.js?v=11',
+    '/js/tabs.js?v=16',
     '/js/vault.js?v=3',
     '/js/input.js?v=13',
     '/js/keycombo.js?v=2',
     '/js/drafts.js?v=5',
-    '/js/terminal.js?v=32',
+    '/js/terminal.js?v=34',
     '/js/opencode.js?v=2',
-    '/js/actions.js?v=19',
+    '/js/actions.js?v=20',
     '/js/commands.js?v=5',
-    '/js/monitor.js?v=10',
+    '/js/monitor.js?v=12',
+    '/js/prompt-popup.js?v=5',
     '/js/chrome.js?v=3',
     '/js/updates.js?v=1',
-    '/js/settings.js?v=10',
-    '/js/split-view.js?v=3',
-    '/js/app.js?v=28',
+    '/js/settings.js?v=13',
+    '/js/split-view.js?v=4',
+    '/js/delegate-nav.js?v=4',
+    '/js/app.js?v=33',
 ];
 
 self.addEventListener('install', event => {

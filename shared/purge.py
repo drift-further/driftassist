@@ -1,14 +1,13 @@
 """Reviewed, generation-bound purging of content-idle tmux sessions."""
 
-import hashlib
 import os
 import secrets
 import subprocess
 import threading
 import time
 
-from shared import state, tab_state
-from shared.agent_identity import refine_with_content, resolve_process
+from shared import pane_scan, state, tab_state
+from shared.agent_identity import pane_root_start, refine_with_content, resolve_process
 from shared.tmux import PASSWORD_PROMPT_RE, _process_start_time, tmux_exact_target
 from routes.autoyes import (
     _detect_autoyes_prompt, _PROMPT_TERMINATOR_RE, detection_window, detection_window_lines,
@@ -19,10 +18,15 @@ _LOCK = threading.Lock()
 PREVIEW_TTL = 600
 
 
-def _observe(session=None):
-    # Share ticket A's activity normalization; never change the captured text.
-    from routes.poll import _activity_tail
+def _capture(pane_id):
+    cap = subprocess.run(
+        ["tmux", "capture-pane", "-e", "-p", "-t", pane_id, "-S", f"-{detection_window_lines()}"],
+        capture_output=True, text=True, timeout=5,
+    )
+    return None if cap.returncode else cap.stdout
 
+
+def _observe(session=None):
     command = ["tmux", "list-panes"]
     if session is None:
         command.append("-a")
@@ -59,27 +63,23 @@ def _observe(session=None):
         row["owned"] |= (name in state.assist_owned_sessions or owned == "1"
                          or bool(os.environ.get("TMUX") and os.environ.get("TMUX_PANE") == pane_id))
         row["panes"].append((target, pane_id, pane_pid))
-        cap = subprocess.run(
-            ["tmux", "capture-pane", "-e", "-p", "-t", pane_id, "-S", f"-{detection_window_lines()}"],
-            capture_output=True, text=True, timeout=5,
+        process_kind = resolve_process(target, pane_pid, command)
+        # A fresh capture by pane id, published through the one ordered writer
+        # (shared/pane_scan.py): if a newer sample of this pane landed while it
+        # ran, that one stands, cache and activity together. A persisted
+        # name-based activity cannot predate this session's birth.
+        previous = state.pane_content_hash.get(target)
+        sampled = pane_scan.sample(
+            target, pane_id, None, now, 0, capture=lambda _t, _id=pane_id: _capture(_id),
+            kind_of=lambda tail, _k=process_kind: refine_with_content(_k, tail),
+            fresh=True, floor=int(created), root=pane_root_start(pane_pid),
         )
-        if cap.returncode:
+        if sampled is None:
             raise RuntimeError(f"Cannot capture {name}; refresh the list")
-        tail = cap.stdout.rstrip("\n")
-        kind = refine_with_content(resolve_process(target, pane_pid, command), tail)
-        content_hash = hashlib.md5(_activity_tail(tail, kind).encode()).hexdigest()
-        with state._activity_lock:
-            previous = state.pane_content_hash.get(target)
-            if previous is not None and previous != content_hash:
-                state.pane_last_activity[target] = now
-            state.pane_last_activity.setdefault(target, now)
-            # Persisted name-based activity cannot predate this session's birth.
-            activity = max(state.pane_last_activity[target], int(created))
-            changed |= state.pane_last_activity[target] != activity
-            state.pane_last_activity[target] = activity
-            state.pane_content_hash[target] = content_hash
-            row["activity"][target] = state.pane_last_activity[target]
-            changed |= previous != content_hash
+        tail = sampled.raw
+        kind = refine_with_content(process_kind, tail)
+        row["activity"][target] = sampled.changed_at
+        changed |= sampled.changed or previous != state.pane_content_hash.get(target)
         window_tail = detection_window(tail)
         nonempty = [ln for ln in window_tail.splitlines() if ln.strip()]
         row["prompt"] |= bool(

@@ -152,6 +152,81 @@ def logs(resolved: Config, lines: str = "100", follow: bool = False) -> int:
     return completed.returncode
 
 
+def _migration_text() -> str:
+    """The migration marker in words. Read without the layout lock."""
+    from shared import paths
+
+    marker = paths.migration_state()
+    if marker is None:
+        return "none"
+    if not marker.get("valid", True):
+        return f"marker unreadable ({marker.get('error')}): recovery required, {marker.get('path')}"
+    direction = marker.get("direction", "forward")
+    if marker.get("phase") == "done":
+        return "rolled back" if direction == "reverse" else "completed"
+    return f"INCOMPLETE: {direction}, phase {marker.get('phase')} (assist migrate-state --resume | --rollback)"
+
+
+def _sha256(path: Path) -> str | None:
+    import hashlib
+
+    try:
+        if path.is_dir():
+            digest = hashlib.sha256()
+            for child in sorted(p for p in path.rglob("*") if p.is_file()):
+                digest.update(str(child.relative_to(path)).encode())
+                digest.update(child.read_bytes())
+            return digest.hexdigest()
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _layout_report(resolved: Config) -> bool:
+    """Doctor's layout section. False when something needs the owner."""
+    from shared import paths
+
+    ok = True
+    if resolved.layout == "refused":
+        print(f"  {MARK_FAIL} layout refused: {resolved.layout_error}")
+        return False
+    print(f"  {MARK_OK} layout {resolved.layout} (config {resolved.config_dir}, data {resolved.data_dir})")
+    text = _migration_text()
+    if text in ("none", "completed", "rolled back"):
+        print(f"  {MARK_OK} migration: {text}")
+    else:
+        print(f"  {MARK_FAIL} migration: {text}")
+        ok = False
+    marker = paths.migration_state()
+    if (
+        marker and marker.get("valid", True) and marker.get("direction", "forward") == "forward"
+        and marker.get("phase") in ("committed", "cleaning", "done")
+        and not paths.install_json_path().exists()
+    ):
+        print(f"  {MARK_FAIL} the migration committed but install.json is missing "
+              f"({paths.install_json_path()}): the install falls back to the legacy layout. "
+              "Run: assist migrate-state --resume, or restore install.json")
+        ok = False
+    for problem in paths.overlap_problems(resolved.home):
+        print(f"  {MARK_WARN} {problem}: a migration would be refused. Set ASSIST_CONFIG_DIR / "
+              "ASSIST_DATA_DIR outside the checkout")
+    candidates = [p for _, legacy, xdg in paths.item_locations(resolved.home) for p in (legacy, xdg)]
+    candidates.append(paths.state_dir() / "migration-receipt.orig.json")
+    for path in candidates:
+        part = Path(str(path) + ".part")
+        if part.exists():
+            print(f"  {MARK_WARN} .part leftover: {part} (an interrupted migrate-state; "
+                  "--resume finishes or clears it)")
+    for label, legacy, xdg in paths.item_locations(resolved.home):
+        if legacy.exists() and xdg.exists():
+            same = _sha256(legacy) == _sha256(xdg)
+            mark = MARK_WARN
+            note = "identical" if same else "DIFFERENT"
+            print(f"  {mark} {label} present in both {legacy} and {xdg} ({note}); "
+                  f"the {resolved.layout} copy is the one in use")
+    return ok
+
+
 def config(resolved: Config) -> int:
     user_home = os.environ.get("HOME", "")
     projects_dir = os.environ.get("ASSIST_PROJECTS_DIR") or f"{user_home}/projects"
@@ -163,7 +238,15 @@ def config(resolved: Config) -> int:
     print(f"Python             {resolved.python}")
     print(f"Venv               {resolved.home / '.venv'}")
     print(f"User config file   {resolved.config_file}")
-    print(f"Env file           {resolved.home / '.env'}")
+    print(f"Layout             {resolved.layout}")
+    if resolved.layout_error:
+        print(f"                   {resolved.layout_error}")
+    print(f"Config dir         {resolved.config_dir or '-'}")
+    print(f"Data dir           {resolved.data_dir or '-'}")
+    print(f"State dir          {resolved.state_dir}")
+    print(f"Env file           {resolved.env_file or '-'}")
+    print(f"Token file         {resolved.auth_token_path}")
+    print(f"Migration          {_migration_text()}")
     print(f"Projects dir       {projects_dir}")
     print(f"Skills dir         {skills_dir}")
     print(f"Session init cmd   {session_init_cmd}")
@@ -265,18 +348,24 @@ def doctor(resolved: Config) -> int:
     else:
         print(f"  {MARK_FAIL} venv missing — run install.sh")
         ok_all = False
-    if (resolved.home / ".env").is_file():
-        print(f"  {MARK_OK} .env present")
+    if resolved.env_file is not None and resolved.env_file.is_file():
+        print(f"  {MARK_OK} env file present ({resolved.env_file})")
     else:
-        print(f"  {MARK_WARN} .env missing — run install.sh")
+        print(f"  {MARK_WARN} env file missing ({resolved.env_file}) — run install.sh")
     if resolved.config_file.is_file():
         print(f"  {MARK_OK} user config ({resolved.config_file})")
     else:
         print(f"  {MARK_WARN} user config missing")
-    if os.access(resolved.home, os.W_OK):
-        print(f"  {MARK_OK} data directory writable")
+    data_dir = resolved.data_dir or resolved.home
+    if os.access(data_dir, os.W_OK) or not data_dir.exists():
+        print(f"  {MARK_OK} data directory writable ({data_dir})")
     else:
-        print(f"  {MARK_FAIL} data directory NOT writable ({resolved.home})")
+        print(f"  {MARK_FAIL} data directory NOT writable ({data_dir})")
+        ok_all = False
+
+    print()
+    print("Layout:")
+    if not _layout_report(resolved):
         ok_all = False
 
     print()

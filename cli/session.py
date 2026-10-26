@@ -120,12 +120,17 @@ def _merged_sessions(include_cwd: bool = False) -> dict:
     sessions_response = http.get("/terminal/sessions")
     poll_response = http.get("/poll")
     states = poll_response.get("states") or {}
+    poll_panes = {p.get("target"): p for p in poll_response.get("sessions") or []}
 
     panes = []
     for pane in sessions_response.get("sessions") or []:
         merged = dict(pane)
         pane_state = states.get(pane.get("target")) or {}
         merged.update(pane_state)
+        current = poll_panes.get(pane.get("target"), {})
+        for key in ("delegate", "resume", "resume_reason"):
+            if key in current:
+                merged[key] = current[key]
         if include_cwd:
             cwd_target = merged.get("target") or merged.get("session")
             if cwd_target:
@@ -170,6 +175,8 @@ def _display_rows(panes: list[dict], include_cwd: bool) -> list[list[str]]:
         ]
         if include_cwd:
             row.append(_text(pane.get("cwd")))
+        delegate = pane.get("delegate") or {}
+        row.append(f"{delegate['state']}:{delegate.get('reason', '')}" if delegate.get("state") else "-")
         rows.append(row)
     return rows
 
@@ -208,6 +215,7 @@ def view(session: str | None, pane: str = "0.0", lines: int | None = None) -> in
     content = response.get("content")
     if content is not None:
         sys.stdout.write(str(content))
+    print_resume_hint(target)
     print_next_hint("view", session)
     return 0
 
@@ -242,6 +250,9 @@ def launch(
         "project": session,
         "skip_init": True,
     }
+    parent = reply_address()
+    if parent:
+        payload["parent"] = parent
     if cwd is not None:
         payload["cwd"] = cwd
     if cols is not None:
@@ -377,7 +388,8 @@ def _http_error_detail(error: http.ApiError) -> str:
 
 def kill(session: str | None, pane: str = "0.0") -> int:
     """Kill a tmux session through Assist's existing terminal endpoint."""
-    resolve_target(session, pane)
+    target = resolve_target(session, pane)
+    print_resume_hint(target, fresh=True)
     try:
         response = http.post("/terminal/kill", {"session": session})
     except http.ApiError as exc:
@@ -489,4 +501,44 @@ def autoyes(
         global_block.get("delay"),
         (status.get("sources") or {}).get(session),
     )
+    return 0
+
+
+def print_resume_hint(target, fresh=False):
+    if os.environ.get('ASSIST_NO_HINTS') == '1':
+        return
+    try:
+        response = http.get('/api/resume?' + urlencode({'target': target, 'fresh': int(fresh)}))
+    except http.ApiError:
+        return  # An optional hint cannot prevent viewing or killing a pane.
+    record = response.get('resume')
+    if record:
+        label = 'resume' if record.get('verified', True) else 'resume (unverified)'
+        print(label + ': ' + record['line'], file=sys.stderr, flush=True)
+
+
+def print_delegate_hint(target):
+    if os.environ.get('ASSIST_NO_HINTS') == '1':
+        return
+    try:
+        poll = http.get('/poll')
+    except http.ApiError:
+        return
+    for pane in poll.get('sessions') or []:
+        if pane.get('target') == target:
+            d = pane.get('delegate') or {}
+            if d.get('state'):
+                detail = (' — ' + d['detail']) if d.get('detail') else ''
+                print(f"delegate: {d['state']} ({d.get('reason', '')}){detail}", file=sys.stderr)
+            return
+
+
+def resume(session, pane='0.0', agent_only=False):
+    target = resolve_target(session, pane)
+    response = http.get('/api/resume?' + urlencode({'target':target, 'fresh':1}))
+    record = response.get('resume')
+    if not record:
+        print('assist: ' + (response.get('resume_reason') or 'no resume available'), file=sys.stderr)
+        return 1
+    print(record['command'] if agent_only else record['line'])
     return 0

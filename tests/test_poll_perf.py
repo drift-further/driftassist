@@ -100,6 +100,11 @@ class PollWireTests(unittest.TestCase):
         # A shell with a background child: pane_current_command stays bash.
         self.box.tmux("send-keys", "-t", "busy", "sleep 600 &", "Enter")
         _settle(0.8)
+        # /poll captures a pane by its id (`%N`); this maps it back to its session.
+        self.session_of = dict(
+            line.split(" ", 1)
+            for line in self.box.tmux("list-panes", "-a", "-F", "#{pane_id} #{session_name}").splitlines()
+        )
 
         self.save_idle = MagicMock()
         patches = [
@@ -133,6 +138,20 @@ class PollWireTests(unittest.TestCase):
         run_patch.start()
         self.addCleanup(run_patch.stop)
 
+    def test_resume_only_observes_supported_agent_panes(self):
+        from routes import delegates
+        from shared import resume_line
+        for kind in ('shell', 'claude', 'cursor', 'opencode', 'gemini', 'codex'):
+            with self.subTest(kind=kind), \
+                 patch.object(self.poll, 'resolve_process', side_effect=lambda target, *args:
+                              kind if target.startswith('agent:') else 'shell'), \
+                 patch.object(resume_line, 'RESOLVER', resume_line.Resolver()), \
+                 patch.object(delegates, 'observe_process_tree', wraps=delegates.observe_process_tree) as observe, \
+                 patch.object(self.poll, 'resume_for_pane', wraps=self.poll.resume_for_pane) as resume:
+                self.get()
+                self.assertEqual(resume.call_count, int(kind in ('codex', 'claude')))
+                self.assertEqual(observe.call_count, int(kind in ('codex', 'claude')))
+
     def get(self, since=None):
         self.calls.clear()
         response = self.client.get("/poll", query_string={"since": since} if since else {})
@@ -143,10 +162,10 @@ class PollWireTests(unittest.TestCase):
         return {entry["session"]: entry for entry in data["scan"]}
 
     def captured(self):
-        # Targets arrive in tmux's exact form (`=name:w.p`, see
-        # tests/test_exact_targets.py); the session name is what is compared.
+        # A capture targets the pane id (`%N`, see tests/test_tmux_id_targets.py);
+        # the session name is what is compared.
         return sorted(
-            c[c.index("-t") + 1].removeprefix("=").split(":")[0]
+            self.session_of[c[c.index("-t") + 1]]
             for c in self.calls if "capture-pane" in c
         )
 
@@ -239,7 +258,7 @@ class PollWireTests(unittest.TestCase):
 
         def capture(args, *a, **kw):
             result = recorded_run(args, *a, **kw)
-            if "capture-pane" in args and args[args.index("-t") + 1].startswith("=agent:"):
+            if "capture-pane" in args and self.session_of.get(args[args.index("-t") + 1]) == "agent":
                 result.stdout = tail
             return result
 

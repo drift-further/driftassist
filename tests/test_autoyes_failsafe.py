@@ -748,7 +748,7 @@ class StopTargetTests(unittest.TestCase):
         html = (ROOT / "index.html").read_text()
         bar = html[html.index('id="autoyes-countdown"'):]
         bar = bar[:bar.index("</div>\n        </div>")]
-        self.assertIn('onclick="cancelAutoYesCountdown()"', html[html.index('<div class="autoyes-countdown"'):][:200])
+        self.assertIn('data-action="cancelAutoYesCountdown"', html[html.index('<div class="autoyes-countdown"'):][:200])
         self.assertIn(">STOP</button>", bar)
 
     def test_stop_is_at_least_44px_tall(self):

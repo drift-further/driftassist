@@ -22,7 +22,7 @@ from routes import settings
 class InstalledRestartTests(unittest.TestCase):
     def test_builtin_restart_aliases_use_this_checkout_and_custom_command_is_preserved(self):
         app = Flask(__name__)
-        home = Path(settings.state.DATA_DIR).resolve()
+        home = settings.paths.APP_ROOT  # the code root, whatever the runtime layout
         with app.app_context(), patch.object(settings.subprocess, 'Popen') as spawn:
             for command in ('assist restart', 'karen assist restart'):
                 response = settings._restart_server_effect(command)

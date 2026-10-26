@@ -7,7 +7,10 @@ import re
 import subprocess
 import threading
 import time
+import unicodedata
 from pathlib import Path
+
+from shared.delegate_parent import enrich_parents
 
 from flask import Blueprint, jsonify, request
 
@@ -103,6 +106,10 @@ def terminal_projects():
 def terminal_launch():
     """Launch a tmux session for a project with optional venv activation."""
     data = request.get_json(silent=True) or {}
+    parent = data.get("parent")
+    if parent is not None and (not isinstance(parent, str) or any(
+            unicodedata.category(char) in ("Cc", "Zl", "Zp") for char in parent)):
+        return jsonify({"ok": False, "error": "invalid_parent"}), 400
     project = (data.get("project") or "").strip()
     if not project:
         return jsonify({"ok": False, "error": "No project specified"}), 400
@@ -154,6 +161,7 @@ def terminal_launch():
             cols,
             rows,
             init_cmd if intent is park.Intent.TERMINAL_INIT_LAUNCH else "",
+            parent=data.get("parent"),
         ),
     )
     if park.is_refusal(result):
@@ -184,7 +192,7 @@ def _existing_terminal_effect(session_name):
     )
 
 
-def _terminal_launch_effect(project_path, session_name, cols, rows, init_cmd):
+def _terminal_launch_effect(project_path, session_name, cols, rows, init_cmd, parent=None):
     """Create one terminal unit while the park decision lock is held."""
 
     created = create_tmux_session(
@@ -201,6 +209,13 @@ def _terminal_launch_effect(project_path, session_name, cols, rows, init_cmd):
             500,
         )
     identity = created.identity
+
+    if isinstance(parent, str) and parent.strip():
+        recorded = subprocess.run(
+            ["tmux", "set-option", "-t", tmux_exact_target(identity.session_id),
+             "@assist_parent", parent.strip()], capture_output=True, text=True, timeout=5)
+        if recorded.returncode:
+            return jsonify({"ok": False, "error": "parent_record_failed"}), 500
 
     subprocess.run(
         [
@@ -400,7 +415,7 @@ def terminal_sessions():
             "list-panes",
             "-a",
             "-F",
-            "#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_current_command}\t#{pane_width}\t#{pane_height}\t#{session_activity}\t#{pane_pid}\t#{pane_id}\t#{session_created}",
+            "#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_current_command}\t#{pane_width}\t#{pane_height}\t#{session_activity}\t#{pane_pid}\t#{pane_id}\t#{session_created}\t#{@assist_parent}",
         ],
         capture_output=True,
         text=True,
@@ -442,6 +457,7 @@ def terminal_sessions():
                     "target": target,
                     "session": parts[0],
                     "created": created,
+                    "_assist_parent": parts[10] if len(parts) > 10 else "",
                     "window": int(parts[1]),
                     "pane": int(parts[2]),
                     "command": parts[3],
@@ -460,6 +476,16 @@ def terminal_sessions():
             )
 
     enrich_panes_with_agents(panes)
+    # Use the same watcher snapshot as /poll; never clear marks on a list refresh.
+    from routes.delegates import snapshot as delegate_snapshot
+    from routes.poll import _DELEGATE_WIRE
+    watched = {entry['pane_id']: entry for entry in delegate_snapshot()['panes']}
+    for pane in panes:
+        entry = watched.get(pane.get('pane_id'))
+        if entry:
+            pane['delegate'] = {key: entry[key] for key in _DELEGATE_WIRE}
+            pane['resume'], pane['resume_reason'] = entry.get('resume'), entry.get('resume_reason')
+    enrich_parents(panes, tuple(state.get_settings()["delegates"]["prefixes"]))
 
     # Same ordering /poll applies, so the first render before a poll lands is
     # already correct rather than briefly showing raw tmux order.

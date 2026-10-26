@@ -28,18 +28,23 @@ if [[ "${1:-}" == "activate-park-v16" ]]; then
     exec "$PYTHON" -m shared.park_activation controller
 fi
 
-# Load .env if present -- BEFORE any path or port is computed, so a port or
-# log path set only in .env is honoured when this script is run directly.
-if [[ -f "$SCRIPT_DIR/.env" ]]; then
+# The install's env file -- the checkout's .env on the legacy layout, or
+# server.env in the config dir on XDG (shared/paths.py, the one resolver the CLI
+# and server use too; stdlib only, so python3 suffices before a venv exists).
+# Loaded BEFORE any path or port is computed, so a port or log path set only
+# there is honoured when this script is run directly. A layout owned by
+# another checkout stops here.
+ENV_FILE="$("$PYTHON" -I "$SCRIPT_DIR/shared/paths.py" env-file --checkout "$SCRIPT_DIR")" || exit 1
+if [[ -f "$ENV_FILE" ]]; then
     set -a
-    source "$SCRIPT_DIR/.env"
+    source "$ENV_FILE"
     set +a
 fi
 
 # Per-user state, not a shared /tmp name: a second checkout, or a second user,
 # must not read or kill this server through the same PID file. cli/config.py
 # computes the same defaults; tests/test_install_paths.py keeps them in step.
-STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/drift-assist"
+STATE_DIR="${ASSIST_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/drift-assist}"
 PORT="${ASSIST_PORT:-8089}"
 PID_FILE="${ASSIST_PID_FILE:-$STATE_DIR/assist.pid}"
 LOG_FILE="${ASSIST_LOG_FILE:-$STATE_DIR/assist.log}"
@@ -54,6 +59,16 @@ ensure_state_dirs() {
     if [[ "$PID_FILE" == "$STATE_DIR/"* || "$LOG_FILE" == "$STATE_DIR/"* ]]; then
         chmod 700 "$STATE_DIR"
     fi
+}
+
+# The shared layout lock (shared/paths.py), held on fd 9 for the life of this
+# script and of the server it starts: a state migration takes it exclusively,
+# so a start cannot race one, and a stopped migration refuses every start.
+enter_layout() {
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+    exec 9>>"$STATE_DIR/migrate.lock"
+    "$PYTHON" -I "$SCRIPT_DIR/shared/paths.py" enter --checkout "$SCRIPT_DIR" --fd 9 || exit 1
 }
 
 # Size rotation at start: one previous generation kept as <log>.1.
@@ -182,7 +197,7 @@ load_record() {
 
 refuse_foreign() {
     echo "PID file $PID_FILE records PID $REC_PID, which runs another checkout's serve.py." >&2
-    echo "Not touching it. Give this checkout its own ASSIST_PID_FILE and ASSIST_LOG_FILE in .env." >&2
+    echo "Not touching it. Give this checkout its own ASSIST_PID_FILE and ASSIST_LOG_FILE in $ENV_FILE." >&2
     return 1
 }
 
@@ -300,21 +315,22 @@ do_run() {
 }
 
 case "${1:-help}" in
-    start)   do_start ;;
-    run)     do_run ;;
+    start)   enter_layout; do_start ;;
+    run)     enter_layout; do_run ;;
     owner)   pid_owner "${2:-}" ;;  # read-only: ours | foreign | stale (tests use it)
-    paths)   printf 'port=%s\npid_file=%s\nlog_file=%s\nbind=%s\n' "$PORT" "$PID_FILE" "$LOG_FILE" "${ASSIST_BIND:-}" ;;
-    stop)    do_stop ;;
-    restart) do_restart ;;
+    paths)   printf 'port=%s\npid_file=%s\nlog_file=%s\nbind=%s\nenv_file=%s\n' "$PORT" "$PID_FILE" "$LOG_FILE" "${ASSIST_BIND:-}" "$ENV_FILE" ;;
+    stop)    enter_layout; do_stop ;;
+    restart) enter_layout; do_restart ;;
     status)  do_status ;;
     *)
         echo "Usage: assist-ctl {start|stop|restart|status|run|paths}"
         echo ""
-        echo "Environment variables (or set in .env):"
+        echo "Environment variables (or set in the env file: $ENV_FILE):"
         echo "  ASSIST_PORT           Port (default: 8089)"
         echo "  ASSIST_BIND           Extra LAN address to listen on (see: assist expose)"
         echo "  ASSIST_PID_FILE       PID file (default: \$XDG_STATE_HOME/drift-assist/assist.pid)"
         echo "  ASSIST_LOG_FILE       Log file (default: \$XDG_STATE_HOME/drift-assist/assist.log)"
+        echo "  ASSIST_CONFIG_DIR / ASSIST_DATA_DIR / ASSIST_STATE_DIR   Runtime roots (shared/paths.py)"
         echo "  ASSIST_PROJECTS_DIR   Projects root directory"
         echo "  ASSIST_CLI_BIN        Path to CLI binary for proxy"
         echo "  ASSIST_CLI_DIR        CLI working directory"

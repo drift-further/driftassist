@@ -163,7 +163,7 @@ class GitCommitBoxTests(unittest.TestCase):
 
     def test_button_says_what_it_does_and_confirms_first(self):
         index = (ROOT / "index.html").read_text(encoding="utf-8")
-        self.assertIn('onclick="gitCommitPushConfirm()">Commit &amp; push</button>', index)
+        self.assertIn('data-action="gitCommitPushConfirm">Commit &amp; push</button>', index)
         self.assertNotIn("C&amp;P", index)
         body = _function(_js("app.js"), "gitCommitPushConfirm")
         preview = body.index("/api/git/preview")

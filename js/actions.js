@@ -755,6 +755,47 @@ function _unfreezeAndScroll() {
     display.scrollTop = display.scrollHeight;
 }
 
+// --- Attention: a prompt a human has to look at, apart from answering ---
+// Mirrors routes/autoyes.py:observe_attention. A live claude or codex dialog
+// replaces the composer (tests/fixtures/delegates/META.json), so an idle
+// composer row BELOW the prompt's footer means the prompt is quoted or
+// historical and the observation is null. `❯ 1. Yes` / `❯ Yes` and
+// `› 1. Yes, proceed` are option rows, not composers.
+const _CLAUDE_COMPOSER_RE = /^\s*❯(?:\s|$)(?!\s*(?:\d+[.)]|Yes\b))/;
+const _CODEX_COMPOSER_RE = /^\s*›\s+(?!\d+[.)])/;
+
+function _composerBelow(lines, below, agentKind) {
+    for (let i = below + 1; i < lines.length; i++) {
+        const ln = lines[i];
+        if (agentKind === 'codex') {
+            if (_CODEX_COMPOSER_RE.test(ln)) return true;
+        } else if (_CLAUDE_COMPOSER_RE.test(ln)) {
+            const above = i - 1 >= 0 && _OPT_SEP_RE.test(lines[i - 1]);
+            const under = i + 1 < lines.length && _OPT_SEP_RE.test(lines[i + 1]);
+            if (above && under) return true;
+        }
+    }
+    return false;
+}
+
+// `content` must be ANSI-stripped (detectionTail output). Returns
+// {kind: 'answerable'|'menu'|'question', id} or null. Never changes what
+// detectSmartActions offers or what Auto-Yes answers.
+function observeAttention(content, agentKind) {
+    if (!content) return null;
+    const lines = content.split('\n').slice(-_detectionWindow);
+    const r = detectSmartActions(lines.join('\n'), '__attention__', agentKind);
+    if (!r || r.passive) return null;
+    let below = _findOptionFooter(lines);
+    if (below < 0) {
+        below = lines.length - 1;
+        while (below > 0 && !lines[below].trim()) below--;
+    }
+    if (_composerBelow(lines, below, agentKind)) return null;
+    const kind = r.id === 'numbered-options' ? (r.notifyOnly ? 'question' : 'menu') : 'answerable';
+    return { kind, id: r.id };
+}
+
 // `content` must be ANSI-stripped; `target` keys the per-pane dismiss state.
 function detectSmartActions(content, target, agentKind) {
     if (!content) return null;

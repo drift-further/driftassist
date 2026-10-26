@@ -7,6 +7,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from shared import paths
+
 
 _ASSIGNMENT_RE = re.compile(
     r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$"
@@ -41,6 +43,14 @@ class Config:
     log_file: Path
     control_dir: Path
     auth_token_path: Path
+    # The runtime layout (shared/paths.py): "legacy", "xdg", or "refused" when
+    # install.json names another checkout (layout_error says which).
+    layout: str = "legacy"
+    layout_error: str | None = None
+    env_file: Path | None = None
+    config_dir: Path | None = None
+    data_dir: Path | None = None
+    state_dir: Path | None = None
 
 
 def _strip_comment(value: str) -> str:
@@ -212,6 +222,9 @@ def user_roster_file(xdg_config_home: Path) -> Path:
 
 def state_dir_for(user_home: str) -> Path:
     """Per-user runtime state: PID file and log. assist-ctl uses the same path."""
+    override = os.environ.get("ASSIST_STATE_DIR")
+    if override:
+        return Path(override)
     xdg_state_home = os.environ.get("XDG_STATE_HOME") or str(
         Path(user_home) / ".local" / "state"
     )
@@ -360,8 +373,20 @@ def resolve(
                 f"invoked={expected} resolved={actual}"
             )
 
-    env_file = home / ".env"
-    if env_file.is_file():
+    # One env file for the CLI, the server, the installer and assist-ctl: the
+    # checkout's .env on the legacy layout, <config dir>/server.env on XDG.
+    # A layout owned by another checkout loads nothing; every verb except the
+    # diagnostics then refuses (bin/assist, paths.enter_runtime).
+    layout_error = None
+    try:
+        layout = paths.layout(home)
+        config_dir = paths.config_dir(home)
+        data_dir = paths.data_dir(home)
+        env_file = paths.env_file(home)
+    except paths.LayoutError as exc:
+        layout, layout_error = "refused", str(exc)
+        config_dir = data_dir = env_file = None
+    if env_file is not None and env_file.is_file():
         _load_assignments(env_file)
 
     port_value = os.environ.get("ASSIST_PORT") or "8089"
@@ -387,11 +412,12 @@ def resolve(
                 log_file = LEGACY_LOG_FILE
     control_dir = Path(os.environ.get("ASSIST_CONTROL_DIR", "/tmp/assist-park-v16"))
     auth_token_path = Path(
-        os.environ.get("ASSIST_AUTH_TOKEN_PATH", str(home / "auth_token"))
+        os.environ.get("ASSIST_AUTH_TOKEN_PATH")
+        or str((config_dir or home) / "auth_token")
     )
 
     try:
-        token = auth_token_path.read_text(encoding="utf-8").strip()
+        token = None if layout_error else auth_token_path.read_text(encoding="utf-8").strip()
     except (OSError, UnicodeError):
         token = None
 
@@ -407,4 +433,10 @@ def resolve(
         log_file=log_file,
         control_dir=control_dir,
         auth_token_path=auth_token_path,
+        layout=layout,
+        layout_error=layout_error,
+        env_file=env_file,
+        config_dir=config_dir,
+        data_dir=data_dir,
+        state_dir=state_dir,
     )

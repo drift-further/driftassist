@@ -5,8 +5,6 @@ import time
 from urllib.parse import urlencode
 
 from cli import http
-from routes.autoyes import _detect_autoyes_prompt
-from shared.agent_identity import _ANSI_ESCAPE_RE
 
 
 DEFAULT_TIMEOUT = 110.0
@@ -50,6 +48,11 @@ def _agent_kind(poll_response: dict, target: str) -> str | None:
 
 
 def _prompt_detail(tail: str, agent_kind: str | None) -> str | None:
+    # Imported here, not at module load: the detector lives with the server's
+    # state, and bin/assist imports this module for every verb's parser.
+    from routes.autoyes import _detect_autoyes_prompt
+    from shared.agent_identity import _ANSI_ESCAPE_RE
+
     plain_tail = _ANSI_ESCAPE_RE.sub("", tail)
     detected = _detect_autoyes_prompt(plain_tail, agent_kind)
     if detected is None:
@@ -161,6 +164,9 @@ def run_wait(
     else:
         state, detail = wait_for(target, timeout, baseline_hash)
 
+    from cli.session import print_resume_hint, print_delegate_hint
+    print_resume_hint(target)
+    print_delegate_hint(target)
     if state == "idle":
         return 0
     if state == "prompt":

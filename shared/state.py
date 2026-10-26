@@ -9,11 +9,22 @@ import json
 import logging
 import math
 import os
+import re
 import tempfile
 import threading
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
+
+from shared import paths
+
+# Code versus runtime roots (shared/paths.py). APP_ROOT is the checkout: code
+# and static assets, never written here. CONFIG_DIR holds settings and
+# secrets, DATA_DIR mutable state. On the legacy layout both are the checkout,
+# exactly as before; with install.json they are the XDG directories.
+APP_ROOT = paths.APP_ROOT
+CONFIG_DIR = paths.config_dir()
+DATA_DIR = paths.data_dir()
 
 log = logging.getLogger(__name__)
 
@@ -144,16 +155,39 @@ DEFAULT_SETTINGS = {
         "request_max_pending": 3,
         "request_cooldown_sec": 30,
     },
+    "security": {
+        # `script-src 'self'` with no inline script anywhere (shared/security.py
+        # register_csp). Off sends the same policy as Report-Only, for a fork
+        # that still carries inline code; nothing collects reports, because the
+        # Reporting API needs a trustworthy origin and the LAN one is plain HTTP.
+        "csp_enforce": True,
+    },
+    # Delegate observability (spec 7185 §9): only sessions whose name starts
+    # with a prefix are watched, and nothing is written into a pane, so every
+    # switch ships on.
+    "delegates": {
+        "watch": "on",
+        "prefixes": ["del_"],
+        "alert_waiting": "on",
+        "alert_finished": "on",
+        "alert_dead": "on",
+        "alert_hold_sec": 8,
+        "finish_quiet_sec": 45,
+        "stall_sec": 300,
+        "tmux_channel": "on",
+        "tmux_bell": "off",
+        "nest_tabs": "on",
+    },
 }
 
 _settings = {}
 _settings_lock = threading.Lock()
-SETTINGS_FILE = Path(__file__).resolve().parent.parent / "settings.json"
+SETTINGS_FILE = CONFIG_DIR / "settings.json"
 
 # ---------------------------------------------------------------------------
 # Per-project settings — overrides global defaults on a per-project basis
 # ---------------------------------------------------------------------------
-PROJECT_SETTINGS_FILE = Path(__file__).resolve().parent.parent / "project_settings.json"
+PROJECT_SETTINGS_FILE = CONFIG_DIR / "project_settings.json"
 _project_settings = {}
 _project_settings_lock = threading.Lock()
 
@@ -219,6 +253,9 @@ SETTING_RANGES = {
     "access.open_max_minutes": (1, 1440),
     # Per-project (DEFAULT_PROJECT_SETTINGS); same clamp as the runtime delay.
     "autoyes.delay": (0.1, 30),
+    "delegates.alert_hold_sec": (3, 120),
+    "delegates.finish_quiet_sec": (15, 600),
+    "delegates.stall_sec": (60, 3600),
 }
 
 # Numeric settings whose integer default still admits a fraction.
@@ -228,6 +265,8 @@ _FRACTIONAL_SETTINGS = frozenset({"autoyes.default_delay", "autoyes.delay"})
 # it (shared/studio_client.py:web_base).
 _URL_SETTINGS = frozenset({"studio.web_base", "studio.api_base"})
 PURGE_IDLE_THRESHOLDS = (3600, 14400, 43200, 86400, 259200)
+# A delegate session prefix: letters, digits, `_` or `-`, ending in `_`.
+_DELEGATE_PREFIX_RE = re.compile(r"[A-Za-z0-9_-]+_")
 
 
 def _is_http_url(value):
@@ -279,7 +318,10 @@ def check_setting(path, value, default, enforce_range=True):
             return (value == "" or _is_http_url(value)), value
         return True, value
     if isinstance(default, list):
-        return isinstance(value, list) and all(isinstance(v, str) for v in value), value
+        ok = isinstance(value, list) and all(isinstance(v, str) for v in value)
+        if ok and path == "delegates.prefixes":
+            ok = all(_DELEGATE_PREFIX_RE.fullmatch(v) for v in value)
+        return ok, value
     return True, value
 
 
@@ -563,7 +605,6 @@ def get_project_setting(project, *keys):
 # ---------------------------------------------------------------------------
 # Paths (non-configurable)
 # ---------------------------------------------------------------------------
-DATA_DIR = Path(__file__).resolve().parent.parent  # assist/ directory
 HISTORY_FILE = DATA_DIR / "history.json"
 FAVORITES_FILE = DATA_DIR / "favorites.json"
 GLOBAL_SKILLS_DIR = Path(
@@ -651,9 +692,7 @@ def patch_container_config(patch):
 # Extensions — registered SDK/tool bundles for the container
 # ---------------------------------------------------------------------------
 EXTENSIONS_FILE = DATA_DIR / "extensions.json"
-BUILTIN_EXTENSIONS_DIR = (
-    Path(__file__).resolve().parent.parent / "docker" / "extensions"
-)
+BUILTIN_EXTENSIONS_DIR = APP_ROOT / "docker" / "extensions"
 _extensions = []
 _extensions_lock = threading.Lock()
 
@@ -754,6 +793,18 @@ autoyes_cancelled = {}
 # target -> consecutive scans with no prompt since a cancel; two release it.
 autoyes_cancel_quiet = {}
 autoyes_answered = {}  # target -> (prompt_hash, answered_at_timestamp)
+# target -> {"pane_id", "request_id", "status", "at", "failed_deliveries",
+# "probe_failing_since"}: what the scanner last did about the prompt on that
+# pane (reporting only; routes/autoyes.py:_set_disposition). The delegate
+# classifier reads Auto-Yes ownership from it and the countdowns, never from
+# how long a prompt has been visible.
+autoyes_disposition = {}
+# Delegate watcher (routes/delegates.py, spec 7185 §5.2-5.3): pane_id -> the
+# published classification, and the watcher's health block (None until its
+# first tick or while delegates.watch is off). Both under delegate_lock.
+delegate_states = {}
+delegate_watch = None
+delegate_lock = threading.Lock()
 autoyes_delays = {}  # session_name -> seconds (per-session override)
 AUTOYES_DELAY = DEFAULT_SETTINGS["autoyes"]["default_delay"]
 # Rebuilt by the auto-yes scanner each tick: session_name -> effective enabled.
@@ -898,7 +949,7 @@ if _mount_env:
     CLAUDE_MOUNT_SCRIPT = Path(_mount_env)
 else:
     # Auto-detect from repo docker/ directory
-    _default_mount = DATA_DIR / "docker" / "claude-mount.sh"
+    _default_mount = APP_ROOT / "docker" / "claude-mount.sh"
     CLAUDE_MOUNT_SCRIPT = _default_mount if _default_mount.exists() else None
 
 # Claude env vars to strip from tmux sessions

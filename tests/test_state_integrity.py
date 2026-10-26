@@ -25,6 +25,8 @@ from flask import Flask
 from routes import settings as settings_routes
 from routes.input import input_bp
 from shared import state, utils
+
+ROOT = Path(__file__).resolve().parent.parent
 from shared.tmux import DeliveryResult, ExpectedTargetIdentity
 
 
@@ -147,6 +149,70 @@ class SettingsPatchValidationTests(_TempState):
         )
         resp = self._project({"automate": {"stop_after": "18:30"}})
         self.assertEqual(resp.status_code, 200)
+
+
+class DelegateSettingsTests(_TempState):
+    """The delegates section (spec 7185 §9): types, the panel's ranges, prefixes."""
+
+    def setUp(self):
+        super().setUp()
+        state.load_settings()
+        app = Flask(__name__)
+        app.register_blueprint(settings_routes.settings_bp)
+        self.client = app.test_client()
+
+    def _patch(self, body):
+        return self.client.patch("/api/settings", json={"delegates": body})
+
+    def test_the_shipped_defaults(self):
+        self.assertEqual(state.DEFAULT_SETTINGS["delegates"], {
+            "watch": "on", "prefixes": ["del_"],
+            "alert_waiting": "on", "alert_finished": "on", "alert_dead": "on",
+            "alert_hold_sec": 8, "finish_quiet_sec": 45, "stall_sec": 300,
+            "tmux_channel": "on", "tmux_bell": "off", "nest_tabs": "on",
+        })
+
+    def test_bad_values_are_rejected(self):
+        cases = [
+            {"alert_hold_sec": 2}, {"alert_hold_sec": 121}, {"alert_hold_sec": "8"},
+            {"finish_quiet_sec": 14}, {"finish_quiet_sec": 601}, {"finish_quiet_sec": 45.5},
+            {"stall_sec": 59}, {"stall_sec": 3601},
+            {"watch": "maybe"}, {"watch": True}, {"tmux_bell": "yes"}, {"nest_tabs": 1},
+            {"prefixes": "del_"}, {"prefixes": ["del"]}, {"prefixes": ["bad prefix_"]},
+            {"prefixes": [5]}, {"prefixes": ["_"]},
+        ]
+        before = state.get_settings()
+        for body in cases:
+            with self.subTest(body=body):
+                resp = self._patch(body)
+                self.assertEqual(resp.status_code, 400, resp.get_json())
+                self.assertIn("delegates." + next(iter(body)), resp.get_json()["rejected"])
+        self.assertEqual(state.get_settings(), before)
+
+    def test_good_values_save(self):
+        cases = [
+            ({"alert_hold_sec": 3}, "alert_hold_sec", 3),
+            ({"alert_hold_sec": 120}, "alert_hold_sec", 120),
+            ({"finish_quiet_sec": 15}, "finish_quiet_sec", 15),
+            ({"stall_sec": 3600}, "stall_sec", 3600),
+            ({"watch": "off"}, "watch", "off"),
+            ({"prefixes": ["del_", "bench_", "Agent-2_"]}, "prefixes", ["del_", "bench_", "Agent-2_"]),
+            ({"prefixes": []}, "prefixes", []),
+        ]
+        for body, key, want in cases:
+            with self.subTest(body=body):
+                resp = self._patch(body)
+                self.assertEqual(resp.status_code, 200, resp.get_json())
+                self.assertEqual(state.get_setting("delegates", key), want)
+
+    def test_every_toggle_has_a_panel_row(self):
+        # gotcha 2023: an "on"/"off" setting needs a _SETTINGS_SECTIONS row too.
+        settings_js = (ROOT / "js" / "settings.js").read_text()
+        self.assertIn("key: 'delegates'", settings_js)
+        for key, value in state.DEFAULT_SETTINGS["delegates"].items():
+            if value in ("on", "off") or isinstance(value, int):
+                with self.subTest(key=key):
+                    self.assertIn(f"key: '{key}'", settings_js)
 
 
 class LoadFallbackTests(_TempState):

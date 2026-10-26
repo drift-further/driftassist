@@ -1,4 +1,5 @@
 """Execute the Bash installer with isolated state and a dependency-install fixture."""
+import json
 import os
 import shutil
 import stat
@@ -18,7 +19,7 @@ class InstallWorkflowTests(unittest.TestCase):
         self.home.mkdir()
         for name in ('install.sh', 'serve.py', 'pyproject.toml', 'requirements.lock', 'env.example',
                      'roster.example.toml', 'bin/assist', 'bin/statusline.sh', 'assist-ctl',
-                     'cli/__init__.py', 'shared/state.py', 'routes/__init__.py', 'index.html'):
+                     'cli/__init__.py', 'shared/state.py', 'shared/paths.py', 'routes/__init__.py', 'index.html'):
             destination = self.home / name; destination.parent.mkdir(exist_ok=True)
             shutil.copy2(ROOT / name, destination)
         pip = self.home / '.venv/bin/pip'; pip.parent.mkdir(parents=True)
@@ -28,7 +29,10 @@ class InstallWorkflowTests(unittest.TestCase):
         self.config = self.base / 'config/drift-assist'; self.config.mkdir(parents=True)
         self.bin = self.base / 'commands'; self.bin.mkdir()
         self.log = self.base / 'pip.log'
-        self.env = {**os.environ, 'HOME': str(self.user), 'XDG_CONFIG_HOME': str(self.config.parent),
+        inherited = {k: v for k, v in os.environ.items()
+                     if k not in ('ASSIST_CONFIG_DIR', 'ASSIST_DATA_DIR', 'ASSIST_STATE_DIR', 'ASSIST_AUTH_TOKEN_PATH')}
+        self.env = {**inherited, 'HOME': str(self.user), 'XDG_CONFIG_HOME': str(self.config.parent),
+                    'XDG_DATA_HOME': str(self.base / 'data'), 'XDG_STATE_HOME': str(self.base / 'state'),
                     'XDG_BIN_HOME': str(self.bin), 'ASSIST_TEST_PIP_LOG': str(self.log),
                     'ASSIST_INSTALL_SERVICE': '1', 'ASSIST_REPLACE_STATUSLINE': '1'}
 
@@ -69,8 +73,21 @@ class InstallWorkflowTests(unittest.TestCase):
         self.assertIn('--require-hashes', self.log.read_text())
 
     def test_fresh_install_creates_private_env(self):
+        # A fresh install is on the XDG layout: install.json names this
+        # checkout, and the env file lives in the config dir, not the checkout.
         result = self.run_install('--non-interactive', '--no-integrations')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        record = json.loads((self.config / 'install.json').read_text())
+        self.assertEqual(Path(record['checkout']).resolve(), self.home.resolve())
+        self.assertEqual(stat.S_IMODE((self.config / 'server.env').stat().st_mode), 0o600)
+        self.assertFalse((self.home / '.env').exists())
+        self.assertTrue((self.base / 'data/drift-assist-data').is_dir())
+
+    def test_existing_state_in_checkout_keeps_the_legacy_layout(self):
+        (self.home / 'auth_token').write_text('legacy-token\n')
+        result = self.run_install('--non-interactive', '--no-integrations')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((self.config / 'install.json').exists())
         self.assertEqual(stat.S_IMODE((self.home / '.env').stat().st_mode), 0o600)
 
     def test_foreign_command_needs_explicit_replacement_before_any_writes(self):

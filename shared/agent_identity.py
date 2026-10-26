@@ -1,6 +1,7 @@
 """Resolve the coding-agent identity of a tmux pane."""
 
 import ctypes
+import errno
 import logging
 import os
 import platform
@@ -10,6 +11,7 @@ import subprocess
 import threading
 import time
 from functools import lru_cache
+from typing import NamedTuple
 
 from shared import tab_state
 
@@ -49,6 +51,7 @@ _DIRECT_EXECUTABLE_KINDS = {
     "opencode": "opencode",
     "gemini": "gemini",
     "antigravity": "gemini",
+    "agy": "gemini",
 }
 _AGENT_PACKAGE_KINDS = {
     "@anthropic-ai/claude-code": "claude",
@@ -148,6 +151,39 @@ def _stat_fields(pid):
     return fields[0], int(fields[1]), fields[19]
 
 
+class _RootUnknown:
+    """A pane root that could not be read. It equals nothing, itself included,
+    so an unknown root can never prove two pane generations the same."""
+
+    def __eq__(self, other):
+        return False
+
+    def __hash__(self):
+        return id(self)
+
+    def __repr__(self):
+        return "ROOT_UNKNOWN"
+
+
+ROOT_UNKNOWN = _RootUnknown()
+
+
+def pane_root_start(pane_pid):
+    """The start identity of a pane's root process, read from /proc now: with
+    the pane id it tells a pane generation apart when a restarted tmux server
+    reuses `%N` (spec 7185 §4.1). One file read, no subprocess.
+
+    None only where there is no /proc (macOS): the pane id alone is then the
+    identity, as spec §5.1 has it. ROOT_UNKNOWN when /proc exists but the root
+    cannot be read: callers publish nothing under it."""
+    if _IS_MAC:
+        return None
+    try:
+        return _stat_fields(int(pane_pid))[2]
+    except (OSError, ValueError, IndexError, TypeError):
+        return ROOT_UNKNOWN
+
+
 def _proc_start_time(pid):
     try:
         if os.path.isdir("/proc"):
@@ -186,6 +222,9 @@ def _kind_from_node_entrypoint(token):
         for component in (token or "").lower().replace("\\", "/").split("/")
         if component
     )
+    # Match the script operand itself, never a directory or a later argument.
+    if components and components[-1] in ("agy", "agy.js"):
+        return "gemini"
     for marker, kind in _NODE_ENTRYPOINT_COMPONENTS.items():
         width = len(marker)
         if any(
@@ -243,8 +282,17 @@ def _kind_from_process(comm, argv):
     return None
 
 
-def _build_process_snapshot(now):
-    """Enumerate /proc once; pane roots share the resulting parent map."""
+def _errno_name(exc):
+    return errno.errorcode.get(getattr(exc, "errno", None) or 0, type(exc).__name__)
+
+
+def _build_process_snapshot(now, errors=None):
+    """Enumerate /proc once; pane roots share the resulting parent map.
+
+    With an `errors` list (observe_process_tree only), a `stat` that could not
+    be read is appended as (pid, path, errno name) instead of skipped silently;
+    a PID that exited between listdir and the read (ENOENT, ESRCH) is not an
+    error. Without it, behaviour is exactly the legacy one."""
     children = {}
     start_times = {}
     for entry in os.listdir("/proc"):
@@ -255,7 +303,12 @@ def _build_process_snapshot(now):
             _state, ppid, start_time = _stat_fields(pid)
             children.setdefault(ppid, []).append(pid)
             start_times[pid] = start_time
-        except (OSError, ValueError, IndexError):
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except (OSError, ValueError, IndexError) as exc:
+            if errors is not None:
+                name = _errno_name(exc) if isinstance(exc, OSError) else "malformed"
+                errors.append((int(entry), f"/proc/{entry}/stat", name))
             continue
     return {
         "created_at": now,
@@ -295,20 +348,27 @@ def child_pids(pid):
         return None
 
 
-def _snapshot_process_info(snapshot, pid):
+def _snapshot_process_info(snapshot, pid, errors=None):
+    """(comm, argv) for pid; ("", []) when either read fails. With an `errors`
+    list, the failed read is appended as (pid, path, errno name) — any failure,
+    ENOENT included, since the caller asks only about PIDs in a pane's tree."""
     cached = snapshot["process_info"].get(pid)
     if cached is not None:
         return cached
+    path = f"/proc/{pid}/comm"
     try:
-        with open(f"/proc/{pid}/comm", encoding="utf-8", errors="replace") as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             comm = f.read().strip()
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
+        path = f"/proc/{pid}/cmdline"
+        with open(path, "rb") as f:
             argv = [
                 part.decode("utf-8", errors="replace")
                 for part in f.read().split(b"\0")
                 if part
             ]
-    except OSError:
+    except OSError as exc:
+        if errors is not None:
+            errors.append((pid, path, _errno_name(exc)))
         comm = ""
         argv = []
     snapshot["process_info"][pid] = (comm, argv)
@@ -349,6 +409,109 @@ def _scan_snapshot_tree(snapshot, pane_pid):
         "has_wrapper": has_wrapper,
         "root_start_time": start_times.get(pane_pid) or _proc_start_time(pane_pid),
     }
+
+
+class ProcessObservation(NamedTuple):
+    """One process-tree read that says whether it can be trusted (spec 7185 §4.3)."""
+
+    complete: bool      # every read that could change the answer succeeded
+    errors: list        # [(pid | None, path, errno name)]
+    agent: dict | None  # {kind, pid, start}: the first agent in the tree
+    agents: list        # [{kind, pid, start, argv, cwd}]: every agent-kind process
+    wrapper: bool       # ssh, docker, ... somewhere in the tree
+    root_start: str | None
+
+
+def _recheck_start(pid, errors):
+    """(start, ok) for pid now. An exited pid (ENOENT, ESRCH) is (None, True):
+    a true reading. Any other failure is (None, False) and is appended to
+    `errors`: a denied read is no evidence that the process is gone."""
+    try:
+        return _stat_fields(pid)[2], True
+    except (FileNotFoundError, ProcessLookupError):
+        return None, True
+    except (OSError, ValueError, IndexError) as exc:
+        name = _errno_name(exc) if isinstance(exc, OSError) else "malformed"
+        errors.append((pid, f"/proc/{pid}/stat", name))
+        return None, False
+
+
+def observe_process_tree(pane_pid):
+    """Walk a pane's process tree from a fresh snapshot, reporting completeness.
+
+    Unlike the legacy helpers, a read that fails is not mistaken for "no
+    agent": `complete` is False when a stat outside ENOENT/ESRCH failed (it
+    hides that PID's parent), when a comm/cmdline read in the pane's subtree
+    failed, when the root is gone, or when its start time changed during the
+    walk. An agent whose start time no longer matches counts as gone. Without
+    /proc (macOS) nothing is complete. A cwd that cannot be read is recorded in
+    `errors` but leaves `complete` alone: it does not change which agent runs.
+    """
+    if _IS_MAC or not os.path.isdir("/proc"):
+        return ProcessObservation(False, [(None, "/proc", "unsupported")], None, [], False, None)
+    errors = []
+    try:
+        pane_pid = int(pane_pid)
+        snapshot = _build_process_snapshot(time.time(), errors=errors)
+    except (TypeError, ValueError):
+        return ProcessObservation(False, [(None, "pane_pid", "invalid")], None, [], False, None)
+    except OSError as exc:
+        return ProcessObservation(False, [(None, "/proc", _errno_name(exc))], None, [], False, None)
+    children = snapshot["children"]
+    start_times = snapshot["start_times"]
+    root_start = start_times.get(pane_pid)
+    complete = not errors
+    if root_start is None:
+        complete = False
+        if not any(pid == pane_pid for pid, _path, _name in errors):
+            errors.append((pane_pid, f"/proc/{pane_pid}/stat", "ENOENT"))
+
+    agents = []
+    has_wrapper = False
+    queue = [pane_pid] if root_start is not None else []
+    seen = set()
+    while queue:
+        pid = queue.pop(0)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        before = len(errors)
+        comm, argv = _snapshot_process_info(snapshot, pid, errors=errors)
+        if len(errors) > before:
+            complete = False
+        executable = os.path.basename(argv[0]) if argv else comm
+        if comm in _WRAPPER_COMMS or executable in _WRAPPER_COMMS:
+            has_wrapper = True
+        kind = _kind_from_process(comm, argv)
+        if kind is not None:
+            try:
+                cwd = os.readlink(f"/proc/{pid}/cwd")
+            except OSError as exc:
+                errors.append((pid, f"/proc/{pid}/cwd", _errno_name(exc)))
+                cwd = None
+            agents.append({"kind": kind, "pid": pid, "start": start_times.get(pid),
+                           "argv": argv, "cwd": cwd})
+        queue.extend(children.get(pid, []))
+
+    if root_start is not None:
+        start, ok = _recheck_start(pane_pid, errors)
+        if not ok:
+            complete = False
+        elif start != root_start:
+            complete = False
+            errors.append((pane_pid, f"/proc/{pane_pid}/stat", "changed"))
+    # PID reuse (a different start) and exit read as gone, never as the old
+    # agent; a recheck that could not be read leaves the answer unknown.
+    kept = []
+    for a in agents:
+        start, ok = _recheck_start(a["pid"], errors) if a["start"] else (None, True)
+        if not ok:
+            complete = False
+        elif start is not None and start == a["start"]:
+            kept.append(a)
+    agents = kept
+    agent = {k: agents[0][k] for k in ("kind", "pid", "start")} if agents else None
+    return ProcessObservation(complete, errors, agent, agents, has_wrapper, root_start)
 
 
 def _scan_process_tree(target, pane_pid, _force_snapshot=False):

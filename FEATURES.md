@@ -15,6 +15,27 @@ checking. `assist wait` waits for a pane to settle and says whether it is idle, 
 question or still working.
 Where: `assist ls`, `assist view`, `assist send`, `assist wait`.
 
+### Delegate state and recovery
+Delegate panes show distinct marks for working, waiting, finished and exited; a hollow
+mark means their observation is stale or unknown. Alerts appear in Assist, with system
+notifications where HTTPS and browser permission allow them. Prompts owned by Auto-Yes
+do not raise duplicate alerts. Each browser receives its own alerts.
+
+Open parents group their delegates behind a separate disclosure. The rail keeps up to
+three pane rows visible, folds finished work into an overflow sheet, and preserves
+terminal space on small screens. Orphans remain top-level with “parent not open”.
+Pins, snoozes and ordering keep their existing session and pane identities.
+Where: session tabs and Settings → Delegates.
+
+The same state is readable through tmux user options and `wait-for` signals, without
+writing into a delegate pane. `assist resume` prints a recovery command when its
+conversation can be identified; `view`, `wait` and `kill` include a resume hint when
+available. Claude recovery uses the matching process generation’s session file, including the new
+conversation after `/clear`. Unverified farewell commands are labelled, and unverifiable conversations
+are not guessed. `ASSIST_NO_HINTS=1` and JSON output suppress hints.
+Where: `assist resume <session> [--pane P] [--agent-only]`, `assist ls --json`, and
+`/api/delegates` for authenticated integrations.
+
 ### The `assist` CLI
 Every session control from a shell: list, view, send, wait, launch and kill sessions,
 and set Auto-Yes. `assist launch --role` starts a session from your roster of agent
@@ -166,9 +187,14 @@ Where: ◇ Studio.
 ## Access
 
 ### Sign-in
-One shared secret, generated on first start. The browser signs in once and keeps a
-cookie; scripts send the secret in a header.
+One shared secret, generated on first start. The browser signs in once and keeps its
+own cookie; scripts send the secret in a header.
 Where: `/login`; `assist token` prints where the secret is kept.
+
+### Devices
+Every signed-in browser is a device with its own cookie, named right after it signs in.
+Revoke one to sign out only that browser; scripts on the token are unaffected.
+Where: Settings → Access → Devices; `assist devices [list|rename|revoke|reset]`.
 
 ### Phone pairing
 `assist pair` prints the phone's URL and a QR code, and opens a short window where the

@@ -109,10 +109,19 @@ the host.*
 ### Other ways to sign in
 
 - **The token.** `assist token` prints where it is, and prints the value too
-  when run in a terminal. Paste it into the login page once; the browser keeps a
-  cookie from then on.
+  when run in a terminal. Paste it into the login page once; the browser keeps
+  its own cookie from then on.
 - **Approval.** A new browser can press *Request device approval* on the login
   page, and any signed-in session approves or denies it.
+
+### Lost a phone?
+
+Every signed-in browser is a separate device with its own cookie. Open
+**Settings → Access → Devices** on another signed-in browser (or run
+`assist devices` on the host) and revoke the lost one: only that browser is
+signed out, and scripts using the token are unaffected. `assist devices reset`
+signs every browser out at once. If the token itself may have leaked, delete
+`auth_token` and restart instead.
 
 ### Keep it running
 
@@ -188,6 +197,30 @@ assist update             # install the checked fast-forward update
 assist restart
 ```
 
+**Moving state out of the checkout.** An install from before the XDG layout
+keeps settings, the token and history in the checkout. To move them to
+`~/.config/drift-assist` and `~/.local/share/drift-assist-data`:
+
+```bash
+assist stop                 # or: systemctl --user stop / launchctl, if it runs as a service
+# stop any scripts that call assist (assist wait loops, cron jobs)
+assist migrate-state        # refuses while the server or an assist process is running
+assist start
+assist doctor               # Layout: xdg, migration: completed
+```
+
+It is a transaction: an interruption leaves either the old layout or the new
+one complete, and `assist migrate-state --resume` finishes it. `assist
+migrate-state --rollback` moves the current files back (changes made since are
+kept); it stops, naming the file, if a different copy is already in the
+checkout. Tmux panes are not touched. After the move, an older checkout or
+CLI cannot find the env file or token until you roll back.
+
+**Upgrading to per-device sign-in:** after this update every browser signs in
+again once. The old cookie was the same value on every browser, so it is no
+longer accepted. Pair each phone again (`assist pair`) or paste the token at
+`/login`; scripts on the token are not affected.
+
 `assist --version` prints the version, plus the commit in a git checkout. Put
 it in any bug report. Updates currently follow the checkout's configured remote
 tracking branch; releases are not tagged yet. Local edits, untracked files,
@@ -216,11 +249,15 @@ rm -rf ~/.config/drift-assist
 rm -rf ~/.config/claude-assist          # pre-rename config dir, if present
 rm -rf ~/.local/state/drift-assist      # PID file and logs
 rm -rf ~/.local/share/drift-assist      # or wherever you cloned
+rm -rf ~/.local/share/drift-assist-data # runtime state on the XDG layout
 ```
 
-The checkout also holds your prompt history (`history.json`), favorites and
-segments (`favorites.json`), `settings.json` and `auth_token`. Copy anything you
-want to keep before deleting it. An install from before the move to
+Your settings, `auth_token`, prompt history (`history.json`), favorites and
+segments (`favorites.json`) and the rest of the runtime state live where
+`assist config` says (Config dir, Data dir). A fresh install keeps them in
+`~/.config/drift-assist` and `~/.local/share/drift-assist-data`; an install from
+before that keeps them in the checkout until `assist migrate-state` moves them.
+Copy anything you want to keep before deleting it. An install from before the move to
 `~/.local/state` may also have left `/tmp/assist-server.{pid,log}`.
 
 If you approved status-line setup during installation, the installer may also
@@ -301,7 +338,33 @@ Session wait commands use these exit codes:
 
 ## Configuration
 
-All configuration is environment-variable based, via `.env` in the repo. See `env.example` for the full list. The most common ones:
+All configuration is environment-variable based, via the install's env file:
+`server.env` in the config dir on a fresh install, or `.env` in the checkout on an
+install from before the XDG move (`assist config` prints which). See
+`env.example` for the full list.
+
+**Where things live.** The checkout holds code only. Settings and secrets go in
+the config dir, mutable state in the data dir, PID, log and the migration marker
+in the state dir:
+
+| Root | Default | Override |
+|------|---------|----------|
+| config | `~/.config/drift-assist` (`$XDG_CONFIG_HOME`) | `ASSIST_CONFIG_DIR` |
+| data | `~/.local/share/drift-assist-data` (`$XDG_DATA_HOME`) | `ASSIST_DATA_DIR` |
+| state | `~/.local/state/drift-assist` (`$XDG_STATE_HOME`) | `ASSIST_STATE_DIR` |
+
+The data dir is `drift-assist-data`, not `drift-assist`, because that is where the
+checkout itself goes. A config or data dir that is, contains or sits inside the checkout
+is refused: `assist migrate-state` will not run and a fresh install stays on the legacy
+layout.
+
+`install.json` in the config dir names the one checkout those directories
+belong to; a second checkout of Assist on the same user refuses them
+(`layout_owned_by_other_checkout`) and needs its own `ASSIST_CONFIG_DIR` and
+`ASSIST_DATA_DIR`. An install whose checkout has a `.env` and no `install.json`
+keeps everything in the checkout, as before.
+
+The most common variables:
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
@@ -320,11 +383,11 @@ All configuration is environment-variable based, via `.env` in the repo. See `en
 | `ASSIST_BIND` | One extra LAN address to listen on, beside loopback. Written by `assist expose`; a wildcard such as `0.0.0.0` is refused | (loopback only) |
 | `ASSIST_PID_FILE` | Server PID file | `~/.local/state/drift-assist/assist.pid` (`$XDG_STATE_HOME`) |
 | `ASSIST_LOG_FILE` | Server log read by `assist logs`; moved to `.1` at start once over `ASSIST_LOG_MAX_BYTES` (10 MB) | `~/.local/state/drift-assist/assist.log` |
-| `ASSIST_AUTH_TOKEN_PATH` | Shared-secret file | `<assist-home>/auth_token` |
+| `ASSIST_AUTH_TOKEN_PATH` | Shared-secret file | `<config dir>/auth_token` |
 | `ASSIST_ALLOWED_ORIGINS` | Browser origins accepted by the CSRF check, comma-separated. **Required on any install reached from more than localhost** — `shared/security.py` ships loopback only, so list your hostname and the LAN address your phone uses or every POST from them 403s while GETs still work | (loopback only) |
 | `DISPLAY` | X11 display for clipboard helpers | `:0` |
 
-Changes to `.env` require `assist restart` to take effect.
+Changes to the env file require `assist restart` to take effect.
 
 ## Access and authentication
 
@@ -337,14 +400,14 @@ mechanism.
 
 Two things enforce it:
 
-**A shared secret gates every endpoint.** On first start the server generates one and writes it to `auth_token` in the install directory (mode `0600`, gitignored). A direct interactive start prints the token value and its file path; redirected startup output prints only the path, so the value is not copied into the server log. Open Assist, paste the token into the login page once, and the browser holds a cookie from then on — the raw token is never stored client-side, only an HMAC of it. Scripts send it in the **`X-Assist-Token` header** — the only accepted carrier for the raw secret. A `?token=` query parameter is *not* accepted: a credential in a URL ends up in proxy access logs, browser history and outbound `Referer` headers, and it would only ever have authenticated the HTML document and none of its stylesheets or scripts.
+**A shared secret gates every endpoint.** On first start the server generates one and writes it to `auth_token` in the install directory (mode `0600`, gitignored). A direct interactive start prints the token value and its file path; redirected startup output prints only the path, so the value is not copied into the server log. Open Assist, paste the token into the login page once, and the browser holds its own device cookie from then on — the raw token is never stored client-side. Scripts send it in the **`X-Assist-Token` header** — the only accepted carrier for the raw secret. A `?token=` query parameter is *not* accepted: a credential in a URL ends up in proxy access logs, browser history and outbound `Referer` headers, and it would only ever have authenticated the HTML document and none of its stylesheets or scripts.
 
 ```
 $ cat auth_token
 BduKDRwh…
 ```
 
-To rotate: delete `auth_token` and restart. A new secret is generated and every issued cookie stops matching, because the HMAC key changed.
+To sign out one browser, revoke its device (Settings → Access → Devices, or `assist devices revoke <id>`). To rotate the token: delete `auth_token` and restart. A new secret is generated and every issued cookie stops matching, because the HMAC key changed. See `SECURITY.md` → Devices and revocation.
 
 **Adding a device without typing the token.** A browser that arrives with no token can ask to be let in: it raises an approval request that any already-logged-in session sees and approves or denies. The request path is the one thing not behind the auth gate — a device with no token is exactly who calls it — so it is fenced instead by a LAN allowlist, a cap on pending requests, a per-IP cooldown, and a secret claim that binds an approval to the browser that asked. To onboard the first device, `assist pair` on the host (or **More → Access → Open** in a signed-in browser) starts a time-boxed open-access window, and the strip across the top of the UI stays lit until it closes.
 

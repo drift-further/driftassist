@@ -46,7 +46,8 @@ class ShippedDefaultTests(unittest.TestCase):
 
     def test_settings_json_is_gitignored(self):
         """A clone must not be able to inherit someone else's hot posture."""
-        ignored = (state.SETTINGS_FILE.parent / ".gitignore").read_text()
+        # On the legacy layout settings live in the checkout, so it must ignore them.
+        ignored = (state.APP_ROOT / ".gitignore").read_text()
         self.assertIn("settings.json", ignored)
         self.assertIn("project_settings.json", ignored)
 

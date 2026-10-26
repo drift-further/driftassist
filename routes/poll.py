@@ -1,10 +1,8 @@
 """routes/poll.py — Consolidated polling, health check, CLI proxy."""
 
-import hashlib
 import json as json_mod
 import os
 import re
-import secrets
 import shutil
 import subprocess
 import threading
@@ -19,14 +17,20 @@ from shared import execution_park as park
 import shared.state as state
 import shared.tab_state as tab_state
 from shared.agent_identity import (
+    ROOT_UNKNOWN,
     _ANSI_ESCAPE_RE,
-    _CODEX_FINGERPRINT_RE,
     _VERSION_CMD_RE,
     child_pids,
+    pane_root_start,
     refine_with_content,
     resolve_process,
 )
 from shared.agent_model import observe as observe_model
+from shared import pane_scan
+# Re-exported: tests/test_poll_perf.py and tests/test_autoyes_parity.py patch and
+# read the cache through this module. /poll passes its own binding to
+# pane_scan.sample(), so a patched dict here is the one every write lands in.
+from shared.pane_scan import _SCAN_CACHE, _SCAN_LOCK, _activity_tail
 from shared.tmux import capture_reusable, prettify_command, sudo_prompt_waiting, tmux_exact_target
 from routes.autoyes import (
     autoyes_will_consider,
@@ -35,6 +39,8 @@ from routes.autoyes import (
     detection_window_lines,
     prompt_popup_info,
 )
+from routes.delegates import snapshot as delegate_snapshot, resume_for_pane
+from shared.delegate_parent import enrich_parents
 from routes.terminal import enrich_panes_with_agents
 
 poll_bp = Blueprint("poll_bp", __name__)
@@ -47,76 +53,54 @@ CLI_PROXY_TIMEOUT_CEILING = 600
 # A pane whose change marker has not moved reuses its last capture, but never
 # one older than this (shared/tmux.py:capture_reusable).
 SCAN_RECAPTURE_SEC = 30
+_DELEGATE_WIRE = ("state", "reason", "detail", "since", "episode", "health", "observed_at", "alert")
 # Idle state is written when a pane's content changed, else at most this often.
 IDLE_SAVE_INTERVAL_SEC = 30
 # Git branch and status counts are reused for this long per project dir,
 # unless .git/index or .git/HEAD moves first.
 GIT_META_TTL_SEC = 10
 
-# target -> {"raw", "tail", "rev", "prev"}: the last capture of each pane. `rev`
-# rises whenever a pane's browser tail changes, and a browser that echoes the
-# `gen` it last applied as ?since= gets only tails newer than that. The epoch
-# makes a `since` from before a restart read as "has nothing".
-_SCAN_CACHE = {}
-_SCAN_LOCK = threading.Lock()
-_SCAN_EPOCH = secrets.token_hex(4)
-_scan_rev = 0
 _last_idle_save = 0.0
 
 _GIT_META_CACHE = {}
 _GIT_META_LOCK = threading.Lock()
 
 
-_CODEX_QUOTA_RE = re.compile(
-    r"\b(?!Context\b)((?:[a-z][a-z0-9_-]*|\d+h)\s+)\d+(%\s+left\b)",
-    re.IGNORECASE,
-)
+def _capture_tail(target, pane_id=None, pane_pid=None):
+    """capture-pane for pane_scan.sample(); None when tmux refuses.
 
-
-def _activity_tail(tail, agent_kind):
-    """Ignore account quota redraws only in Codex's bottom status bar."""
-    if agent_kind != "codex":
-        return tail
-    lines = tail.split("\n")
-    footer = [i for i, line in enumerate(lines) if _ANSI_ESCAPE_RE.sub("", line).strip()][-5:]
-    in_status = False
-    for i in footer:
-        plain = _ANSI_ESCAPE_RE.sub("", lines[i])
-        if _CODEX_FINGERPRINT_RE.search(plain):
-            in_status = True
-        elif not in_status or _CODEX_QUOTA_RE.sub("", plain).strip(" ·|\t"):
-            # Only quota-only wrapped continuation rows belong to that footer.
-            in_status = False
-        if in_status:
-            lines[i] = _CODEX_QUOTA_RE.sub(r"\1*\2", plain)
-    return "\n".join(lines)
-
-
-def _parse_since(value):
-    """The rev a browser already holds, or None when it holds nothing we issued."""
-    epoch, _, rev = (value or "").partition(".")
-    if epoch != _SCAN_EPOCH or not rev.isdigit():
+    The listed pane is captured by its id (`%N`), so the bytes come from the
+    pane the listing named wherever it sits now: a name reused, or swapped
+    away and back, cannot hand over another pane's text. A `%N` is unique only
+    within one tmux server's life, so the id is then read back and must still
+    name the listed pane pid; a vanished id, another pid or no answer fails
+    closed. Only a caller with no listed pane id falls back to the exact name."""
+    cap = subprocess.run(
+        ["tmux", "capture-pane", "-e", "-p", "-t", tmux_exact_target(pane_id or target),
+         "-S", f"-{detection_window_lines()}"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if cap.returncode != 0:
         return None
-    return int(rev)
+    if pane_id is None:
+        return cap.stdout
+    check = subprocess.run(
+        ["tmux", "display-message", "-p", "-t", tmux_exact_target(pane_id), "#{pane_pid}"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if not pane_pid or check.returncode != 0 or check.stdout.strip() != str(pane_pid):
+        return None
+    return cap.stdout
 
 
 def _store_scan_capture(target, raw, prev):
-    """Cache a fresh capture; bump the rev only if the browser tail changed."""
-    global _scan_rev
-    tail = detection_window(raw)
-    with _SCAN_LOCK:
-        entry = _SCAN_CACHE.get(target)
-        # Two browsers poll concurrently: an older capture landing second must
-        # not replace a newer one.
-        if entry and entry["prev"][1] > prev[1]:
-            return entry["raw"]
-        if entry is None or entry["tail"] != tail:
-            _scan_rev += 1
-            rev = _scan_rev
-        else:
-            rev = entry["rev"]
-        _SCAN_CACHE[target] = {"raw": raw, "tail": tail, "rev": rev, "prev": prev}
-    return raw
+    """Publish a capture taken by the caller; the rev rises only if the browser tail changed."""
+    return pane_scan.store_capture(target, raw, prev, cache=_SCAN_CACHE)
+
 
 def _find_project_dir(cwd):
     """Find the nearest project root for a tmux pane cwd."""
@@ -370,7 +354,7 @@ def consolidated_poll():
             "#{pane_current_command}\t#{pane_width}\t#{pane_height}\t"
             "#{session_activity}\t#{pane_pid}\t#{pane_id}\t#{session_created}\t"
             "#{pane_tty}\t#{window_activity}\t#{history_size}\t#{cursor_x}\t"
-            "#{cursor_y}\t#{alternate_on}",
+            "#{cursor_y}\t#{alternate_on}\t#{@assist_parent}\t#{pane_dead}",
         ],
         capture_output=True,
         text=True,
@@ -410,6 +394,8 @@ def consolidated_poll():
                         "target": target,
                         "session": parts[0],
                         "created": created,
+                        "_assist_parent": parts[16] if len(parts) > 16 else "",
+                        "pane_dead": parts[17] if len(parts) > 17 else "0",
                         "window": int(parts[1]),
                         "pane": int(parts[2]),
                         "command": parts[3],
@@ -442,35 +428,35 @@ def consolidated_poll():
     sudo_prompts = []
     autoyes_by_session = {}
     live_targets = set()
+    changed_at = {}
+    resume_tails = {}
     idle_changed = False
     for pane in panes:
         target = pane["target"]
         live_targets.add(target)
-        # A pane that has not changed since its last capture reuses it: a
-        # capture-pane per pane per browser per poll was most of /poll's cost.
-        with _SCAN_LOCK:
-            cached = _SCAN_CACHE.get(target)
-        if cached and capture_reusable(
-            cached["prev"], pane_markers.get(target), now, SCAN_RECAPTURE_SEC
-        ):
-            captured = True
-            tail = cached["raw"]
-        else:
-            captured_at = time.time()
-            cap = subprocess.run(
-                ["tmux", "capture-pane", "-e", "-p", "-t", tmux_exact_target(target), "-S", f"-{detection_window_lines()}"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            captured = cap.returncode == 0
-            if captured:
-                tail = _store_scan_capture(
-                    target,
-                    cap.stdout.rstrip("\n"),
-                    (pane_markers.get(target), captured_at),
-                )
-        if captured:
+        # One sample per pane through shared/pane_scan.py: a pane that has not
+        # changed since its last capture reuses it (a capture-pane per pane per
+        # browser per poll was most of /poll's cost); two browsers capturing at
+        # once share one; and the capture's activity hash is published with it.
+        process_kind = process_kinds.get(target)
+        root = pane_root_start(pane.get("pane_pid"))
+        sampled = pane_scan.sample(
+            target, pane.get("pane_id"), pane_markers.get(target), now, SCAN_RECAPTURE_SEC,
+            capture=lambda t, _id=pane.get("pane_id"), _pid=pane.get("pane_pid"): _capture_tail(t, _id, _pid),
+            kind_of=lambda tail, _k=process_kind: refine_with_content(_k, tail),
+            cache=_SCAN_CACHE,
+            reusable=capture_reusable,
+            root=root,
+        )
+        resume_tails[target] = sampled.tail if sampled else ""
+        if sampled is None and root is ROOT_UNKNOWN:
+            # No identity for this pane now: uncertain, so active rather than
+            # idle on a time that may belong to another pane generation.
+            changed_at[target] = now
+        if sampled is not None:
+            tail = sampled.raw
+            changed_at[target] = sampled.changed_at
+            idle_changed = idle_changed or sampled.changed
             agent_kind = refine_with_content(process_kinds.get(target), tail)
             pane["agent_kind"] = agent_kind
             # One regex pass over <=5 lines of a capture already taken. The
@@ -489,16 +475,6 @@ def consolidated_poll():
             pane["model_effort"] = model_effort
             pane["model_changed_at"] = model_changed_at
             if tail:
-                content_hash = hashlib.md5(_activity_tail(tail, agent_kind).encode()).hexdigest()
-                with state._activity_lock:
-                    prev_hash = state.pane_content_hash.get(target)
-                    if prev_hash is None:
-                        # First time seeing this pane — treat as just active
-                        state.pane_last_activity.setdefault(target, now)
-                    elif content_hash != prev_hash:
-                        state.pane_last_activity[target] = now
-                    idle_changed = idle_changed or content_hash != prev_hash
-                    state.pane_content_hash[target] = content_hash
                 # Every open browser pops these (js/prompt-popup.js), whichever
                 # tab is in view.
                 waiting = sudo_prompt_waiting(pane_ttys.get(target), tail)
@@ -527,14 +503,14 @@ def consolidated_poll():
                 )
     # Tails go out as the cache holds them, read in one pass with the rev they
     # are stamped against, and only those newer than what this browser holds.
-    since = _parse_since(request.args.get("since"))
+    since = pane_scan.parse_since(request.args.get("since"))
     with _SCAN_LOCK:
         for entry in scan_results:
             cached = _SCAN_CACHE.get(entry["target"])
             if cached and (since is None or cached["rev"] > since):
                 entry["tail"] = cached["tail"]
                 entry["tail_rev"] = cached["rev"]
-        result["gen"] = f"{_SCAN_EPOCH}.{_scan_rev}"
+        result["gen"] = f"{pane_scan._SCAN_EPOCH}.{pane_scan._scan_rev}"
     result["scan"] = scan_results
     result["sudo_prompts"] = sudo_prompts
     # js/actions.js windows the pane with this, so the action bar and Auto-Yes
@@ -543,20 +519,14 @@ def consolidated_poll():
     # The rows of each tail that detection reads, for js/poll-sync.js:detectionTail.
     result["detection_window"] = detection_window_lines()
 
-    # Clean up stale targets no longer in tmux
+    # Clean up stale targets no longer in tmux — only after a complete listing;
+    # a failed list-panes must not read as "every pane vanished".
     if proc.returncode == 0:
         tab_state.sweep_agent_declarations(live_targets)
         with state._activity_lock:
             for stale in set(state.pane_model) - live_targets:
                 state.pane_model.pop(stale, None)
-        with _SCAN_LOCK:
-            for stale in set(_SCAN_CACHE) - live_targets:
-                _SCAN_CACHE.pop(stale, None)
-    with state._activity_lock:
-        for stale in set(state.pane_content_hash) - live_targets:
-            state.pane_content_hash.pop(stale, None)
-            state.pane_last_activity.pop(stale, None)
-            idle_changed = True
+    idle_changed |= pane_scan.forget_missing(live_targets, proc.returncode == 0, cache=_SCAN_CACHE)
 
     # Persist idle state when it changed, else now and then. An fsync'd write
     # on every poll from every browser was pure cost on a quiet host.
@@ -587,8 +557,11 @@ def consolidated_poll():
         command = pane["command"]
         pane_pid = pane.get("pane_pid", "")
 
-        with state._activity_lock:
-            last_active = state.pane_last_activity.get(target, now)
+        last_active = changed_at.get(target)
+        if last_active is None:
+            # No sample this poll (capture failed): the last published time.
+            with state._activity_lock:
+                last_active = state.pane_last_activity.get(target, now)
         idle_seconds = now - last_active
 
         idle_thresh = state.get_setting("terminal", "idle_threshold_sec")
@@ -630,6 +603,30 @@ def consolidated_poll():
     # Backfill idle_seconds onto pane objects for frontend use
     for pane in panes:
         pane["idle_seconds"] = states.get(pane["target"], {}).get("idle_seconds", 0)
+
+    # Delegate observability (spec 7185 §6.1): the watcher's classification on
+    # each delegate pane, and its health block. /poll.states is not touched.
+    watched = delegate_snapshot()
+    result["watch"] = watched["watch"]
+    by_pane = {entry["pane_id"]: entry for entry in watched["panes"]}
+    for pane in panes:
+        entry = by_pane.get(pane.get("pane_id"))
+        if entry:
+            pane["delegate"] = {key: entry[key] for key in _DELEGATE_WIRE}
+            pane["resume"], pane["resume_reason"] = entry.get("resume"), entry.get("resume_reason")
+        else:
+            # Reuse the resolved kind: only supported agent panes need the
+            # ownership observation; shells and unsupported agents stay cheap.
+            kind = process_kinds.get(pane["target"])
+            if kind in ("codex", "claude"):
+                pane["resume"], pane["resume_reason"] = resume_for_pane(
+                    pane, tail=resume_tails.get(pane["target"], ""))
+            else:
+                pane["resume"] = None
+                pane["resume_reason"] = (
+                    "unsupported" if kind in ("cursor", "opencode", "gemini") else "no agent")
+
+    enrich_parents(panes, tuple(state.get_settings()["delegates"]["prefixes"]))
 
     # --- Tab order / pin / snooze ---
     # Runs after the states block so the wake sweep sees fresh activity times.
@@ -689,6 +686,13 @@ def consolidated_poll():
     # de-duplicates on its id. Reads must not consume it — a poll that dies in
     # flight would take the operator's only warning with it.
     result["access"] = auth.window_state()
+    # Which device this browser is, for the name step and the Devices sheet.
+    # Header-token requests (scripts, the CLI) are not devices: null.
+    device = auth.request_device(request)
+    result["device"] = (
+        {"id": device["id"], "name": device["name"], "named": bool(device.get("named"))}
+        if device else None
+    )
 
     # Raw UTF-8, not jsonify's \uXXXX escapes: agent panes are full of box
     # drawing and bullets, which the escapes turned into six bytes each.

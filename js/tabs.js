@@ -25,7 +25,7 @@ function _followRenamedSession(oldSession, newSession) {
 // textContent is no longer the label. Everything that wants the label goes here.
 function _tabLabelText(tab) {
     const c = tab.cloneNode(true);
-    c.querySelectorAll('.tab-badge, .tab-idle-time, .tab-dot, .tab-model').forEach(n => n.remove());
+    c.querySelectorAll('.tab-badge, .tab-idle-time, .tab-dot, .tab-model, .delegate-mark, .delegate-target, .delegate-orphan-label, .delegate-age, .delegate-focus, .delegate-reason').forEach(n => n.remove());
     return c.textContent.trim();
 }
 
@@ -260,6 +260,7 @@ function _saveSnooze(target, on) {
 // Session order as the strip currently shows it — the basis for both reorder
 // gestures, since order is per session, not per pane.
 function _sessionOrderFromDom() {
+    if (typeof _delegateNavigation !== 'undefined' && _delegateNavigation.length) return navigationSessionOrder(_delegateNavigation);
     const container = document.getElementById('session-tabs');
     if (!container) return _tabState.order.slice();
     const seen = new Set();
@@ -420,6 +421,18 @@ function _createContextMenu(tab, x, y) {
         };
     }
 
+    let splitBtn = null;
+    if (typeof SplitView !== 'undefined') {
+        splitBtn = document.createElement('button');
+        splitBtn.className = 'tab-ctx-item';
+        splitBtn.textContent = 'Split view';
+        splitBtn.onclick = function(e) {
+            e.stopPropagation();
+            _removeContextMenu();
+            SplitView.openWith(target);
+        };
+    }
+
     const snoozeBtn = document.createElement('button');
     snoozeBtn.className = 'tab-ctx-item tab-ctx-snooze';
     snoozeBtn.textContent = isSnoozed ? 'Unsnooze' : 'Snooze';
@@ -435,6 +448,7 @@ function _createContextMenu(tab, x, y) {
     menu.appendChild(reorderBtn);
     menu.appendChild(sortBtn);
     if (fitBtn) menu.appendChild(fitBtn);
+    if (splitBtn) menu.appendChild(splitBtn);
     menu.appendChild(dupeBtn);
     menu.appendChild(snoozeBtn);
     menu.appendChild(killBtn);
@@ -471,19 +485,21 @@ function _removeContextMenu() {
 // --- Long-press detection ---
 
 function _initTabLongPress() {
-    const container = document.getElementById('session-tabs');
+    const container = document;
     if (!container) return;
 
     container.addEventListener('touchstart', function(e) {
-        const tab = e.target.closest('.session-tab');
+        const tab = e.target.closest('.session-tab, .delegate-disclosure');
         if (!tab) return;
-        _tabContextTarget = tab;
+        const chip = tab.classList.contains('delegate-disclosure');
+        if (!chip) _tabContextTarget = tab;
         const touch = e.touches[0];
         _tabLongPressTimer = setTimeout(function() {
             _tabLongPressTimer = null;
             // Offset the menu below the touch point so the synthesized click
             // on release doesn't land on the first menu item ("Pin").
-            _createContextMenu(tab, touch.clientX, touch.clientY + 12);
+            if (chip) _createDelegateChipMenu(tab, touch.clientX, touch.clientY + 12);
+            else _createContextMenu(tab, touch.clientX, touch.clientY + 12);
             // Mark so touchend swallows the synthesized click
             tab._longPressTriggered = true;
         }, _TAB_LONG_PRESS_MS);
@@ -504,7 +520,7 @@ function _initTabLongPress() {
         // Consume the long-press flag: swallow the click the browser
         // synthesizes right after this touchend so it can't hit the menu
         // or re-select the tab.
-        const tab = e.target.closest('.session-tab');
+        const tab = e.target.closest('.session-tab, .delegate-disclosure');
         if (tab && tab._longPressTriggered) {
             tab._longPressTriggered = false;
             const swallow = function(ev) {
@@ -521,6 +537,12 @@ function _initTabLongPress() {
 
     // Desktop: right-click context menu
     container.addEventListener('contextmenu', function(e) {
+        const chip = e.target.closest('.delegate-disclosure');
+        if (chip) {
+            e.preventDefault();
+            _createDelegateChipMenu(chip, e.clientX, e.clientY);
+            return;
+        }
         const tab = e.target.closest('.session-tab');
         if (!tab) return;
         e.preventDefault();
@@ -594,14 +616,19 @@ function _initTabDragReorder() {
             if (!container.contains(tab)) return;
             // A drag nudges the whole SESSION one slot, not one pane: order is
             // per session, and the server keeps a session's panes contiguous.
-            const sessions = _sessionOrderFromDom();
+            const sessions = typeof _delegateNavigation !== 'undefined' && _delegateNavigation.length
+                ? _delegateNavigation.map(u => u.session) : _sessionOrderFromDom();
             const idx = sessions.indexOf(_sessionOf(tab.dataset.target));
             if (idx === -1) return;
             const direction = _dragOffsetX > 0 ? 1 : -1;
             const newIdx = Math.max(0, Math.min(sessions.length - 1, idx + direction));
             if (newIdx !== idx) {
-                sessions.splice(newIdx, 0, sessions.splice(idx, 1)[0]);
-                _saveLists({order: sessions});
+                if (typeof _delegateNavigation !== 'undefined' && _delegateNavigation.length) {
+                    _saveLists({order: reorderDelegateNavigation(_delegateNavigation, sessions[idx], sessions[newIdx], direction > 0)});
+                } else {
+                    sessions.splice(newIdx, 0, sessions.splice(idx, 1)[0]);
+                    _saveLists({order: sessions});
+                }
             }
         }
     }, {passive: true});
@@ -653,7 +680,7 @@ function _initTabDesktopDrag() {
         if (!tab || _sessionOf(tab.dataset.target) === _dndSession) return;
         // Drop before or after, depending on which half the cursor is over.
         const box = tab.getBoundingClientRect();
-        tab.classList.add(e.clientX < box.left + box.width / 2 ? 'dnd-before' : 'dnd-after');
+        (tab.closest('.navigation-unit') || tab).classList.add(e.clientX < box.left + box.width / 2 ? 'dnd-before' : 'dnd-after');
     });
 
     container.addEventListener('drop', function(e) {
@@ -663,9 +690,14 @@ function _initTabDesktopDrag() {
         const source = _dndSession;
         _endDesktopDrag();
         if (!marked) return;
-        const anchor = _sessionOf(marked.dataset.target);
+        const anchor = marked.dataset.session || _sessionOf(marked.dataset.target);
         if (anchor === source) return;
         const after = marked.classList.contains('dnd-after');
+        if (typeof _delegateNavigation !== 'undefined' && _delegateNavigation.length) {
+            _saveLists({order: reorderDelegateNavigation(_delegateNavigation, source, anchor, after)});
+            showFlash('sent', 'Tab moved');
+            return;
+        }
         const sessions = _sessionOrderFromDom().filter(s => s !== source);
         let at = sessions.indexOf(anchor);
         if (at === -1) return;
@@ -706,7 +738,16 @@ function _enterReorderMode(tab) {
     _reorderModeTab = tab;
     tab.classList.add('reorder-source');
 
-    const container = document.getElementById('session-tabs');
+    let container = document.getElementById('session-tabs');
+    let childContainer = null;
+    const unit = typeof _delegateUnit === 'function' ? _delegateUnit(tab.dataset.target) : null;
+    if (unit && unit.session !== _sessionOf(tab.dataset.target)) {
+        childContainer = document.createElement('div');
+        childContainer.className = 'delegate-sheet';
+        for (const p of unit.children) childContainer.appendChild(_delegateTabElements.get(p.target));
+        document.body.appendChild(childContainer);
+        container = childContainer;
+    }
     if (!container) return;
 
     // Build drop zones between each tab
@@ -718,7 +759,8 @@ function _enterReorderMode(tab) {
     banner.innerHTML = 'Tap a slot to place <b>' + escHtml(_tabLabelText(tab)) +
         '</b> &mdash; <span class="reorder-cancel">cancel</span>';
     banner.querySelector('.reorder-cancel').onclick = () => _exitReorderMode();
-    container.parentElement.insertBefore(banner, container);
+    if (childContainer) childContainer.prepend(banner);
+    else container.parentElement.insertBefore(banner, container);
 
     // ESC to cancel (desktop)
     const onKey = (e) => { if (e.key === 'Escape') _exitReorderMode(); };
@@ -732,6 +774,7 @@ function _enterReorderMode(tab) {
         container.querySelectorAll('.reorder-drop-zone').forEach(z => z.remove());
         _reorderModeTab = null;
         _reorderCleanup = null;
+        if (childContainer) { childContainer.remove(); refreshDelegateRail(); }
     };
 }
 
@@ -744,7 +787,7 @@ function _buildDropZones(container, sourceTab) {
     container.querySelectorAll('.reorder-drop-zone').forEach(z => z.remove());
 
     // Insert a drop zone before each tab and after the last one
-    const allTabs = Array.from(container.querySelectorAll(':scope > .session-tab'));
+    const allTabs = Array.from(container.querySelectorAll(':scope > .navigation-unit, :scope > .session-tab'));
 
     for (let i = 0; i <= allTabs.length; i++) {
         const zone = document.createElement('div');
@@ -752,7 +795,7 @@ function _buildDropZones(container, sourceTab) {
         zone.dataset.insertIndex = i;
 
         // Don't show zones immediately adjacent to the source tab (no-op positions)
-        const sourceIdx = allTabs.indexOf(sourceTab);
+        const sourceIdx = allTabs.indexOf(sourceTab.closest('.navigation-unit') || sourceTab);
         if (i === sourceIdx || i === sourceIdx + 1) {
             zone.classList.add('reorder-zone-hidden');
         }
@@ -781,9 +824,15 @@ function _placeTabAtIndex(container, sourceTab, insertIdx, tabsAtTimeOfBuild) {
     // index i". Resolve that to a SESSION, since order is per session.
     const sourceSession = _sessionOf(sourceTab.dataset.target);
     const before = insertIdx < tabsAtTimeOfBuild.length
-        ? _sessionOf(tabsAtTimeOfBuild[insertIdx].dataset.target)
+        ? (tabsAtTimeOfBuild[insertIdx].dataset.session || _sessionOf(tabsAtTimeOfBuild[insertIdx].dataset.target))
         : null;
 
+    if (typeof _delegateNavigation !== 'undefined' && _delegateNavigation.length) {
+        _saveLists({order: reorderDelegateNavigation(_delegateNavigation, sourceSession, before)});
+        _exitReorderMode();
+        showFlash('sent', 'Tab moved');
+        return;
+    }
     const sessions = _sessionOrderFromDom().filter(s => s !== sourceSession);
     let at = (before && before !== sourceSession) ? sessions.indexOf(before) : -1;
     if (at === -1) at = sessions.length;  // dropped past the end, or onto itself
@@ -808,7 +857,7 @@ function _applyPinMarkers() {
 
     let hadPinned = false;
     for (const tab of tabs) {
-        const isPinned = _isPinned(tab.dataset.target);
+        const isPinned = (typeof _delegateUnit === 'function' && _delegateUnit(tab.dataset.target)?.pinned) || _isPinned(tab.dataset.target);
         tab.classList.toggle('pinned', isPinned);
         if (isPinned) hadPinned = true;
         // Desktop drag-to-reorder. Set here rather than in the two renderers so
@@ -819,13 +868,13 @@ function _applyPinMarkers() {
     // Add/remove pin divider
     let divider = container.querySelector('.pin-divider');
     if (hadPinned) {
-        const firstUnpinned = tabs.find(t => !_isPinned(t.dataset.target));
+        const firstUnpinned = tabs.find(t => !t.classList.contains('pinned'));
         if (firstUnpinned) {
             if (!divider) {
                 divider = document.createElement('span');
                 divider.className = 'pin-divider';
             }
-            container.insertBefore(divider, firstUnpinned);
+            container.insertBefore(divider, firstUnpinned.closest('.navigation-unit') || firstUnpinned);
         }
     } else if (divider) {
         divider.remove();
@@ -864,7 +913,8 @@ function _applyStaleGroup() {
     // Team-lead grouping: if a team-lead is stale and any agent child is
     // running, the lead and ALL its children stay in the strip.
     const threshold = _getStaleThreshold();
-    const allTabs = Array.from(container.querySelectorAll('.session-tab'));
+    const allTabs = typeof _allNavigationTabs === 'function' && _delegateNavigation.length
+        ? _allNavigationTabs() : Array.from(container.querySelectorAll('.session-tab'));
     if (allTabs.length === 0) {
         // No sessions at all — nothing to list and nothing to open.
         sheetBody.innerHTML = '';
@@ -890,6 +940,8 @@ function _applyStaleGroup() {
 
     const staleTabs = allTabs.filter(t => {
         const target = t.dataset.target;
+        const unit = typeof _delegateUnit === 'function' ? _delegateUnit(target) : null;
+        if (unit?.pinned || (unit && delegateGroupNeedsAttention(unit))) return false;
         if (_isPinned(target)) return false;
         // Manual snooze forces the tab into ZZ even when it's the active or a
         // running tab — snoozing the tab you're looking at is the main use
@@ -908,7 +960,7 @@ function _applyStaleGroup() {
         // — the tab you most need to see is the one that ages into ZZ fastest.
         // Explicit snooze above still wins; this only covers the automatic
         // idle-threshold sweep.
-        if (t.classList.contains('has-prompt')) return false;
+        if (t.classList.contains('has-prompt') || t.querySelector('.delegate-waiting, .delegate-working')) return false;
         const idle = parseInt(t.dataset.idleSeconds || '0', 10);
         if (idle < threshold) return false;
         // Team-lead/agent unit: if the session has any running child, keep
@@ -925,6 +977,11 @@ function _applyStaleGroup() {
     // rebuilds the sheet, causing stale rows to flicker out.
     const staleSet = new Set(staleTabs);
     allTabs.forEach(t => t.classList.toggle('stale-tucked', staleSet.has(t)));
+    container.querySelectorAll('.navigation-unit').forEach(wrap => {
+        const unit = _delegateNavigation.find(u => u.session === wrap.dataset.session);
+        const tucked = unit && [...unit.parents, ...unit.children].every(p => staleSet.has(_delegateTabElements.get(p.target)));
+        wrap.classList.toggle('stale-tucked', !!tucked);
+    });
 
     // The sheet lists EVERY tab, in strip order — not just the tucked ones.
     // The strip is a ~260px scroller holding close to a metre of tabs with its
@@ -938,7 +995,17 @@ function _applyStaleGroup() {
     // the top while they are reading.
     const scrollTop = sheetBody.scrollTop;
     sheetBody.innerHTML = '';
-    allTabs.forEach(tab => sheetBody.appendChild(_buildTabRow(tab, staleSet.has(tab))));
+    allTabs.forEach(tab => {
+        const unit = typeof _delegateUnit === 'function' ? _delegateUnit(tab.dataset.target) : null;
+        const allTucked = unit && unit.children.length && [...unit.parents, ...unit.children].every(p => staleSet.has(_delegateTabElements.get(p.target)));
+        if (allTucked && tab.dataset.target !== unit.parents[0].target) return;
+        const row = _buildTabRow(tab, staleSet.has(tab));
+        if (allTucked) {
+            row.querySelector('.row-name').textContent += ' · ' + new Set(unit.children.map(p => p.session)).size + ' delegates';
+            row.addEventListener('click', () => { expandedDelegateParent = unit.session; refreshDelegateRail(); });
+        }
+        sheetBody.appendChild(row);
+    });
     sheetBody.scrollTop = scrollTop;
 
     if (sheetCount) sheetCount.textContent = String(allTabs.length);
@@ -984,6 +1051,7 @@ function _applyStaleGroup() {
         setTimeout(() => pill.classList.remove('flash'), 260);
     }
     _lastStaleCount = staleTabs.length;
+    if (typeof refreshDelegateRail === 'function') refreshDelegateRail();
 
     // Tucking changes the strip's width, and a tab selected from the sheet
     // only becomes visible here, once it is un-tucked.
@@ -1012,7 +1080,9 @@ function _buildTabRow(tab, isTucked) {
 
     const name = document.createElement('span');
     name.className = 'row-name';
-    name.textContent = _tabLabelText(tab) || session;
+    const unit = typeof _delegateUnit === 'function' ? _delegateUnit(target) : null;
+    const parentLabel = unit && unit.session !== session ? shortName(unit.session) + ' › ' : '';
+    name.textContent = parentLabel + (_tabLabelText(tab) || session);
     row.appendChild(name);
 
     const idleSec = parseInt(tab.dataset.idleSeconds || '0', 10);

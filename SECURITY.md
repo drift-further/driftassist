@@ -53,8 +53,9 @@ and its file path. Redirected startup output prints only the path, so the raw
 value is not copied into the server log. It is presented one of two ways and no
 others:
 
-* the browser exchanges it once at `/login` for a cookie holding an HMAC of it —
-  the raw secret is never stored client-side;
+* the browser exchanges it once at `/login` for a cookie bound to that one
+  browser (a device record, below) — the raw secret is never stored
+  client-side;
 * scripts and the `assist` CLI send it in the **`X-Assist-Token` header**.
 
 The browser login field uses `autocomplete="current-password"`, so a browser
@@ -68,11 +69,38 @@ the header. (For a headless browser, set it on the browser context — a token i
 the URL would authenticate the HTML document but none of its stylesheets or
 scripts anyway.)
 
-The login cookie lasts ten years and is never revalidated. That is deliberate —
-a phone must not be asked to re-authenticate mid-session — and it means
-**revocation is deleting `auth_token` and restarting**. Every issued cookie stops
-matching, because the HMAC key changed. Do that if a device is lost, if the
-token was pasted somewhere it should not have been, or if you are not sure.
+## Devices and revocation
+
+Every browser that signs in — with the token at `/login`, through an approval
+request, or through the open window that `assist pair` starts — becomes one
+**device**: a record in `devices.json` (0600, in the data directory) and a
+cookie of the form `v2.<device id>.<mac>`, where the mac is an HMAC of the id
+keyed by the token. A device cannot forge another's cookie, and the file holds
+no secret. Up to 32 devices can be active at once. A device name is a label
+someone typed, not a verified identity; the User-Agent shown beside it is
+whatever that browser chose to send.
+
+The cookie lasts ten years and is checked against the registry on every
+request. That is deliberate — a phone must not be asked to re-authenticate
+mid-session — and revocation is per device:
+
+* **A lost or retired browser:** revoke that one device, in Settings → Access →
+  Devices or with `assist devices revoke <id>`. Its next request gets 401 and
+  its open terminal stream is closed. Nothing else is signed out, and scripts
+  on the header token are not devices, so they keep working.
+* **Every browser at once:** `assist devices reset` (header token only).
+* **The token itself leaked** (pasted somewhere, committed, or you are not
+  sure): delete `auth_token` and restart. A new secret is generated, every
+  cookie stops matching because the HMAC key changed, and scripts need the new
+  token. This remains the nuclear option.
+
+The registry fails closed. A `devices.json` that cannot be read or parsed is
+copied aside as `devices.json.corrupt-<ts>` and replaced by a recovery marker;
+until `assist devices reset`, every cookie is refused and no new device is
+signed in, while the header token keeps working. A missing file means no
+devices, which is how the upgrade to per-device cookies starts: the old shared
+cookie (one value on every browser, so it could never be revoked one at a time)
+is refused, and every browser signs in again once.
 
 Three endpoints are exempt from the gate: `/login`, `/health` (a liveness probe
 whose complete response body is `{"status":"ok"}`), and `/api/cli-proxy`.
@@ -84,6 +112,21 @@ reachable without a token, because a device with no token is exactly who calls
 it; it is fenced instead by a LAN allowlist, a cap on pending requests, a per-IP
 cooldown, and a single-use claim that binds an approval to the browser that
 asked.
+
+## Content-Security-Policy
+
+Every response carries `script-src 'self'` (full policy in
+`shared/security.py:CSP_POLICY`). The app has no inline script at all: each
+control names its action in a `data-action` attribute that
+`js/actions-registry.js` resolves through an explicit map, and the sign-in
+page's approval script is `/login.js` — the one script exempt from the auth
+gate, because the browser that needs it is signed out. So escaping is no
+longer the only layer: markup injected into the page cannot run an `on*=`
+handler or an inline `<script>`. Inline styles stay allowed; they cannot run
+code. There is no reporting endpoint (the Reporting API needs a trustworthy
+origin, and the LAN origin is plain HTTP). `security.csp_enforce: false` in
+`settings.json` sends the same policy as Report-Only, for a fork that still
+carries inline code.
 
 ## Temporary execution park
 

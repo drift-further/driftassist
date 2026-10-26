@@ -1,9 +1,10 @@
 """`assist expose` — let a phone on the LAN reach this host's Assist directly.
 
-Writes two lines into the checkout's .env: ASSIST_BIND (the LAN address, a
-second listener beside loopback) and that address's origin in
+Writes two lines into the install's env file (the checkout's .env, or
+server.env in the config dir on the XDG layout): ASSIST_BIND (the LAN address,
+a second listener beside loopback) and that address's origin in
 ASSIST_ALLOWED_ORIGINS, so the login POST from the phone is not refused as
-cross-origin. Everything else in .env is left byte-for-byte alone.
+cross-origin. Everything else in the file is left byte-for-byte alone.
 
 nginx or Caddy in front remains the advanced path (README); this is the one
 that needs no root and no second config file.
@@ -151,7 +152,11 @@ def _sync_environment(env_file: Path) -> None:
 
 
 def command(resolved, ip: str | None, off: bool = False) -> int:
-    env_file = resolved.home / ".env"
+    env_file = resolved.env_file
+    if env_file is None:
+        proc.print_error(resolved.layout_error or "no env file for this install")
+        return 1
+    env_file.parent.mkdir(parents=True, exist_ok=True)
     if off:
         remove_exposure(env_file)
         print(f"Removed ASSIST_BIND from {env_file}.")
@@ -175,7 +180,7 @@ def command(resolved, ip: str | None, off: bool = False) -> int:
         print("Restarting the server to apply it...")
         code = proc.restart(resolved)
         if code != 0:
-            proc.print_error("the restart failed; the change in .env applies at the next start")
+            proc.print_error(f"the restart failed; the change in {env_file} applies at the next start")
             return code
         applied = "Assist now listens"
     else:

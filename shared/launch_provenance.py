@@ -20,8 +20,9 @@ import uuid
 from pathlib import Path
 from typing import Iterator
 
-from shared.agent_identity import _stat_fields
-from shared.tmux import ExpectedTargetIdentity
+# shared.agent_identity and shared.tmux load application state (tab_state,
+# settings), so they are imported where they are used. Reading or validating
+# a store's layout — what the migration tool and recovery do — needs neither.
 
 
 ROOT_NAME = ".assist-launch-provenance-v1"
@@ -63,6 +64,18 @@ def _absolute(path: os.PathLike[str] | str) -> Path:
     return Path(os.path.abspath(os.fspath(path)))
 
 
+def _same_root(recorded: object, root: os.PathLike[str] | str) -> bool:
+    """Whether a receipt's recorded root is this store's root, as a physical path.
+
+    The migration tool records the data root with symlinks resolved, while the
+    runtime keeps the spelling it was given; an unchanged symlink names the
+    same directory either way. A different directory is still refused.
+    """
+    if not isinstance(recorded, str) or not os.path.isabs(recorded):
+        return False
+    return os.path.realpath(recorded) == os.path.realpath(os.fspath(root))
+
+
 def _assist_home(value: os.PathLike[str] | str | None = None) -> Path:
     selected = value or os.environ.get("ASSIST_HOME")
     if selected is None:
@@ -73,13 +86,32 @@ def _assist_home(value: os.PathLike[str] | str | None = None) -> Path:
         raise ProvenanceError("assist_home_invalid", os.fspath(selected)) from exc
 
 
+def runtime_base(
+    assist_home: os.PathLike[str] | str | None = None,
+) -> Path:
+    """Where this install's store and receipt live: its data dir.
+
+    For the install this module belongs to that is shared.paths.data_dir() —
+    the checkout on the legacy layout, the XDG data dir after migration. An
+    explicitly different `assist_home` (a release harness, a test) keeps its
+    store beside itself, as before. The epoch still records the checkout as
+    `assist_home` on both layouts.
+    """
+    home = _assist_home(assist_home)
+    from shared import paths
+
+    if home == paths.APP_ROOT.resolve():
+        return _absolute(paths.data_dir())
+    return home
+
+
 def provenance_root(
     assist_home: os.PathLike[str] | str | None = None,
 ) -> Path:
     override = os.environ.get("ASSIST_LAUNCH_PROVENANCE_ROOT")
     if override:
         return _absolute(override)
-    return _assist_home(assist_home) / ROOT_NAME
+    return runtime_base(assist_home) / ROOT_NAME
 
 
 def _fsync_directory(path: Path) -> None:
@@ -196,6 +228,8 @@ def _atomic_json_replace(path: Path, payload: object) -> None:
 
 
 def _process_start_time(pid: int) -> str | None:
+    from shared.agent_identity import _stat_fields
+
     try:
         process_state, _parent_pid, start_time = _stat_fields(int(pid))
     except (OSError, TypeError, ValueError, IndexError):
@@ -213,6 +247,8 @@ def _actor_identity() -> dict[str, object]:
 
 
 def _normalize_identity(value: object) -> dict[str, object]:
+    from shared.tmux import ExpectedTargetIdentity
+
     try:
         identity = ExpectedTargetIdentity.from_value(value)
     except (KeyError, TypeError, ValueError) as exc:
@@ -632,10 +668,78 @@ def initialize_for_startup(
         return False
     initialize_epoch(
         assist_home=home,
-        receipt_path=home / INITIALIZATION_RECEIPT_NAME,
+        receipt_path=runtime_base(home) / INITIALIZATION_RECEIPT_NAME,
         expect_empty=True,
     )
     return True
+
+
+_RECEIPT_KEYS = {
+    "schema",
+    "assist_home",
+    "provenance_root",
+    "coverage",
+    "epoch",
+    "epoch_sha256",
+    "empty",
+}
+
+
+def _parse_receipt(receipt_bytes: bytes) -> dict[str, object]:
+    try:
+        receipt = json.loads(receipt_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProvenanceError("provenance_initialization_receipt_invalid") from exc
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt) != _RECEIPT_KEYS
+        or receipt.get("schema") != INITIALIZATION_SCHEMA
+    ):
+        raise ProvenanceError("provenance_initialization_receipt_invalid")
+    return receipt
+
+
+def transform_receipt(receipt_bytes: bytes, new_root: os.PathLike[str] | str) -> bytes:
+    """The same receipt naming the store at `new_root`, in canonical bytes.
+
+    The migration tool moves the store and rewrites only `provenance_root`;
+    `assist_home` stays the checkout. Receipts are written canonically, so the
+    inverse (back to the original root) reproduces the original bytes.
+    """
+    receipt = _parse_receipt(receipt_bytes)
+    receipt["provenance_root"] = os.fspath(_absolute(new_root))
+    return _canonical_bytes(receipt)
+
+
+def verify_staged(
+    store_path: os.PathLike[str] | str,
+    receipt_bytes: bytes,
+    expected_root: os.PathLike[str] | str,
+    *,
+    assist_home: os.PathLike[str] | str,
+) -> dict[str, object]:
+    """Validate a staged store and its receipt where they are.
+
+    For the migration tool: the store sits at its staging path while the
+    receipt already names `expected_root`, its final path. Never selects a
+    layout, never initialises a store, and imports no application state —
+    the store's layout, epoch and epoch digest are checked, which is what the
+    receipt binds; records are byte-identical to the source store by hash.
+    """
+    receipt = _parse_receipt(receipt_bytes)
+    home = _assist_home(assist_home)
+    if receipt.get("assist_home") != os.fspath(home):
+        raise ProvenanceError("provenance_initialization_home_mismatch")
+    if not _same_root(receipt.get("provenance_root"), _absolute(expected_root)):
+        raise ProvenanceError("provenance_initialization_root_mismatch")
+    store = LaunchProvenanceStore(assist_home=home, root=store_path)
+    epoch = store._validate_layout()
+    if receipt.get("epoch") != epoch:
+        raise ProvenanceError("provenance_initialization_epoch_mismatch")
+    digest = hashlib.sha256((_absolute(store_path) / "epoch.json").read_bytes()).hexdigest()
+    if receipt.get("epoch_sha256") != digest:
+        raise ProvenanceError("provenance_initialization_epoch_mismatch")
+    return receipt
 
 
 def verify_initialization(
@@ -661,7 +765,7 @@ def verify_initialization(
     root = provenance_root(home)
     if receipt.get("assist_home") != os.fspath(home):
         raise ProvenanceError("provenance_initialization_home_mismatch")
-    if receipt.get("provenance_root") != os.fspath(root):
+    if not _same_root(receipt.get("provenance_root"), root):
         raise ProvenanceError("provenance_initialization_root_mismatch")
     if receipt.get("coverage") != require_coverage:
         raise ProvenanceError("provenance_initialization_coverage_mismatch")

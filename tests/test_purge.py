@@ -393,8 +393,8 @@ class PurgeCliTests(unittest.TestCase):
         for path in ('js/tabs.js', 'js/ui.js', 'css/terminal.css'):
             url = re.search(r'/' + re.escape(path) + r'\?v=\d+', html).group()
             self.assertIn("'" + url + "'", worker)
-        self.assertIn('onclick="openPurgeIdle()"', html)
-        self.assertIn('onclick="killPurgeSelected()" disabled', html)
+        self.assertIn('data-action="openPurgeIdle"', html)
+        self.assertIn('data-action="killPurgeSelected" disabled', html)
 
 
 @unittest.skipUnless(shutil.which('node'), 'needs Node')

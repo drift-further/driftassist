@@ -91,7 +91,8 @@ console.log(JSON.stringify({before, after}));
         terminal = (ROOT / "js/terminal.js").read_text()
         tabs = (ROOT / "js/tabs.js").read_text()
         actions = (ROOT / "js/actions.js").read_text()
-        for name, src in (("app.js", app), ("terminal.js", terminal)):
+        self.assertIn("_applySessionsData(data.sessions || [], data.active_target || '', requestedAt)", terminal)
+        for name, src in (("app.js", app),):
             self.assertIn("targetMissingIsStale(current, requestedAt", src, name)
             self.assertIn("noteTargetListed(current)", src, name)
         self.assertEqual(terminal.count("noteTargetChosen(_termTarget, true)"), 2)

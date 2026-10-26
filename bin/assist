@@ -59,9 +59,14 @@ def _reexec_in_project_venv() -> None:
 
 _reexec_in_project_venv()
 
+# Only modules that load no application state are imported here. A verb that
+# needs the server's state (session verbs, update) imports it in main(), after
+# the layout lock is held and the migration marker checked (shared/paths.py),
+# so `migrate-state`, `doctor` and `config` run without loading any of it.
 try:
     from cli import (
         container,
+        devices,
         expose,
         http,
         pair,
@@ -69,11 +74,10 @@ try:
         purge,
         roster,
         service,
-        session,
-        update,
         wait as wait_cli,
     )
     from cli.config import ConfigError, resolve
+    from shared import paths
     from shared.execution_park import FEATURES_PARKED
 except ModuleNotFoundError as exc:  # a legible failure beats a 12-line traceback
     print(
@@ -108,6 +112,13 @@ Reach it from your phone:
   pair [--minutes N] [--url URL]
                          Open a short sign-in window; print the phone URL + QR
   token                  Print the token file path (and the token, on a terminal)
+  migrate-state [--resume | --rollback]
+                         Move settings, token and state out of the checkout into
+                         ~/.config and ~/.local/share (stop the server first)
+  devices [list]         Signed-in browsers (each has its own cookie)
+  devices rename ID NAME Label a device
+  devices revoke ID      Sign one browser out; nothing else is affected
+  devices reset          Sign every browser out (and clear a quarantined list)
 
 Config & diagnostics:
   config                 Print resolved paths, ports, and env
@@ -129,6 +140,8 @@ Sessions:
       [--wait] [--timeout N] [--role R (--family F | --against F)]
                          Create a bare shell; takes no command
                          With --role, resolve and send its roster command
+  resume SESSION [--pane P] [--agent-only]
+                         Print a verified resume command when available
   kill SESSION [--pane P]
                          Kill a tmux session
   purge --idle 24h [--yes] [--keep NAME ...] [--json]
@@ -225,6 +238,7 @@ COMMANDS = {
     "container",
     "ls",
     "view",
+    "resume",
     "send",
     "wait",
     "launch",
@@ -237,9 +251,15 @@ COMMANDS = {
     "expose",
     "pair",
     "token",
+    "devices",
+    "migrate-state",
     "service",
     "update",
 }
+
+
+# migrate-state takes the layout lock EXCLUSIVELY itself (cli/migrate_state.py).
+LOCK_FREE_VERBS = {"help", "config", "doctor", "migrate-state"}
 
 
 class ArgumentError(Exception):
@@ -454,6 +474,11 @@ def build_parser() -> AssistArgumentParser:
     purge_parser.add_argument("--json", action="store_true", dest="json_output",
                               help="machine output; suppress next-step hints")
 
+    resume_parser = subparsers.add_parser('resume', description='Print a resume line; never execute it.')
+    resume_parser.add_argument('session', help='Session name to recover')
+    resume_parser.add_argument('--pane', default='0.0', metavar='P', help='Pane index (default: 0.0)')
+    resume_parser.add_argument('--agent-only', action='store_true', help='Print only the agent command, without the Assist launch/send wrapper')
+
     kill_parser = subparsers.add_parser(
         "kill",
         description="Kill an entire tmux session.",
@@ -636,6 +661,24 @@ def main(arguments: list[str] | None = None) -> int:
         proc.print_error(f"Unknown command: {verb} (try: assist help)")
         return 1
 
+    # Every verb that can read or write the install holds the shared layout
+    # lock for its whole run and refuses mid-migration. Read-only diagnostics
+    # and help read the marker without it.
+    if verb not in LOCK_FREE_VERBS:
+        try:
+            paths.enter_runtime(resolved.home)
+        except paths.LayoutError as exc:
+            proc.print_error(str(exc))
+            return 1
+
+    if verb == "devices":
+        # Its own argument handling, so `assist devices -h` reaches it.
+        return devices.command(argv[1:])
+    if verb == "migrate-state":
+        from cli import migrate_state
+
+        return migrate_state.command(argv[1:], resolved)
+
     try:
         parsed = build_parser().parse_args(argv)
     except ArgumentError as exc:
@@ -645,6 +688,8 @@ def main(arguments: list[str] | None = None) -> int:
     if parsed.verb in PROCESS_HANDLERS:
         return PROCESS_HANDLERS[parsed.verb](resolved)
     if parsed.verb == 'update':
+        from cli import update
+
         return update.command(resolved, parsed.check, parsed.json_output)
     if parsed.verb == "activate-park-v16":
         return proc.activate_park(resolved, ASSIST_HOME, parsed.resume)
@@ -661,6 +706,8 @@ def main(arguments: list[str] | None = None) -> int:
         return proc.doctor(resolved)
     if parsed.verb == "container":
         return container.dispatch(parsed.arguments)
+    if parsed.verb in ("ls", "view", "send", "launch", "kill", "autoyes", "resume"):
+        from cli import session
     if parsed.verb == "ls":
         return session.list_sessions(parsed.json_output, parsed.include_cwd)
     if parsed.verb == "view":
@@ -696,6 +743,8 @@ def main(arguments: list[str] | None = None) -> int:
             parsed.against,
             resolved.roster_file,
         )
+    if parsed.verb == "resume":
+        return session.resume(parsed.session, parsed.pane, parsed.agent_only)
     if parsed.verb == "kill":
         return session.kill(parsed.session, parsed.pane)
     if parsed.verb == "purge":

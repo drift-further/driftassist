@@ -4,8 +4,9 @@ import html
 
 from flask import Blueprint, make_response, redirect, request, send_from_directory
 
+from shared import devices
 from shared.auth import client_ip, ip_in_scope, set_auth_cookie, token_matches
-from shared.state import DATA_DIR
+from shared.paths import APP_ROOT
 
 static_bp = Blueprint("static_bp", __name__)
 
@@ -14,95 +15,14 @@ static_bp = Blueprint("static_bp", __name__)
 # otherwise demand every brace below be doubled — str.format does not rescan
 # what it substitutes in, so these braces are safe exactly here.
 #
-# Inline rather than a module under /js/: that directory sits behind the auth
-# gate, so a logged-out browser cannot load one.
+# The script is /login.js rather than a module under /js/: that directory sits
+# behind the auth gate, so a logged-out browser cannot load one, and an inline
+# <script> would not run under `script-src 'self'`.
 _REQUEST_UI = """
   <div class="req-sep">or</div>
   <button type="button" id="req-btn" class="req-btn">Request device approval</button>
   <div id="req-state" class="req-state"></div>
-<script>
-(function () {
-  var btn = document.getElementById('req-btn');
-  var out = document.getElementById('req-state');
-  var timer = null, poller = null, remaining = 0;
-
-  function stop() {
-    if (timer) { clearInterval(timer); timer = null; }
-    if (poller) { clearInterval(poller); poller = null; }
-  }
-  function clock(s) {
-    return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
-  }
-  function idle(msg) {
-    stop();
-    out.className = 'req-state';
-    out.textContent = msg || '';
-    btn.disabled = false;
-    btn.textContent = 'Request device approval';
-  }
-  function waiting(code) {
-    // The request has landed; leaving the button on "Requesting…" would read
-    // as a stuck spinner for the whole five minutes.
-    btn.textContent = 'Request sent';
-    out.className = 'req-state waiting';
-    out.textContent = '';
-    var big = document.createElement('div');
-    big.className = 'req-code';
-    big.textContent = code;
-    var msg = document.createElement('div');
-    msg.textContent = 'Waiting for approval\\u2026 ';
-    var cl = document.createElement('span');
-    cl.id = 'req-clock';
-    cl.textContent = clock(remaining);
-    msg.appendChild(cl);
-    out.appendChild(big);
-    out.appendChild(msg);
-    timer = setInterval(function () {
-      remaining = Math.max(0, remaining - 1);
-      var el = document.getElementById('req-clock');
-      if (el) el.textContent = clock(remaining);
-    }, 1000);
-  }
-  function poll(claim) {
-    poller = setInterval(function () {
-      fetch('/access/request/status?claim=' + encodeURIComponent(claim))
-        .then(function (r) { return r.json(); })
-        .then(function (st) {
-          if (st.status === 'approved') {
-            stop();
-            out.className = 'req-state';
-            out.textContent = 'Approved \\u2014 loading\\u2026';
-            location.href = '/';
-          } else if (st.status === 'denied') {
-            idle('Request denied.');
-          } else if (st.status === 'expired') {
-            idle('No one answered. Paste the token instead.');
-          } else {
-            remaining = st.remaining_sec;
-          }
-        })
-        .catch(function () { /* transient — the next tick re-syncs */ });
-    }, 2000);
-  }
-
-  btn.addEventListener('click', function () {
-    btn.disabled = true;
-    btn.textContent = 'Requesting\\u2026';
-    fetch('/access/request', { method: 'POST' })
-      .then(function (r) {
-        return r.json().then(function (d) { return { code: r.status, body: d }; });
-      })
-      .then(function (res) {
-        if (res.code === 429) { idle('Too many requests. Try again in a moment.'); return; }
-        if (!res.body || !res.body.ok) { idle('Could not request approval.'); return; }
-        remaining = res.body.request.expires_in;
-        waiting(res.body.request.code);
-        poll(res.body.claim);
-      })
-      .catch(function () { idle('Could not reach the server.'); });
-  });
-})();
-</script>
+<script src="/login.js?v=1"></script>
 """
 
 _LOGIN_PAGE = """<!DOCTYPE html>
@@ -199,9 +119,24 @@ def login_origin_refused(origin):
     return _LOGIN_PAGE.format(error=error, request_ui=_login_request_ui()), 403
 
 
+_ADMIT_ERRORS = {
+    "recovery_required": (
+        "The device list is quarantined. On the host, run "
+        "<code>assist devices reset</code>, then sign in again.",
+        503,
+    ),
+    "device_cap": (
+        "This Assist has the maximum number of signed-in devices. Revoke one "
+        "in Settings \u2192 Access \u2192 Devices, then sign in again.",
+        409,
+    ),
+    "write_failed": ("Could not record this device. Try again.", 503),
+}
+
+
 @static_bp.route("/login", methods=["GET", "POST"])
 def login():
-    """Exchange the shared secret for a long-lived cookie."""
+    """Exchange the shared secret for a device and its long-lived cookie."""
     # The request button is offered only where a request could actually
     # succeed: shared.auth refuses out-of-scope callers, so showing it to an
     # off-LAN visitor would be a control that can only ever fail.
@@ -216,17 +151,32 @@ def login():
         return _LOGIN_PAGE.format(error="", request_ui=request_ui)
     if not token_matches(request.form.get("token")):
         return _LOGIN_PAGE.format(error="Invalid token.", request_ui=request_ui), 401
-    return set_auth_cookie(make_response(redirect("/")))
+    result = devices.admit(
+        devices.TokenLogin(),
+        ip=client_ip(request),
+        ua=request.headers.get("User-Agent", ""),
+    )
+    if isinstance(result, devices.AdmitRefused):
+        error, status = _ADMIT_ERRORS.get(result.reason, ("Sign-in refused.", 403))
+        return _LOGIN_PAGE.format(error=error, request_ui=request_ui), status
+    return set_auth_cookie(make_response(redirect("/")), result["id"])
+
+
+@static_bp.route("/login.js")
+def login_script():
+    """The approval-request script for the sign-in page. Exempt from the auth
+    gate (shared/auth_gate.py) because its caller is signed out."""
+    return send_from_directory(APP_ROOT, "login.js", mimetype="text/javascript")
 
 
 @static_bp.route("/")
 def index():
-    return send_from_directory(DATA_DIR, "index.html")
+    return send_from_directory(APP_ROOT, "index.html")
 
 
 @static_bp.route("/sw.js")
 def serve_sw():
-    response = send_from_directory(DATA_DIR, "sw.js")
+    response = send_from_directory(APP_ROOT, "sw.js")
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     response.headers["Service-Worker-Allowed"] = "/"
     return response
@@ -234,21 +184,21 @@ def serve_sw():
 
 @static_bp.route("/css/<path:filename>")
 def serve_css(filename):
-    return send_from_directory(DATA_DIR / "css", filename)
+    return send_from_directory(APP_ROOT / "css", filename)
 
 
 @static_bp.route("/js/<path:filename>")
 def serve_js(filename):
-    return send_from_directory(DATA_DIR / "js", filename)
+    return send_from_directory(APP_ROOT / "js", filename)
 
 
 @static_bp.route("/fonts/<path:filename>")
 def serve_fonts(filename):
     return send_from_directory(
-        DATA_DIR / "fonts", filename, max_age=31536000
+        APP_ROOT / "fonts", filename, max_age=31536000
     )  # 1 year cache — font files are immutable
 
 
 @static_bp.route("/icons/<path:filename>")
 def serve_icons(filename):
-    return send_from_directory(DATA_DIR / "icons", filename, max_age=31536000)
+    return send_from_directory(APP_ROOT / "icons", filename, max_age=31536000)

@@ -157,7 +157,9 @@ class DoctorTmuxTests(unittest.TestCase):
 
     def test_old_tmux_fails_doctor(self):
         resolved = SimpleNamespace(
-            python=sys.executable, home=ROOT, config_file=ROOT / "nope", port=1
+            python=sys.executable, home=ROOT, config_file=ROOT / "nope", port=1,
+            env_file=ROOT / "nope.env", layout="legacy", layout_error=None,
+            config_dir=ROOT, data_dir=ROOT, state_dir=ROOT / "nope",
         )
         out = io.StringIO()
         with mock.patch.object(proc, "_tmux_version", return_value=(3, 1)), \

@@ -153,3 +153,39 @@ def register_request_guards(app):
 
                     return login_origin_refused(origin)
                 return jsonify({"ok": False, "error": "Origin not allowed"}), 403
+
+
+# ---------------------------------------------------------------------------
+# Content-Security-Policy
+# ---------------------------------------------------------------------------
+
+# No inline script anywhere: every control is a data-action resolved by
+# js/actions-registry.js, and the sign-in page's script is /login.js. Inline
+# styles stay allowed — they cannot run code. No report-uri/report-to: the
+# Reporting API needs a trustworthy origin, and the LAN origin is plain HTTP.
+CSP_POLICY = (
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; connect-src 'self' ws: wss:; font-src 'self'; "
+    "frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+)
+
+
+def csp_enforced():
+    from shared import state
+
+    return (state.get_settings().get("security") or {}).get("csp_enforce", True) is not False
+
+
+def register_csp(app):
+    """Send the policy on every response, enforcing unless security.csp_enforce
+    is off. Report-only mode keeps `frame-ancestors 'none'` enforcing, since a
+    report-only policy ignores that directive."""
+
+    @app.after_request
+    def _csp(response):
+        if csp_enforced():
+            response.headers["Content-Security-Policy"] = CSP_POLICY
+        else:
+            response.headers["Content-Security-Policy"] = "frame-ancestors 'none'"
+            response.headers["Content-Security-Policy-Report-Only"] = CSP_POLICY
+        return response

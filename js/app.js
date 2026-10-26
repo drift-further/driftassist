@@ -167,6 +167,7 @@ async function consolidatedPoll() {
 
         // Scan — prompt detection + activity on background tabs
         _applyScanData(data.scan || []);
+        _applyDelegateAlerts(_sessionPanes);
 
         // A sudo prompt in any pane — a Yes/No popup (prompt-popup.js)
         if (typeof _applySudoPrompts === 'function') _applySudoPrompts(data.sudo_prompts || []);
@@ -209,6 +210,7 @@ async function consolidatedPoll() {
         if (typeof _applyAccessData === 'function') {
             _applyAccessData(data.access || null);
         }
+        if (typeof applyDeviceData === 'function') applyDeviceData(data.device || null);
 
         // Collapsed-chrome grabber mirrors #status-dot / #studio-badge.
         if (typeof syncChromeGrabber === 'function') syncChromeGrabber();
@@ -367,57 +369,12 @@ function _applySessionsData(panes, activeTarget, requestedAt) {
     container.innerHTML = '';
     if (typeof SplitView !== 'undefined' && panes.length === 0) SplitView.reconcile(panes,requestedAt || Date.now());
     if (panes.length === 0) {
+        renderDelegateNavigation([], current);
         container.innerHTML = '<span class="session-tabs-empty">No sessions</span>';
         return;
     }
 
-    const teamSessions = new Set();
-    for (const p of panes) {
-        if (p.agent_name) teamSessions.add(p.session);
-    }
-
-    for (const p of panes) {
-        const isAgent = !!p.agent_name;
-        // Mirrors loadSessions() in terminal.js — keep the two in sync.
-        const isSubpane = !isAgent && !!p.is_subpane;
-        const isTeamLead = !isAgent && teamSessions.has(p.session);
-        const aName = agentDisplayName(p);
-        const aColor = _agentColors[p.agent_color] || '';
-
-        const tab = document.createElement('button');
-        tab.className = 'session-tab';
-        if (isAgent) tab.classList.add('agent-tab');
-        if (isSubpane) tab.classList.add('agent-tab', 'subpane-tab');
-        if (isTeamLead) tab.classList.add('team-lead-tab');
-        tab.dataset.target = p.target;
-        if (p.agent_name) tab.dataset.agentName = p.agent_name;
-
-        // Label: agent name (short) or session·pane for unnamed sibling panes
-        const label = aName || (isSubpane ? shortName(p.session) + '·' + p.pane : shortName(p.session));
-        tab.textContent = label;
-
-        if (isAgent && aColor) {
-            tab.style.borderLeftWidth = '3px';
-            tab.style.borderLeftColor = aColor;
-        } else if (p.session.endsWith('-auto')) {
-            tab.style.borderLeftWidth = '3px';
-            tab.style.borderLeftColor = 'var(--amber)';
-        }
-
-        const dotEl = document.createElement('span');
-        dotEl.className = 'tab-dot';
-        tab.appendChild(dotEl);
-
-        // Mirrors loadSessions() in terminal.js — keep the two in sync.
-        applyTabModel(tab, p);
-
-        if (_sessionPrompts[p.target]) {
-            tab.classList.add('has-prompt');
-        }
-        tab.onclick = function() { selectTab(p.target); };
-        if (p.target === current) tab.classList.add('active');
-        container.appendChild(tab);
-    }
+    renderDelegateNavigation(panes, current);
 
     if (typeof SplitView !== 'undefined') SplitView.reconcile(panes, requestedAt || Date.now());
     if (typeof SplitView !== 'undefined' && SplitView.enabled) {
@@ -481,6 +438,15 @@ function _formatIdleTime(seconds) {
 function _applyStatesData(states) {
     const now = Date.now();
     for (const [target, info] of Object.entries(states)) {
+        const pane = (_sessionPanes || []).find(p => p.target === target);
+        if (pane?.delegate?.state) {
+            delete _sessionPrompts[target];
+            delete _sessionStates[target];
+            const tab = document.querySelector(`.session-tab[data-target="${CSS.escape(target)}"]`);
+            if (tab) tab.dataset.idleSeconds = Math.floor(info.idle_seconds || 0);
+            applyDelegateMark(tab, pane);
+            continue;
+        }
         const prev = _sessionStates[target];
         const prevState = prev ? prev.state : null;
         let effectiveState = info.state;
@@ -576,6 +542,12 @@ function _applyScanData(scanPanes) {
     // view, plus the tab in view, whose prompt counts as seen.
     const questions = [];
     for (const pane of scanPanes) {
+        const listed = (_sessionPanes || []).find(p => p.target === pane.target);
+        if ((pane.delegate || listed?.delegate)?.state) {
+            delete _sessionPrompts[pane.target];
+            delete _notifSentFor[pane.target];
+            continue;
+        }
         const isActive = _termOpen && pane.target === _termTarget;
         if (isActive || (typeof SplitView !== 'undefined' && SplitView.readable(pane.target))) {
             if (pane.prompt) {
@@ -706,3 +678,11 @@ updateRouteIndicator();
 loadProjects();
 startPolling();
 syncAutoYesState().then(() => { if (_termTarget) updateAutoYesUI(_termTarget.split(':')[0]); });
+
+// Service worker (sw.js). Browsers register it only in a secure context, so it
+// is inert on the plain-HTTP phone origin until TLS lands. Registered here
+// rather than from an inline <script>: the page is served with
+// `script-src 'self'`.
+if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+}

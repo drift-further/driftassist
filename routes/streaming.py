@@ -4,7 +4,11 @@ import json
 import threading
 import time
 
+from flask import request
+
+import shared.auth as auth
 import shared.state as state
+from shared import devices
 from shared.security import origin_allowed
 from shared.tmux import (
     capture_pane,
@@ -63,6 +67,13 @@ def _full_frame(target, lines, tui=None):
     )
 
 
+def _close(ws):
+    try:
+        ws.close()
+    except Exception:
+        pass
+
+
 def register_streaming(sock_instance):
     """Register the WebSocket route on the given Sock instance.
 
@@ -70,66 +81,88 @@ def register_streaming(sock_instance):
     """
     global _sock
     _sock = sock_instance
+    _sock.route("/terminal/stream")(terminal_stream_handler)
 
-    @_sock.route("/terminal/stream")
-    def terminal_stream(ws):
-        """WebSocket endpoint for real-time terminal streaming."""
-        # WS handshakes bypass CORS entirely — enforce the same Origin
-        # allowlist as the HTTP before_request hook (shared/security.py).
-        if not origin_allowed(ws.environ.get("HTTP_ORIGIN")):
-            try:
-                ws.close()
-            except Exception:
-                pass
-            return
 
-        target = None
-        lines = _DEFAULT_LINES
-        tui = None
+def terminal_stream_handler(ws):
+    """WebSocket endpoint for real-time terminal streaming.
 
+    flask-sock runs this inside the handshake's Flask request, after the auth
+    gate. The credential is read again here to learn which device (None for
+    the header token) owns the socket, before any subscription is read; the
+    socket is registered under the devices lock, refused if that device was
+    revoked meanwhile, and re-checked once more before the first frame. A
+    later revoke closes it (shared.devices).
+    """
+    # WS handshakes bypass CORS entirely — enforce the same Origin
+    # allowlist as the HTTP before_request hook (shared/security.py).
+    if not origin_allowed(ws.environ.get("HTTP_ORIGIN")):
+        _close(ws)
+        return
+
+    device = auth.request_device(request)
+    if device is None and not auth.header_authenticated(request):
+        _close(ws)
+        return
+    device_id = device["id"] if device else None
+
+    target = None
+    lines = _DEFAULT_LINES
+    tui = None
+
+    try:
+        raw = ws.receive(timeout=5)
+        if raw:
+            msg = json.loads(raw)
+            target = msg.get("target", state.tmux_target)
+            lines = min(int(msg.get("lines", _DEFAULT_LINES)), 20000)
+            tui = _tui_flag(msg)
+    except Exception:
+        target = state.tmux_target
+
+    # One entry per connection, mutated in place on resubscribe. The lock
+    # serializes ws.send() across the three threads that write to this
+    # socket (handler, streamer, autoyes broadcaster) — simple_websocket's
+    # send() has no internal lock and can interleave partial writes.
+    client = {
+        "ws": ws,
+        "lock": threading.Lock(),
+        "target": target,
+        "lines": lines,
+        "tui": tui,
+        "last_send": time.time(),
+        "device_id": device_id,
+    }
+
+    if not target:
         try:
-            raw = ws.receive(timeout=5)
-            if raw:
-                msg = json.loads(raw)
-                target = msg.get("target", state.tmux_target)
-                lines = min(int(msg.get("lines", _DEFAULT_LINES)), 20000)
-                tui = _tui_flag(msg)
+            _send_to(client, json.dumps({"type": "error", "error": "No target specified"}))
         except Exception:
-            target = state.tmux_target
+            pass
+        return
 
-        # One entry per connection, mutated in place on resubscribe. The lock
-        # serializes ws.send() across the three threads that write to this
-        # socket (handler, streamer, autoyes broadcaster) — simple_websocket's
-        # send() has no internal lock and can interleave partial writes.
-        client = {
-            "ws": ws,
-            "lock": threading.Lock(),
-            "target": target,
-            "lines": lines,
-            "tui": tui,
-            "last_send": time.time(),
-        }
+    def _add():
+        with state.ws_lock:
+            state.ws_last_content.pop(f"{target}:{lines}:{tui}", None)
+            state.ws_clients.append(client)
 
-        if not target:
-            try:
-                _send_to(client, json.dumps({"type": "error", "error": "No target specified"}))
-            except Exception:
-                pass
-            return
+    if not devices.register_stream(device_id, client, _add):
+        _close(ws)
+        return
 
-        # First frame goes out immediately.
+    try:
+        # First frame goes out immediately — after one more check that the
+        # device was not revoked between registration and now.
         try:
+            if not devices.stream_device_active(device_id):
+                _close(ws)
+                return
             frame, _info = _full_frame(target, lines, tui)
             _send_to(client, frame)
         except Exception:
             return
 
         set_ws_send_timeout(ws)
-
-        with state.ws_lock:
-            cache_key = f"{target}:{lines}:{tui}"
-            state.ws_last_content.pop(cache_key, None)
-            state.ws_clients.append(client)
         _ensure_streamer()
 
         try:
@@ -162,8 +195,9 @@ def register_streaming(sock_instance):
                     pass
         except Exception:
             pass
-        finally:
-            _remove_ws_client(ws)
+    finally:
+        _remove_ws_client(ws)
+        devices.unregister_stream(client)
 
 
 def _terminal_streamer():

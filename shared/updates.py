@@ -293,8 +293,9 @@ def manager():
     global _manager
     with _manager_lock:
         if _manager is None:
-            from shared.state import DATA_DIR
-            updater = Updater(DATA_DIR)
+            from shared.paths import APP_ROOT
+            # The checkout, whatever the runtime layout: it is the code that updates.
+            updater = Updater(APP_ROOT)
             updater.running_commit = updater.commit()
             updater.settle_restart()
             _manager = UpdateManager(updater)

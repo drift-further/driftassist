@@ -1,0 +1,32 @@
+claude
+user@host:/tmp/assist-fx/claude$ claude
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Opus 5.5 with high effort · Claude Max
+ ▝▝   ▝▝   /tmp/assist-fx/claude
+
+
+❯ Run exactly this shell command: curl -sI https://example.com | head -3
+
+● Bash(curl -sI https://example.com | head -3)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Sautéed for 2s · done 3:48 PM
+
+❯ Use the AskUserQuestion tool to ask me one question: which colour should the banner be, with the options red, green 
+  and blue. Do nothing else.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Banner 
+
+Which colour should the banner be?
+
+❯ 1. Red
+     Make the banner red.
+  2. Green
+     Make the banner green.
+  3. Blue
+     Make the banner blue.
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

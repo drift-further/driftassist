@@ -98,6 +98,9 @@ class _Checkout:
         if "ASSIST_PID_FILE:-/tmp" in script:
             raise RuntimeError("assist-ctl still defaults to /tmp; refusing to run it")
         shutil.copy2(ROOT / "assist-ctl", self.home / "assist-ctl")
+        # assist-ctl resolves its env file and layout lock through this.
+        (self.home / "shared").mkdir()
+        shutil.copy2(ROOT / "shared" / "paths.py", self.home / "shared" / "paths.py")
         (self.home / "serve.py").write_text(_FAKE_SERVE)
         (self.home / ".env").write_text("".join(f"{line}\n" for line in env_lines))
         self.state_home = root / "state"

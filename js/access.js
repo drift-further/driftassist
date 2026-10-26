@@ -155,13 +155,19 @@ function _approveCard(r) {
     const card = document.createElement('div');
     card.className = 'approve-card';
 
+    // The peer address is what the server saw; the User-Agent is whatever the
+    // device chose to send, so it leads with the first and labels the second.
+    const peer = document.createElement('div');
+    peer.className = 'approve-peer';
+    peer.textContent = 'from ' + r.ip;
+
     const code = document.createElement('div');
     code.className = 'approve-code';
     code.textContent = r.code;
 
     const who = document.createElement('div');
     who.className = 'approve-meta';
-    who.textContent = r.ip + ' · ' + _uaShort(r.ua);
+    who.textContent = 'browser (self-reported): ' + _uaShort(r.ua);
 
     const when = document.createElement('div');
     when.className = 'approve-meta';
@@ -180,6 +186,7 @@ function _approveCard(r) {
     actions.appendChild(deny);
     actions.appendChild(ok);
 
+    card.appendChild(peer);
     card.appendChild(code);
     card.appendChild(who);
     card.appendChild(when);

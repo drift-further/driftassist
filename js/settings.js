@@ -38,6 +38,22 @@ const _SETTINGS_SECTIONS = [
         ]
     },
     {
+        // delegates.prefixes is a list, which the panel has no field type for:
+        // edited in settings.json or through PATCH /api/settings.
+        key: 'delegates', label: 'Delegates', fields: [
+            { key: 'watch', label: 'Watch Delegates', type: 'toggle', options: ['on', 'off'] },
+            { key: 'alert_waiting', label: 'Alert: Waiting', type: 'toggle', options: ['on', 'off'] },
+            { key: 'alert_finished', label: 'Alert: Finished', type: 'toggle', options: ['on', 'off'] },
+            { key: 'alert_dead', label: 'Alert: Dead', type: 'toggle', options: ['on', 'off'] },
+            { key: 'alert_hold_sec', label: 'Waiting Hold', type: 'number', min: 3, max: 120, suffix: 's' },
+            { key: 'finish_quiet_sec', label: 'Finished After Quiet', type: 'number', min: 15, max: 600, suffix: 's' },
+            { key: 'stall_sec', label: 'Stalled After', type: 'number', min: 60, max: 3600, suffix: 's' },
+            { key: 'tmux_channel', label: 'tmux Channel', type: 'toggle', options: ['on', 'off'] },
+            { key: 'tmux_bell', label: 'tmux Bell', type: 'toggle', options: ['on', 'off'] },
+            { key: 'nest_tabs', label: 'Nest Delegate Tabs', type: 'toggle', options: ['on', 'off'] },
+        ]
+    },
+    {
         key: 'connection', label: 'Connection', fields: [
             { key: 'poll_interval_ms', label: 'Poll Interval', type: 'number', min: 1000, max: 30000, suffix: 'ms' },
             { key: 'ws_heartbeat_sec', label: 'WS Heartbeat', type: 'number', min: 1, max: 30, suffix: 's' },
@@ -75,7 +91,9 @@ const _SETTINGS_SECTIONS = [
         ]
     },
     {
-        key: 'access', label: 'Open Access', fields: [
+        key: 'access', label: 'Access', fields: [
+            { key: '_devices', label: 'Devices', type: 'button', text: 'Manage',
+              onClick: () => openDevicesSheet() },
             { key: 'open_networks', label: 'Allowed Networks', type: 'text' },
             { key: 'open_default_minutes', label: 'Default Duration', type: 'number', min: 1, max: 1440, suffix: ' min' },
             { key: 'open_max_minutes', label: 'Max Duration', type: 'number', min: 1, max: 1440, suffix: ' min' },
@@ -112,6 +130,12 @@ function renderSettings() {
         hdr.textContent = section.label;
         body.appendChild(hdr);
 
+        if (section.key === 'delegates' && !window.isSecureContext) {
+            const notice = document.createElement('p');
+            notice.className = 'settings-vault-warning';
+            notice.textContent = 'System notifications need HTTPS; Assist is open over HTTP';
+            body.appendChild(notice);
+        }
         const vals = SETTINGS[section.key] || {};
         for (const field of section.fields) {
             const row = document.createElement('div');

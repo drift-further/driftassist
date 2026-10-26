@@ -1,0 +1,38 @@
+{
+  "claude-permission": {
+    "pane_width": 120,
+    "pane_height": 40,
+    "pane_title": "✳ Curl example.com headers",
+    "agent": "claude 2.1.310",
+    "captured": "2026-10-25",
+    "composer_hidden": true,
+    "note": "live dialog replaced the ❯ composer row; no composer between rules below the footer"
+  },
+  "claude-ask": {
+    "pane_width": 120,
+    "pane_height": 40,
+    "pane_title": "✳ Curl example.com headers",
+    "agent": "claude 2.1.310",
+    "captured": "2026-10-25",
+    "composer_hidden": true,
+    "note": "live dialog replaced the ❯ composer row; no composer between rules below the footer"
+  },
+  "codex-approval": {
+    "pane_width": 120,
+    "pane_height": 40,
+    "pane_title": "[ . ] Action Required | Run curl header check | codex",
+    "agent": "codex 0.164.0 (-s read-only -a on-request)",
+    "captured": "2026-10-25",
+    "composer_hidden": true,
+    "note": "approval block replaced the '› Ask Codex to do anything' composer and the status footer"
+  },
+  "codex-faster-model": {
+    "pane_width": 120,
+    "pane_height": 40,
+    "pane_title": "codex",
+    "agent": "codex 0.153.4",
+    "captured": "synthetic",
+    "composer_hidden": "unverified",
+    "note": "not reproducible on demand; menu rows verbatim from the binary (routes/autoyes.py _CODEX_DOWNGRADE_RE comment), composer absence inferred from the 2026-09-05 incident record, not observed live"
+  }
+}

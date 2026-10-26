@@ -93,7 +93,7 @@ class PairCommandTests(unittest.TestCase):
                 redirect_stdout(out):
             code = pair.command(self._resolved(), 5, url="http://10.20.30.40:8089/")
         self.assertEqual(code, 0)
-        post.assert_called_once_with("/access/open", {"minutes": 5})
+        post.assert_called_once_with("/access/open", {"minutes": 5, "source": "pair"})
         text = out.getvalue()
         self.assertIn("http://10.20.30.40:8089/", text)
         self.assertIn("5 min", text)

@@ -7,11 +7,11 @@ import logging
 import os
 import threading
 
-from flask import Flask, g, jsonify, redirect, request
+from flask import Flask, request
 from flask_sock import Sock
 
 import shared.auth as auth
-from shared import listen, security
+from shared import auth_gate, listen, paths, security
 from shared.security import origin_allowed
 
 os.environ.setdefault("DISPLAY", ":0")
@@ -32,63 +32,10 @@ def create_app():
     # a rebound or cross-origin request is refused without consulting a cookie.
     security.register_request_guards(app)
 
-    # Shared-secret gate. The Origin allowlist above only stops a hostile *page*
-    # in the user's browser; it does nothing about a direct request from any
-    # device that can reach the port, and /api/commands/run runs arbitrary
-    # commands by design. This is what makes that unreachable without the token.
-    #
-    # /api/cli-proxy is exempt: containers call it from an isolated network
-    # (docker/claude-mount.sh iptables-pins them to the host's :8089) and have no
-    # way to hold the token. It is fail-closed on its own ASSIST_CLI_ALLOWED
-    # allowlist, and nginx restricts it to the container subnet.
-    # /health is a liveness probe (assist-ctl polls it to decide whether a
-    # restart succeeded) and carries no data worth gating.
-    # The device-approval pair is exempt for the same reason /login is: the
-    # caller has no token yet. Both are fenced inside shared.auth by the LAN
-    # allowlist, a pending cap, a per-IP cooldown and a single-use claim, and
-    # neither can reach a command-exec surface.
-    _AUTH_EXEMPT = {
-        "static_bp.login",
-        "poll_bp.cli_proxy",
-        "poll_bp.health",
-        "access_bp.access_request",
-        "access_bp.access_request_status",
-    }
-
-    @app.before_request
-    def _require_auth():
-        if request.endpoint in _AUTH_EXEMPT:
-            return None
-        if auth.request_authenticated(request):
-            return None
-        # Temporary open access. A live window admits ONE client from a
-        # configured LAN range to this one endpoint; loading the app shell is
-        # what mints its cookie, and the window is spent doing it. Every API
-        # route stays behind the cookie, so an open window is never itself a
-        # command-exec surface.
-        if (
-            request.endpoint == "static_bp.index"
-            and auth.is_onboarding_navigation(request)
-            and auth.consume_window(
-                auth.client_ip(request), request.headers.get("User-Agent", "")
-            )
-        ):
-            g.assist_onboard = True
-            return None
-        # A browser navigating to a page gets the login form; anything else
-        # (fetch, WebSocket handshake, curl) gets a machine-readable 401.
-        if "text/html" in (request.headers.get("Accept") or ""):
-            return redirect("/login")
-        return jsonify({"ok": False, "error": "Authentication required"}), 401
-
-    @app.after_request
-    def _issue_onboard_cookie(response):
-        # Unconditional, including on a non-200: the window is already spent,
-        # so handing the cookie over anyway costs a page reload rather than a
-        # second window.
-        if g.get("assist_onboard"):
-            auth.set_auth_cookie(response)
-        return response
+    # Shared-secret gate and the open window's device issuer (shared/auth_gate.py).
+    auth_gate.register_auth_gate(app)
+    # Content-Security-Policy on every response (shared/security.py).
+    security.register_csp(app)
 
     # CORS — echo only fixed-allowlist Origins, never emit a wildcard.
     @app.after_request
@@ -103,7 +50,6 @@ def create_app():
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Content-Security-Policy"] = "frame-ancestors 'none'"
         return response
 
     from shared.utils import gzip_json_response
@@ -124,6 +70,7 @@ def create_app():
     from routes.automate import automate_bp
     from routes.container import container_bp
     from routes.poll import poll_bp
+    from routes.delegates import delegates_bp
     from routes.completion import completion_bp
     from routes.studio import studio_bp
     from routes.studio_context import context_bp
@@ -142,6 +89,7 @@ def create_app():
     app.register_blueprint(automate_bp)
     app.register_blueprint(container_bp)
     app.register_blueprint(poll_bp)
+    app.register_blueprint(delegates_bp)
     app.register_blueprint(completion_bp)
     app.register_blueprint(studio_bp)
     app.register_blueprint(context_bp)
@@ -170,6 +118,7 @@ def start_application_backgrounds():
     starting any Flask, AutoYes, Automate, drafts, or Studio work.
     """
     from routes.autoyes import autoyes_scanner, restore_autoyes_from_settings
+    from routes.delegates import delegate_watcher
     from routes.automate import automate_recover
     from routes.drafts import start_sweeper as start_drafts_sweeper
     from routes.studio import studio_refresher
@@ -178,6 +127,7 @@ def start_application_backgrounds():
     from shared.updates import manager as update_manager
 
     threading.Thread(target=autoyes_scanner, daemon=True).start()
+    threading.Thread(target=delegate_watcher, daemon=True).start()
     threading.Thread(target=studio_refresher, daemon=True).start()
     threading.Thread(target=studio_observer, daemon=True).start()
     threading.Thread(target=studio_context_refresher, daemon=True).start()
@@ -237,7 +187,17 @@ def configure_logging():
 # WSGI/flask-run compatibility retains the established import-time app.  The
 # direct executable path below is separate so activation can remain observer-
 # only until the controller authorises the bind.
+def _enter_runtime(handoff=False):
+    """Layout ownership, the shared layout lock (held for this process's life)
+    and the migration marker — before anything imports shared.state."""
+    try:
+        return paths.enter_runtime(handoff=handoff)
+    except paths.LayoutError as exc:
+        raise SystemExit(f"[assist] {exc}")
+
+
 if __name__ != "__main__":
+    _layout_lock = _enter_runtime()
     configure_logging()
     app = create_app()
     start_application_backgrounds()
@@ -262,6 +222,7 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="127.0.0.1", help="Interface to bind")
     parser.add_argument("--park-handoff-fd", type=int, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    _layout_lock = _enter_runtime(handoff=args.park_handoff_fd is not None)
     try:
         addresses = listen.bind_addresses(args.host, os.environ.get("ASSIST_BIND"))
     except ValueError as exc:
