@@ -55,48 +55,46 @@ closed. The park-handoff startup path does not run this initializer.
 
 ## Temporary execution park
 
-While container host wiring migrates, Assist refuses exactly these execution
-intents:
+Assist refuses exactly two execution intents:
 
-- Automate start, hard relaunch, soft clear, soft resend, trust answer, and
-  auto-answer (`automate_start`, `automate_hard_relaunch`,
-  `automate_soft_clear`, `automate_soft_resend`, `automate_trust_answer`, and
-  `automate_auto_answer`).
 - The configured host CLI proxy (`configured_cli_proxy`, `/api/cli-proxy`).
-- Configured container image builds (`configured_image_build`,
-  `/api/container/build`).
+- Configured container image builds (`configured_image_build`). No route
+  reaches it any more: Automate and Container, which the park used to hold,
+  were retired (effort 621), and `/api/automate/*` and `/api/container/*`
+  answer 404.
 
 Saved commands, `/api/git/run`, project-venv creation, `/api/restart`, run-init,
 launch or duplicate with an init command, and the native folder picker remain
 available. There is no un-park API or CLI verb; changing the park phase does not
-enable a denied intent. For example, a refused Automate start returns HTTP 409
-with this exact body (the `intent` value identifies the refused operation):
+enable a denied intent. A refused CLI-proxy call returns HTTP 409 with this exact
+body (the `intent` value identifies the refused operation):
 
 ```json
 {
   "ok": false,
   "error": "container_launch_parked",
   "reason": "Container launch automation is temporarily parked while host wiring migrates.",
-  "intent": "automate_start"
+  "intent": "configured_cli_proxy"
 }
 ```
 
 ## Host CLI proxy
 
-Containers launched by Assist run on an isolated network with no LAN access, but they can reach the host on port 8089. This is used to expose a single host-side CLI tool inside the container without copying its dependencies in.
+`/api/cli-proxy` runs one host-side CLI tool for a caller that cannot hold the
+token. Its callers were containers launched by Automate, on an isolated network
+that could reach the host on port 8089; Automate and its container tooling were
+retired, so nothing in Assist calls it today.
 
-The proxy is currently in the temporary execution park: every request returns
-the 409 body documented above, with `"intent":"configured_cli_proxy"`, before a
-host subprocess starts. The configuration and inner subnet/allowlist gates
-below remain in place for a future release that enables the intent; there is no
-runtime un-park verb.
+The proxy is in the execution park: every request returns the 409 body
+documented above, with `"intent":"configured_cli_proxy"`, before a host
+subprocess starts. The configuration and inner allowlist gates below remain in
+place; there is no runtime un-park verb.
 
-Two pieces:
-
-1. **Host-side** (`.env`) — `ASSIST_CLI_BIN`, `ASSIST_CLI_DIR`, `ASSIST_CLI_ALLOWED`. The Flask server's `/api/cli-proxy` endpoint runs `ASSIST_CLI_BIN <args>` on the host and returns stdout/stderr/exit code. `ASSIST_CLI_ALLOWED` (comma-separated) restricts which first-arg subcommands are accepted; **leaving it empty disables the proxy (403)**.
-2. **Container-side** (`container_config.json` → `cli_proxy`) — set `enabled: true` and `container_command: "<name>"`. The image build installs a thin bash wrapper at `/usr/local/bin/<name>` that POSTs to the proxy.
-
-Example — exposing a host CLI called `mycli`:
+Host-side configuration (`.env`): `ASSIST_CLI_BIN`, `ASSIST_CLI_DIR`,
+`ASSIST_CLI_ALLOWED`. Behind the park, the endpoint runs `ASSIST_CLI_BIN <args>`
+on the host and returns stdout/stderr/exit code. `ASSIST_CLI_ALLOWED`
+(comma-separated) restricts which first-arg subcommands are accepted; **leaving
+it empty disables the proxy (403)**.
 
 ```bash
 # .env
@@ -105,16 +103,10 @@ ASSIST_CLI_DIR=/srv/mycli
 ASSIST_CLI_ALLOWED=status,build,deploy
 ```
 
-```json
-// container_config.json
-{
-  "cli_proxy": { "enabled": true, "container_command": "mycli" }
-}
-```
-
-Once a future release enables both parked intents, restart and rebuild the image. Inside a newly launched container, `mycli status` then runs against the host binary.
-
-The wrapper accepts `-f <path>` to base64-upload a file from the container — the host writes it to a temp dir and replaces the arg with the resolved path before invoking the CLI. The temp dir is removed whether or not the call succeeds.
+A request may carry base64 files; the host writes them to a temp dir and
+replaces each `__PROXY_FILE_<n>__` arg with the resolved path before invoking
+the CLI. The
+temp dir is removed whether or not the call succeeds.
 
 A `--timeout N` in the forwarded args sets how long the host waits, plus 30s of slack. It must be a non-negative integer — anything else is a 400 rather than a silent fallback — and it is capped at 600s, so a proxied call cannot hold a host subprocess open indefinitely.
 

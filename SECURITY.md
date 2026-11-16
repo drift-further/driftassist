@@ -130,25 +130,24 @@ carries inline code.
 
 ## Temporary execution park
 
-While container host wiring migrates, Assist refuses only these eight intents:
-`automate_start`, `automate_hard_relaunch`, `automate_soft_clear`,
-`automate_soft_resend`, `automate_trust_answer`, `automate_auto_answer`,
-`configured_cli_proxy`, and `configured_image_build`. That parks Automate's
-launch/relaunch/clear/resend/trust/answer execution, `/api/cli-proxy`, and
-`/api/container/build`. Saved commands, fixed git operations, project-venv
-creation, configured restart, terminal init/duplicate/run-init, and the native
-folder picker remain available.
+Assist refuses only two intents: `configured_cli_proxy` (`/api/cli-proxy`) and
+`configured_image_build` (no route reaches it since Container was retired).
+Saved commands, fixed git operations, project-venv creation, configured
+restart, terminal init/duplicate/run-init, and the native folder picker remain
+available. Automate and Container, which the park used to hold, were retired
+outright: their routes, panels and CLI verbs are gone, and `/api/automate/*`
+and `/api/container/*` answer 404.
 
 There is no API or CLI operation that un-parks an intent, and changing the
 published park phase does not change this deny-list. A refused HTTP operation
-returns 409; for Automate start the exact body is:
+returns 409; for the CLI proxy the exact body is:
 
 ```json
 {
   "ok": false,
   "error": "container_launch_parked",
   "reason": "Container launch automation is temporarily parked while host wiring migrates.",
-  "intent": "automate_start"
+  "intent": "configured_cli_proxy"
 }
 ```
 
@@ -303,8 +302,8 @@ must not be public.
    loopback-only, so a LAN install that skips this gets 403 on every POST.
 3. Narrow `access.open_networks` from the shipped all-private-ranges default to
    the one range your devices are on.
-4. Leave `ASSIST_CLI_ALLOWED` empty unless you use containers. Empty disables
-   `/api/cli-proxy` entirely.
+4. Leave `ASSIST_CLI_ALLOWED` empty. Empty disables `/api/cli-proxy` entirely,
+   behind the park's own 409.
 5. Leave Auto-Yes off until you have watched it answer a prompt you were
    expecting, and leave the all-sessions switch off unless you actually want
    every pane on the machine covered.

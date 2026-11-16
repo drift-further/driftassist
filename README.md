@@ -33,8 +33,7 @@ brew install python@3.12 tmux
 ```
 
 Optional: `xclip`, `xdotool` and `zenity` on Linux (clipboard, key-send, native
-folder picker), and `curl`. `jq` and `docker` are used only by the container
-tooling under `docker/`, which is parked.
+folder picker), and `curl`.
 
 ## Install
 
@@ -285,11 +284,6 @@ Once installed, `assist` manages everything:
 | `assist config` | Print resolved paths, ports, env |
 | `assist roster [<role> [--family F]]` | List the model roster, or print one role command for scripts |
 | `assist doctor` | Check prereqs, venv, .env, server health |
-| `assist container status` | Image info + running `claude-session-*` containers |
-| `assist container build` | Request a container image build (temporarily parked; returns 409) |
-| `assist container config` | Print current container build config |
-| `assist container extensions` | List registered extension bundles |
-| `assist container kill <name>` | Kill a running `claude-session-*` container |
 | `assist ls [--json] [--cwd]` | List sessions and panes, optionally with working directories |
 | `assist view <session> [-n N] [--pane P]` | Capture a session pane |
 | `assist send <session> [<text>\|--file F] [--enter] [--pane P] [--wait] [--timeout N] [--autoyes]` | Send text to a session pane, optionally waiting for it to settle |
@@ -302,7 +296,7 @@ Once installed, `assist` manages everything:
 | `assist studio [args]` | Execute the Studio CLI found on `PATH` — `sto` first, then `studio` — or fail if neither is installed |
 | `assist help` | Full command reference |
 
-The process commands delegate to `./assist-ctl`, or to the service unit once `assist service install` has run. The container verbs are parked with the rest of the container tooling and are left out of `assist help` until that ends. The container commands hit the running server's HTTP API (`/api/container/*`), so the server must be running for them to work.
+The process commands delegate to `./assist-ctl`, or to the service unit once `assist service install` has run.
 
 Each session verb (`ls`, `view`, `send`, `wait`, `launch`, `kill`, and `autoyes`) supports `-h`/`--help`; its generated help describes every argument and flag. `--autoyes` on `send` or `wait` is a temporary window scoped to that one wait and restores the prior state afterward. `assist autoyes` changes the persistent per-session setting instead; `--delay` is valid only with `--on`.
 
@@ -373,8 +367,7 @@ The most common variables:
 | `ASSIST_SKILLS_DIR` | Claude skills directory | `~/.claude/skills` |
 | `ASSIST_SESSION_INIT_CMD` | Command run in new tmux sessions | (none) |
 | `ASSIST_REPLY_TO` | Reply address used by the `assist send` callback hint | (the caller's own tmux session) |
-| `ASSIST_MOUNT_SCRIPT` | Container launch script used by Automate | `docker/claude-mount.sh` when that file exists; otherwise none |
-| `ASSIST_CLI_BIN` | Host CLI exposed to containers via `/api/cli-proxy` | (none — proxy disabled) |
+| `ASSIST_CLI_BIN` | Host CLI run by `/api/cli-proxy` (parked: 409 before it is read) | (none — proxy disabled) |
 | `ASSIST_OPENCODE_BIN` | OpenCode executable used by the Output reader | Auto-detected; see [docs/details.md](docs/details.md) |
 | `ASSIST_CLI_DIR` | Working directory used when invoking `ASSIST_CLI_BIN` | `~` |
 | `ASSIST_CLI_ALLOWED` | Comma-separated allowlist of subcommands (**empty = proxy disabled**) | (empty) |
@@ -497,11 +490,10 @@ Notes:
 ## Architecture
 
 - **`serve.py`** — Flask + flask-sock app factory, registers blueprints, starts background threads
-- **`routes/`** — 15 Flask blueprints: `access`, `automate`, `autoyes`, `commands`, `completion`, `container`, `drafts`, `git`, `input`, `poll`, `settings`, `static`, `studio`, `tabstate`, `terminal`; WebSocket `streaming` is registered separately
+- **`routes/`** — 18 Flask blueprints: `access`, `autoyes`, `commands`, `completion`, `delegates`, `drafts`, `git`, `input`, `opencode`, `outbox`, `poll`, `settings`, `static`, `studio`, `studio_context`, `tabstate`, `terminal`, `updates`; WebSocket `streaming` is registered separately
 - **`shared/`** — `state` (mutable state), `tmux` (tmux helpers), `utils`, `auth`, `security`, `agent_identity`, `agent_model`, `drafts`, `execution_park`, `launch_provenance`, `park_activation`, `segments`, `studio_client`, `tab_state`
 - **`js/`** — 21 ES6 frontend modules (no framework, no bundler)
 - **`css/`** — 15 CSS modules, mobile-first with custom properties
-- **`docker/`** — parameterized `Dockerfile`, `entrypoint.sh`, extension definitions (`extensions/*.json`), helper scripts
 - **`assist-ctl`** — low-level start/stop/restart/status shell script (called by `assist`); `assist-ctl run` is the foreground mode the service unit uses
 - **`bin/assist`** — high-level CLI installed to `~/.local/bin/assist`
 - **`docs/`** — [details.md](docs/details.md): the OpenCode Output reader, launch provenance, the temporary execution park and the host CLI proxy

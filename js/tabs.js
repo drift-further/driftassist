@@ -1002,7 +1002,7 @@ function _applyStaleGroup() {
         const row = _buildTabRow(tab, staleSet.has(tab));
         if (allTucked) {
             row.querySelector('.row-name').textContent += ' · ' + new Set(unit.children.map(p => p.session)).size + ' delegates';
-            row.addEventListener('click', () => { expandedDelegateParent = unit.session; refreshDelegateRail(); });
+            row.addEventListener('click', () => openDelegateRail(unit.session));
         }
         sheetBody.appendChild(row);
     });

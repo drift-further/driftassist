@@ -176,6 +176,10 @@ def token_path(checkout=APP_ROOT):
 # Every piece of runtime state, as (name in the checkout, root, name in that
 # root on the XDG layout). The legacy layout keeps all of them in the checkout
 # under their first name. `assist doctor` and the migration tool read this.
+# container_config.json, extensions.json and automate_state.json belong to the
+# retired Automate and Container features: nothing reads them, but an old
+# install's copies are the user's files, so a migration still carries them
+# (and a journal written before the retirement still validates).
 STATE_ITEMS = (
     (".env", "config", XDG_ENV_NAME),
     ("auth_token", "config", "auth_token"),

@@ -4,6 +4,7 @@ import json
 import sys
 import urllib.error
 import urllib.request
+import uuid
 
 from cli.config import resolve
 
@@ -65,6 +66,8 @@ def _request(
     path: str,
     data: dict | None,
     timeout: int,
+    raw_body=None,
+    extra_headers: dict | None = None,
 ) -> dict:
     resolved = resolve()
     if resolved.token is None:
@@ -78,9 +81,11 @@ def _request(
             path=path,
         )
 
-    headers = {"X-Assist-Token": resolved.token}
+    headers = {"X-Assist-Token": resolved.token, **(extra_headers or {})}
     body = None
-    if method == "POST":
+    if raw_body is not None:
+        body = raw_body
+    elif method == "POST":
         headers["Content-Type"] = "application/json"
         body = json.dumps({} if data is None else data).encode("utf-8")
 
@@ -135,3 +140,39 @@ def get(path: str) -> dict:
 
 def post(path: str, data: dict | None = None) -> dict:
     return _request("POST", path, data, timeout=30)
+
+
+def post_multipart(path: str, fields: dict, stream, size: int, timeout: int = 300) -> dict:
+    """POST `fields` and one file part named "file", streaming the file in 1 MB chunks."""
+    boundary = "assist-" + uuid.uuid4().hex
+    head = b"".join(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode("utf-8")
+        for key, value in fields.items()
+    )
+    # The part's filename is a constant: names travel in `fields`, so nothing a
+    # caller chose (a quote, a trailing backslash) can break this header.
+    head += (
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="upload.bin"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n"
+    ).encode("utf-8")
+    tail = f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+    # Exactly `size` bytes of the stream, never more, so the body always matches
+    # Content-Length; a stream that ends early is an error, not a short body
+    # the server would wait on.
+    def body():
+        yield head
+        left = size
+        while left > 0:
+            chunk = stream.read(min(1024 * 1024, left))
+            if not chunk:
+                raise ValueError(f"upload stream ended {left} bytes short of {size}")
+            left -= len(chunk)
+            yield chunk
+        yield tail
+
+    headers = {
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "Content-Length": str(len(head) + size + len(tail)),
+    }
+    return _request("POST", path, None, timeout, raw_body=body(), extra_headers=headers)

@@ -1,6 +1,5 @@
 import contextlib
 import io
-import json
 import os
 import subprocess
 import sys
@@ -13,7 +12,7 @@ from unittest.mock import patch
 from flask import Flask
 
 from cli import proc
-from routes import container, terminal
+from routes import terminal
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -89,29 +88,6 @@ class PublicPortabilityTests(unittest.TestCase):
             branch.index("write_assist_statusline"),
         )
 
-    def test_container_base_has_no_private_estate_bridges(self):
-        mount = (ROOT / "docker" / "claude-mount.sh").read_text(encoding="utf-8")
-        dockerfile = (ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
-        entrypoint = (ROOT / "docker" / "entrypoint.sh").read_text(encoding="utf-8")
-        for private_value in (
-            ".claude-messages",
-            "drift-further_",
-            "MP_DB_HOST",
-        ):
-            self.assertNotIn(private_value, mount)
-        self.assertNotIn("link-agents.sh", dockerfile)
-        self.assertFalse((ROOT / "docker" / "scripts" / "link-agents.sh").exists())
-        base_stack = "psycopg2-binary fastapi uvicorn httpx beautifulsoup4 pyyaml"
-        self.assertNotIn(base_stack, dockerfile)
-        extension = json.loads(
-            (ROOT / "docker" / "extensions" / "python-web-stack.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        self.assertTrue(any(base_stack in command for command in extension["install"]))
-        self.assertFalse(extension["enabled"])
-        self.assertNotIn("karen", entrypoint)
-
     def test_removed_redraw_helpers_stay_removed(self):
         streaming = (ROOT / "routes" / "streaming.py").read_text(encoding="utf-8")
         tmux = (ROOT / "shared" / "tmux.py").read_text(encoding="utf-8")
@@ -120,58 +96,6 @@ class PublicPortabilityTests(unittest.TestCase):
             self.assertNotIn(name, streaming)
         self.assertNotIn("pane_wants_ctrl_l_heal", tmux)
         self.assertNotIn("OPERATOR_TMUX_NON_CLAIM", park)
-
-
-class ExtensionIdTests(unittest.TestCase):
-    def setUp(self):
-        app = Flask("extension-id")
-        app.register_blueprint(container.container_bp)
-        self.client = app.test_client()
-
-    def test_rejects_invalid_supplied_and_derived_ids(self):
-        payloads = [
-            {"name": "Valid Name", "id": "../escape"},
-            {"name": "Valid Name", "id": "Uppercase"},
-            {"name": "Valid Name", "id": "_leading"},
-            {"name": "Valid Name", "id": ""},
-            {"name": "Valid Name", "id": "a" * 65},
-            {"name": "slash/name"},
-            {"name": ".hidden"},
-        ]
-        with patch.object(container.state, "add_extension") as add:
-            for payload in payloads:
-                with self.subTest(payload=payload):
-                    response = self.client.post(
-                        "/api/container/extensions", json=payload
-                    )
-                    self.assertEqual(response.status_code, 400)
-                    self.assertEqual(response.get_json()["error"], "Invalid extension id")
-            add.assert_not_called()
-
-    def test_rejects_non_string_name_without_raising(self):
-        with patch.object(container.state, "add_extension") as add:
-            for payload in ({"name": 123}, ["not", "an", "object"]):
-                with self.subTest(payload=payload):
-                    response = self.client.post(
-                        "/api/container/extensions", json=payload
-                    )
-                    self.assertEqual(response.status_code, 400)
-                    self.assertEqual(response.get_json()["error"], "Name is required")
-        add.assert_not_called()
-
-    def test_accepts_valid_supplied_and_derived_ids(self):
-        with patch.object(container.state, "add_extension", side_effect=lambda ext: [ext]):
-            supplied = self.client.post(
-                "/api/container/extensions",
-                json={"name": "Web Stack", "id": "web.stack_2-x"},
-            )
-            derived = self.client.post(
-                "/api/container/extensions", json={"name": "My Web Stack"}
-            )
-        self.assertEqual(supplied.status_code, 200)
-        self.assertEqual(supplied.get_json()["extensions"][0]["id"], "web.stack_2-x")
-        self.assertEqual(derived.status_code, 200)
-        self.assertEqual(derived.get_json()["extensions"][0]["id"], "my-web-stack")
 
 
 if __name__ == "__main__":

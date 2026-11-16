@@ -24,11 +24,6 @@ async function loadSettings() {
             _serverPid = d.pid;
             _serverUptime = d.uptime;
             CLAUDE_CMD = claudeCmdForMode(SETTINGS.server.claude_mode);
-            // Automate and Container ship hidden (index.html) and appear only
-            // once the server says their execution intents are no longer parked.
-            if (d.parked === false) {
-                document.querySelectorAll('[data-parked]').forEach(el => { el.style.display = ''; });
-            }
         }
     } catch(e) {}
 }
@@ -121,10 +116,6 @@ let _currentCommandsProject = '';
 let _activityDecayTimers = {};  // target -> setTimeout id
 let _lastScanContent = {};      // target -> last scanned tail (for change detection)
 
-// Per-project automation settings
-let _projectSettings = null;
-let _projectSettingsName = '';
-let _projSettingsOpen = false;
 
 // Idle fade: suppress for first few poll cycles so content detection can establish baseline
 const _pageLoadedAt = Date.now();

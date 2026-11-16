@@ -23,7 +23,7 @@ from shared.agent_identity import (
     child_pids,
     pane_root_start,
     refine_with_content,
-    resolve_process,
+    resolve_process_detail,
 )
 from shared.agent_model import observe as observe_model
 from shared import pane_scan
@@ -411,11 +411,16 @@ def consolidated_poll():
         enrich_panes_with_agents(panes)
 
     process_kinds = {}
+    # Panes whose tree holds two same-kind agents (task 2304), read off the
+    # same walk as the kind so the scan loop never walks a tree again.
+    refused_targets = set()
     for pane in panes:
-        process_kind = resolve_process(
+        process_kind, refused = resolve_process_detail(
             pane["target"], pane.get("pane_pid"), pane.get("command", "")
         )
         process_kinds[pane["target"]] = process_kind
+        if refused:
+            refused_targets.add(pane["target"])
         pane["agent_kind"] = process_kind or "unknown"
 
     result["sessions"] = panes
@@ -489,7 +494,8 @@ def consolidated_poll():
                     autoyes_by_session[session] = state.autoyes_enabled_for(session)
                 enabled, source = autoyes_by_session[session]
                 armed = autoyes_will_consider(
-                    target, enabled, source, process_kinds.get(target), agent_kind
+                    target, enabled, source, process_kinds.get(target), agent_kind,
+                    refused=target in refused_targets,
                 )
                 prompt = prompt_popup_info(_ANSI_ESCAPE_RE.sub("", tail), agent_kind, armed)
                 scan_results.append(
@@ -513,6 +519,9 @@ def consolidated_poll():
         result["gen"] = f"{pane_scan._SCAN_EPOCH}.{pane_scan._scan_rev}"
     result["scan"] = scan_results
     result["sudo_prompts"] = sudo_prompts
+    # Files an agent offered with `assist send-file`, for the popup and tray.
+    from routes.outbox import poll_block as outbox_poll_block
+    result["outbox"] = outbox_poll_block()
     # js/actions.js windows the pane with this, so the action bar and Auto-Yes
     # agree on what is a prompt at any Settings depth.
     result["detection_depth"] = detection_depth()
@@ -640,32 +649,6 @@ def consolidated_poll():
     # draft can be thousands of characters and this payload ships every 5s to
     # every open browser.
     result["drafts"] = drafts.poll_block()
-
-    # --- Automate status ---
-    with state.automate_lock:
-        if state.automate["active"] or state.automate["status"]:
-            now_ts = time.time()
-            result["automate"] = {
-                "active": state.automate["active"],
-                "status": state.automate["status"],
-                "session": state.automate["session"],
-                "project": state.automate["project"],
-                "elapsed_seconds": (
-                    round(now_ts - state.automate["started_at"], 1)
-                    if state.automate["started_at"]
-                    else 0
-                ),
-                "idle_seconds": (
-                    round(now_ts - state.automate["last_output_at"], 1)
-                    if state.automate["last_output_at"]
-                    else 0
-                ),
-                "timeout_minutes": state.automate["timeout_minutes"],
-                "continuous": state.automate["continuous"],
-                "max_iterations": state.automate["max_iterations"],
-                "iterations_completed": state.automate["iterations_completed"],
-                "stop_after": state.automate.get("stop_after", ""),
-            }
 
     # --- Claude session metadata ---
     if state.tmux_target:

@@ -135,20 +135,16 @@ class SettingsPatchValidationTests(_TempState):
 
     def test_project_bad_types_are_refused(self):
         for body in ({"autoyes": {"enabled_default": "yes"}},
-                     {"triggers": {"done_signals": "done"}},
-                     {"triggers": {"done_signals": [1, {}]}},
-                     {"automate": {"timeout": -1}}):
+                     {"autoyes": {"shell_ok": "yes"}},
+                     {"autoyes": {"delay": [5]}}):
             with self.subTest(body=body):
                 self.assertEqual(self._project(body).status_code, 400)
 
     def test_project_good_values_still_save(self):
-        resp = self._project({"triggers": {"done_signals": ["DONE"], "done_idle_sec": 60}})
+        resp = self._project({"autoyes": {"delay": 7, "shell_ok": True}})
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(
-            state.get_project_setting("demo", "triggers", "done_signals"), ["DONE"]
-        )
-        resp = self._project({"automate": {"stop_after": "18:30"}})
-        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(state.get_project_setting("demo", "autoyes", "delay"), 7)
+        self.assertIs(state.get_project_setting("demo", "autoyes", "shell_ok"), True)
 
 
 class DelegateSettingsTests(_TempState):

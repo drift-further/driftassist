@@ -67,6 +67,17 @@ CORPUS = [
     ("selected yes", "claude",
      _dialog(_RULE, "  ❯ Yes", "    2. No", "Enter to select · Esc to cancel"),
      "selected-yes"),
+    # Task 2304: selected-Yes without the structure the fixture above leans on.
+    ("selected yes, no divider", "claude",
+     _dialog("  Do you want to make this edit to serve.py?", "  ❯ Yes",
+             "    No, and tell Claude what to do differently (esc)",
+             "Enter to select · Esc to cancel"), "selected-yes"),
+    ("selected yes, footer more than three rows below", "claude",
+     _dialog(_RULE, "  Do you want to proceed?", "  ❯ Yes",
+             "    Yes, and don't ask again for commands like `deploy",
+             *[f"       --flag-{i:02d} /srv/common/path/{i:02d}" for i in range(4)],
+             "    No, and tell Claude what to do differently (esc)",
+             "Enter to select · Esc to cancel"), "selected-yes"),
     ("opencode permission", "opencode",
      "\n".join(["△ Permission required", "Access external directory",
                 "  Allow once  Allow always  Reject"]), "opencode-permission"),
@@ -99,6 +110,28 @@ CORPUS = [
     ("selected yes above a divider, no top rule", "claude",
      _dialog("  ❯ Yes: ship it", "    2. No: wait", _RULE, "    3. Chat about this",
              "Enter to select · Esc to cancel"), None),
+    # Task 2304 near-misses. No footer: the dialog was answered and erased, or
+    # it is not a menu this detector knows; either way the human decides.
+    ("selected yes, no footer (answered, dialog erased)", "claude",
+     _dialog("  ❯ Yes", "    No", "", "● Bash(ls)", "  ⎿  serve.py"), None),
+    ("selected yes, no footer", "claude",
+     _dialog(_RULE, "  Do you want to proceed?", "  ❯ Yes", "    No"), None),
+    # A "❯ Yes" row quoted in the pane (a README, a diff of this detector) above
+    # a live menu whose cursor sits on something else. Enter would pick that
+    # other option, so the stale row must not count as the menu's selection.
+    ("quoted ❯ Yes above a non-Yes menu, no divider", "claude",
+     _dialog("  The dialog renders as:", "  ❯ Yes", "    No", "",
+             "  Which should we do next?", "  ❯ Rewrite the scanner",
+             "    Document it instead", "Enter to select · Esc to cancel"), None),
+    ("quoted ❯ Yes more than three rows above a non-Yes menu's footer", "claude",
+     _dialog("  ❯ Yes", "  (that was the old dialog)", _RULE,
+             "  Retry the request?", "  ❯ Retry with a faster model",
+             "    Keep waiting", "    Cancel", "Enter to select · Esc to cancel"), None),
+    # codex draws its cursor as "›"; its live selection still outranks the quote.
+    ("quoted ❯ Yes above a codex menu whose option 1 is not Yes", "codex",
+     "\n".join(["  ❯ Yes", "    No", "", "  Undo the last turn?",
+                "› 1. Undo it", "  2. Keep it",
+                "  Press enter to confirm or esc to cancel"]), None),
     ("codex downgrade menu is not a Yes", "codex",
      "\n".join(["› 1. Retry with a faster model", "  2. Dismiss and keep waiting",
                 "  Press enter to confirm or esc to cancel"]), None),
@@ -128,6 +161,10 @@ CORPUS = [
      _dialog(_RULE, "  1. Yes", "  2. No", "Enter to select · Esc to cancel",
              *[f"  todo {i}" for i in range(40 - len(_STATUS))]),
      {8: None, 12: "numbered-yes"}),
+    ("selected yes, footer 40 rows up", "claude",
+     _dialog(_RULE, "  ❯ Yes", "    No", "Enter to select · Esc to cancel",
+             *[f"  todo {i}" for i in range(40 - len(_STATUS))]),
+     {8: None, 12: "selected-yes"}),
     # Judge #6: a long wrapped option 2 and a task panel below the footer. The
     # server saw option 1 in its -60 capture plus the screen; the browser, cut to
     # 60 rows, did not, so Auto-Yes answered what the action bar did not offer.

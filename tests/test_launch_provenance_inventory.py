@@ -50,8 +50,6 @@ class LaunchProvenanceInventoryTests(unittest.TestCase):
             "duplicate",
             "saved_command_split",
             "temporary_git",
-            "automate_start",
-            "automate_hard_relaunch",
         }
         production = "\n".join(
             path.read_text(encoding="utf-8")
@@ -64,12 +62,13 @@ class LaunchProvenanceInventoryTests(unittest.TestCase):
         )
         for surface in routed:
             self.assertIn(f'surface="{surface}"', production)
-        for surface in (
-            "existing_terminal",
-            "automate_reconnect",
-            "automate_startup_recovery",
-        ):
-            self.assertIn(f'surface="{surface}"', production)
+        self.assertIn('surface="existing_terminal"', production)
+        # Automate's two creation and two adoption surfaces went with it
+        # (effort 621 phase 6). An old store may still carry their labels;
+        # the store takes any label, so those records stay readable.
+        for retired in ("automate_start", "automate_hard_relaunch",
+                        "automate_reconnect", "automate_startup_recovery"):
+            self.assertNotIn(f'surface="{retired}"', production)
         self.assertNotIn("record_created(", production)
 
         helper = (ROOT / "shared" / "tmux.py").read_text(encoding="utf-8")

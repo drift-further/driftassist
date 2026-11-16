@@ -12,6 +12,10 @@
 //   question  "Question pending" for a prompt the action bar detects in a tab
 //             you are not looking at, unless Auto-Yes is about to answer it.
 //             It answers nothing; its one button brings up the tab.
+//   file      "File from <agent> · <session>" for a file an agent offered with
+//             `assist send-file` (js/outbox.js). Download takes it; it never
+//             hides on a timer, since closing it early would lose nothing but
+//             a missed one would cost a resend. The files tray keeps it too.
 //
 // Settings → UI & Behavior: popup_autohide "on" hides each popup after
 // popup_seconds; "off" keeps it until acted on, closed with ×, or the prompt
@@ -27,7 +31,7 @@ document.body.appendChild(_promptPopupHost);
 const _promptPopups = new Map();
 // Keys already shown in this browser, per kind. A prompt pops once however long
 // it waits; a new sudo (new pid) or a new prompt (new fingerprint) pops again.
-const _promptPopupSeen = {sudo: new Set(), question: new Set(), delegate: new Set()};
+const _promptPopupSeen = {sudo: new Set(), question: new Set(), delegate: new Set(), file: new Set()};
 // key -> {kind, build}: live prompts waiting for a slot. Shared by both kinds and
 // kept in arrival order, so a sudo already waiting is not overtaken by questions
 // that arrive later.
@@ -85,7 +89,7 @@ function _promptPopupWhere(target, session) {
     return agent || shortName(session || target.split(':')[0]);
 }
 
-// spec: {title, detail, detailTitle, button: {label, color, run}}
+// spec: {title, detail, detailTitle, note, sticky, button: {label, color, run}}
 function _showPromptPopup(kind, key, spec) {
     const el = document.createElement('div');
     el.className = 'prompt-popup ' + kind;
@@ -102,6 +106,12 @@ function _showPromptPopup(kind, key, spec) {
     detail.title = spec.detailTitle || spec.detail;
     text.appendChild(where);
     text.appendChild(detail);
+    if (spec.note) {
+        const note = document.createElement('div');
+        note.className = 'prompt-popup-note';
+        note.textContent = spec.note;
+        text.appendChild(note);
+    }
     el.appendChild(text);
 
     const actions = document.createElement('div');
@@ -111,7 +121,7 @@ function _showPromptPopup(kind, key, spec) {
     el.appendChild(actions);
     el.appendChild(_promptPopupButton(key, '×', 'prompt-popup-close', () => {}));
 
-    const autoHide = _promptPopupAutoHide();
+    const autoHide = !spec.sticky && _promptPopupAutoHide();
     if (autoHide) {
         const timer = document.createElement('div');
         timer.className = 'prompt-popup-timer';
@@ -209,6 +219,25 @@ async function _sudoPopupSend(prompt) {
     } catch (e) {
         showFlash('error', 'Offline');
     }
+}
+
+// ---------------------------------------------------------------- files
+
+// offers: /poll's `outbox`, the files waiting for a download.
+function _applyFileOffers(offers) {
+    _syncPromptPopups('file', (offers || [])
+        .filter(o => o && o.id)
+        .map(o => ({key: 'file:' + o.id, build: () => _filePopupSpec(o)})));
+}
+
+function _filePopupSpec(offer) {
+    return {
+        title: 'File from ' + (offer.sender || 'an agent'),
+        detail: offer.name + ' · ' + outboxSize(offer.size),
+        note: offer.secret_hint ? 'looks like a private key' : '',
+        sticky: true,
+        button: {label: 'Download', color: 'green', run: () => outboxDownload(offer.id)},
+    };
 }
 
 // ---------------------------------------------------------------- questions

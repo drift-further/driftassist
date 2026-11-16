@@ -205,22 +205,6 @@ DEFAULT_PROJECT_SETTINGS = {
         # shell panes: apt, ssh host keys and any (y/n) that shell prints.
         "shell_ok": False,
     },
-    "automate": {
-        "default_prompt": "",
-        "timeout": 10,
-        "continuous": True,
-        "max_iterations": 0,
-        "stop_after": "",
-    },
-    "triggers": {
-        "done_signals": [],
-        "done_idle_sec": 60,
-        "trust_auto_approve": True,
-        "relaunch_wait_sec": 30,
-    },
-    "packages": {
-        "pip": [],
-    },
 }
 
 
@@ -612,147 +596,6 @@ GLOBAL_SKILLS_DIR = Path(
 )
 
 
-# ---------------------------------------------------------------------------
-# Container config — global container build/runtime settings
-# ---------------------------------------------------------------------------
-CONTAINER_CONFIG_FILE = DATA_DIR / "container_config.json"
-_container_config = {}
-_container_config_lock = threading.Lock()
-
-CONTAINER_IMAGE_NAME = "drift-assist-container"
-# The pre-rename default. Status reports it for one release while it is the
-# only image built; a build always writes CONTAINER_IMAGE_NAME.
-LEGACY_CONTAINER_IMAGE_NAME = "claude-assist-container"
-
-DEFAULT_CONTAINER_CONFIG = {
-    "base": {
-        "node_version": "20",
-        "python_version": "3",
-        "claude_version": "latest",
-    },
-    "resources": {
-        "memory": "16g",
-        "cpus": "4",
-        "pids_limit": 512,
-    },
-    "network": {
-        "bind_address": "127.0.0.1",
-        "allow_lan": False,
-        "allow_ports": [5432, 8089],
-        "gateway_host": "",
-    },
-    "packages": {
-        "pip": [],
-        "system": [],
-    },
-    "image": {
-        "name": CONTAINER_IMAGE_NAME,
-        "built_at": None,
-        "build_hash": None,
-    },
-    "cli_proxy": {
-        "enabled": False,
-        "container_command": "",
-    },
-}
-
-
-def load_container_config():
-    global _container_config
-    _container_config = read_json_state(CONTAINER_CONFIG_FILE, {}, expect=dict)
-
-
-def _save_container_config_locked():
-    """Write container config to disk. Caller must hold _container_config_lock."""
-    try:
-        atomic_write_json(CONTAINER_CONFIG_FILE, _container_config)
-    except OSError:
-        pass
-
-
-def get_container_config():
-    """Return merged defaults + saved config (deep copy)."""
-    with _container_config_lock:
-        saved = copy.deepcopy(_container_config)
-    return _deep_merge(copy.deepcopy(DEFAULT_CONTAINER_CONFIG), saved)
-
-
-def patch_container_config(patch):
-    global _container_config
-    with _container_config_lock:
-        _container_config = _deep_merge(_container_config, patch)
-        _save_container_config_locked()
-        result = _deep_merge(
-            copy.deepcopy(DEFAULT_CONTAINER_CONFIG), copy.deepcopy(_container_config)
-        )
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Extensions — registered SDK/tool bundles for the container
-# ---------------------------------------------------------------------------
-EXTENSIONS_FILE = DATA_DIR / "extensions.json"
-BUILTIN_EXTENSIONS_DIR = APP_ROOT / "docker" / "extensions"
-_extensions = []
-_extensions_lock = threading.Lock()
-
-
-def load_extensions():
-    global _extensions
-    _extensions = read_json_state(EXTENSIONS_FILE, [], expect=list)
-    if not _extensions and BUILTIN_EXTENSIONS_DIR.is_dir():
-        for f in sorted(BUILTIN_EXTENSIONS_DIR.glob("*.json")):
-            try:
-                ext = json.loads(f.read_text())
-                _extensions.append(ext)
-            except (OSError, ValueError, json.JSONDecodeError):
-                pass
-        if _extensions:
-            save_extensions()
-
-
-def _save_extensions_locked():
-    """Write extensions to disk. Caller must hold _extensions_lock."""
-    try:
-        atomic_write_json(EXTENSIONS_FILE, _extensions)
-    except OSError:
-        pass
-
-
-def save_extensions():
-    with _extensions_lock:
-        _save_extensions_locked()
-
-
-def get_extensions():
-    with _extensions_lock:
-        return copy.deepcopy(_extensions)
-
-
-def add_extension(ext):
-    with _extensions_lock:
-        _extensions.append(ext)
-        _save_extensions_locked()
-    return get_extensions()
-
-
-def update_extension(ext_id, patch):
-    with _extensions_lock:
-        for ext in _extensions:
-            if ext.get("id") == ext_id:
-                ext.update(patch)
-                break
-        _save_extensions_locked()
-    return get_extensions()
-
-
-def delete_extension(ext_id):
-    with _extensions_lock:
-        _extensions[:] = [e for e in _extensions if e.get("id") != ext_id]
-        _save_extensions_locked()
-    return get_extensions()
-
-
 def _apply_settings():
     """Update module-level convenience vars from current settings. Called after load/patch."""
     global MAX_HISTORY, MAX_UPLOAD_SIZE, PROJECTS_DIR, AUTOYES_DELAY
@@ -843,32 +686,6 @@ def autoyes_enabled_for(session):
     return True, "global"
 
 # ---------------------------------------------------------------------------
-# Automate state
-# ---------------------------------------------------------------------------
-IMMEDIATE_NOTICE_FILENAME = "immediatenotice.md"
-AUTOMATE_STATE_FILE = DATA_DIR / "automate_state.json"
-
-automate = {
-    "active": False,
-    "project": None,
-    "project_path": None,
-    "session": None,
-    "container": None,
-    "prompt": None,
-    "timeout_minutes": 10,
-    "started_at": None,
-    "last_output_at": None,
-    "last_output_hash": None,
-    "done_signal_at": None,
-    "status": None,
-    "continuous": True,
-    "max_iterations": 0,
-    "iterations_completed": 0,
-    "stop_after": "",
-}
-automate_lock = threading.Lock()
-
-# ---------------------------------------------------------------------------
 # WebSocket state
 # ---------------------------------------------------------------------------
 ws_clients = []  # list of {"ws", "lock", "target", "lines", "last_send"} dicts
@@ -937,20 +754,7 @@ def load_idle_state():
 load_idle_state()
 load_settings()
 load_project_settings()
-load_container_config()
-load_extensions()
 
-
-# ---------------------------------------------------------------------------
-# Claude-mount script path
-# ---------------------------------------------------------------------------
-_mount_env = os.environ.get("ASSIST_MOUNT_SCRIPT", "")
-if _mount_env:
-    CLAUDE_MOUNT_SCRIPT = Path(_mount_env)
-else:
-    # Auto-detect from repo docker/ directory
-    _default_mount = APP_ROOT / "docker" / "claude-mount.sh"
-    CLAUDE_MOUNT_SCRIPT = _default_mount if _default_mount.exists() else None
 
 # Claude env vars to strip from tmux sessions
 CLAUDE_ENV_VARS = ("CLAUDECODE",)

@@ -7,7 +7,8 @@
 - After a token rotation every tab sat on a frozen terminal. A 401 from /poll,
   or a WebSocket that never opens because its handshake was refused, sends the
   browser to /login.
-- A project setting reached innerHTML unescaped in `_projStepper`.
+- A project setting reached innerHTML unescaped in `_projStepper` (that panel
+  was retired with Automate in effort 621 phase 6, and its test with it).
 
 The JS checks are source guards: the suite has no browser. Each pins the call
 that carries the behaviour, so a refactor that drops it fails here.
@@ -307,13 +308,6 @@ class AuthLostTests(unittest.TestCase):
         probe = _function(terminal, "_wsCheckAuth")
         self.assertIn("authLost(resp)", probe)
         self.assertIn("clearTimeout(_termWsReconnectTimer)", probe)
-
-
-class ProjectStepperEscapeTests(unittest.TestCase):
-    def test_stepper_value_is_escaped(self):
-        body = _function(_js("monitor.js"), "_projStepper")
-        self.assertIn("${escHtml(String(val))}", body)
-        self.assertNotRegex(body, r">\$\{val\}<")
 
 
 if __name__ == "__main__":

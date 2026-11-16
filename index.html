@@ -10,24 +10,23 @@
     <link rel="stylesheet" href="/css/base.css?v=2">
     <link rel="stylesheet" href="/css/status-bar.css?v=6">
     <link rel="stylesheet" href="/css/input.css?v=9">
-    <link rel="stylesheet" href="/css/terminal.css?v=23">
+    <link rel="stylesheet" href="/css/terminal.css?v=24">
     <link rel="stylesheet" href="/css/split-view.css?v=3">
     <link rel="stylesheet" href="/css/opencode.css?v=2">
     <link rel="stylesheet" href="/css/drawers.css?v=6">
     <link rel="stylesheet" href="/css/widgets.css?v=2">
-    <link rel="stylesheet" href="/css/commands.css?v=2">
+    <link rel="stylesheet" href="/css/commands.css?v=3">
     <link rel="stylesheet" href="/css/autocomplete.css?v=2">
     <link rel="stylesheet" href="/css/segments.css?v=3">
-    <link rel="stylesheet" href="/css/container.css?v=2">
     <link rel="stylesheet" href="/css/studio.css?v=10">
     <link rel="stylesheet" href="/css/access.css?v=5">
     <link rel="stylesheet" href="/css/chrome.css?v=7">
-    <link rel="stylesheet" href="/css/notifications.css?v=4">
+    <link rel="stylesheet" href="/css/notifications.css?v=6">
     <link rel="stylesheet" href="/css/updates.css?v=1">
 </head>
 <body>
     <script src="/js/prepaint.js?v=1"></script>
-    <script src="/js/actions-registry.js?v=3"></script>
+    <script src="/js/actions-registry.js?v=5"></script>
 
     <!-- Top chrome: a utility bar over a full-width session rail. The badge
          headroom the tabs need lives INSIDE the rail's scrollport (8px of top
@@ -67,6 +66,7 @@
                  the top right and the tabs flow around it — a float needs a
                  single box. Studio's trigger lives beside the terminal now. -->
             <div class="chrome-actions">
+                <button type="button" class="outbox-badge" id="outbox-badge" data-action="openOutboxSheet" title="Files waiting" hidden>&#11015; 0</button>
                 <button class="btn-actions" id="btn-actions" data-action="toggleActionsDeck" aria-expanded="false" aria-controls="actions-deck" title="Open all actions"><span class="actions-menu-bars" aria-hidden="true">&#8801;</span>Actions</button>
             </div>
         </div>
@@ -426,10 +426,8 @@
                         <div class="actions-grid">
                             <button class="actions-item workspace plus-proj" data-glyph="&#9638;" data-action="toggleProjects" data-then="closeActionsDeck">Projects</button>
                             <button class="actions-item workspace plus-git" data-glyph="&#9314;" id="btn-git" data-action="toggleGitPanel" data-then="closeActionsDeck">Git</button>
-                            <button data-parked style="display:none" class="actions-item workspace plus-container" data-glyph="&#11041;" data-action="toggleContainerPanel" data-then="closeActionsDeck">Container</button>
                             <button class="actions-item workspace plus-studio" data-action="closeActionsDeck" data-then="openStudio">Studio</button>
                             <button class="actions-item workspace plus-skills" data-glyph="/" data-action="toggleSkillsPanel" data-then="closeActionsDeck">/Skills</button>
-                            <button data-parked style="display:none" class="actions-item workspace plus-auto" data-glyph="&#9654;" id="btn-auto" data-action="toggleAutoPanel" data-then="closeActionsDeck">Automate</button>
                             <button class="actions-item workspace plus-settings" data-glyph="&#9881;" data-action="toggleSettingsPanel" data-then="closeActionsDeck">Settings</button>
                             <button class="actions-item workspace" data-glyph="&#8635;" data-action="openSoftwareUpdate"><span id="update-menu-label">Software updates</span></button>
                         </div>
@@ -499,81 +497,6 @@
                     <button class="cmd-panel-close" data-action="toggleCmdPanel">&#x2715;</button>
                 </div>
                 <div class="cmd-list" id="cmd-list"></div>
-            </div>
-
-            <div class="auto-panel" id="auto-panel">
-                <div class="auto-panel-header">
-                    <span class="auto-panel-title">Automate Run</span>
-                    <button class="auto-panel-close" data-action="toggleAutoPanel">&#x2715;</button>
-                </div>
-                <div class="auto-panel-body">
-                    <textarea class="auto-prompt" id="auto-prompt" rows="3" placeholder="What should Claude do?"></textarea>
-                    <div class="auto-controls">
-                        <label class="auto-check-label">
-                            <input type="checkbox" class="auto-check" id="auto-continuous" checked>
-                            <span>Continuous</span>
-                        </label>
-                        <label class="auto-timeout-label" id="auto-iter-label">
-                            Runs
-                            <input type="number" class="auto-timeout" id="auto-iterations" value="1" min="1" max="999" disabled>
-                        </label>
-                        <label class="auto-timeout-label">
-                            Idle
-                            <input type="number" class="auto-timeout" id="auto-timeout" value="10" min="1" max="120">
-                            <span class="auto-timeout-unit">min</span>
-                        </label>
-                        <label class="auto-timeout-label">
-                            Stop@
-                            <input type="time" class="auto-timeout auto-stop-after" id="auto-stop-after" value="">
-                        </label>
-                        <label class="auto-timeout-label">
-                            Cmd
-                            <select class="auto-timeout auto-claude-cmd" id="auto-claude-cmd">
-                                <option value="">default</option>
-                                <option value="claude">claude</option>
-                                <option value="npx @anthropic-ai/claude-code">npx</option>
-                            </select>
-                        </label>
-                        <button class="auto-run-btn" id="auto-run-btn" data-action="automateRun">Run</button>
-                        <button class="auto-stop-btn hidden" id="auto-stop-btn" data-action="automateStop">Stop</button>
-                    </div>
-                    <div class="auto-status hidden" id="auto-status"></div>
-                    <div class="auto-proj-settings" id="auto-proj-settings">
-                        <button class="auto-proj-toggle" data-action="toggleProjectSettings">
-                            <span class="auto-proj-arrow" id="auto-proj-arrow">&#9654;</span>
-                            <span>Project Settings</span>
-                            <span class="auto-proj-name" id="auto-proj-name"></span>
-                        </button>
-                        <div class="auto-proj-body hidden" id="auto-proj-body"></div>
-                    </div>
-                </div>
-            </div>
-
-            <div class="container-panel" id="container-panel">
-                <div class="container-panel-header">
-                    <span class="container-panel-title">Container</span>
-                    <button class="container-panel-close" data-action="toggleContainerPanel">&#x2715;</button>
-                </div>
-                <div class="container-panel-body">
-                    <div class="ctr-section" id="ctr-status">
-                        <div class="ctr-status-loading">Loading...</div>
-                    </div>
-                    <button class="ctr-section-toggle" data-action="toggleCtrSection" data-arg='"packages"'>
-                        <span class="ctr-arrow" id="ctr-arrow-packages">&#9654;</span>
-                        <span>Packages</span>
-                    </button>
-                    <div class="ctr-section-body hidden" id="ctr-body-packages"></div>
-                    <button class="ctr-section-toggle" data-action="toggleCtrSection" data-arg='"extensions"'>
-                        <span class="ctr-arrow" id="ctr-arrow-extensions">&#9654;</span>
-                        <span>Extensions</span>
-                    </button>
-                    <div class="ctr-section-body hidden" id="ctr-body-extensions"></div>
-                    <button class="ctr-section-toggle" data-action="toggleCtrSection" data-arg='"build"'>
-                        <span class="ctr-arrow" id="ctr-arrow-build">&#9654;</span>
-                        <span>Build</span>
-                    </button>
-                    <div class="ctr-section-body hidden" id="ctr-body-build"></div>
-                </div>
             </div>
 
             <div class="studio-panel" id="studio-panel" role="complementary" aria-label="Studio context" aria-hidden="true">
@@ -784,7 +707,7 @@
         </div>
     </div>
 
-    <script src="/js/state.js?v=6"></script>
+    <script src="/js/state.js?v=7"></script>
     <script src="/js/target-hold.js?v=1"></script>
     <script src="/js/poll-sync.js?v=2"></script>
     <script src="/js/ui.js?v=7"></script>
@@ -795,25 +718,25 @@
     <script src="/js/drafts.js?v=5"></script>
     <script src="/js/keylabels.js?v=4"></script>
     <script src="/js/keycombo.js?v=2"></script>
-    <script src="/js/terminal.js?v=34"></script>
+    <script src="/js/terminal.js?v=35"></script>
     <script src="/js/opencode.js?v=2"></script>
-    <script src="/js/actions.js?v=20"></script>
+    <script src="/js/actions.js?v=21"></script>
     <script src="/js/commands.js?v=5"></script>
-    <script src="/js/container.js?v=1"></script>
     <script src="/js/studio.js?v=4"></script>
     <script src="/js/studio-context.js?v=6"></script>
     <script src="/js/access.js?v=4"></script>
     <script src="/js/devices.js?v=2"></script>
     <script src="/js/chrome.js?v=3"></script>
-    <script src="/js/monitor.js?v=12"></script>
+    <script src="/js/monitor.js?v=13"></script>
     <script src="/js/notifications.js?v=1"></script>
-    <script src="/js/prompt-popup.js?v=5"></script>
-    <script src="/js/tabs.js?v=16"></script>
+    <script src="/js/prompt-popup.js?v=6"></script>
+    <script src="/js/outbox.js?v=2"></script>
+    <script src="/js/tabs.js?v=17"></script>
     <script src="/js/updates.js?v=1"></script>
     <script src="/js/settings.js?v=13"></script>
-    <script src="/js/split-view.js?v=4"></script>
-    <script src="/js/delegate-nav.js?v=4"></script>
-    <script src="/js/app.js?v=33"></script>
+    <script src="/js/split-view.js?v=5"></script>
+    <script src="/js/delegate-nav.js?v=5"></script>
+    <script src="/js/app.js?v=35"></script>
     <script src="/js/selection.js?v=2"></script>
 </body>
 </html>

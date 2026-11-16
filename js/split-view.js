@@ -244,15 +244,31 @@ const SplitView = {
             dead:false, identity:null, content:'', paused:false, lines:2000};
     },
     same(a,b) { return !!a && !!b && a.pane_id === b.pane_id && a.pane_pid === String(b.pane_pid) && a.created === b.created; },
+    // true: the server confirmed this pane generation. false: it refused it.
+    // undefined: no answer (offline, signed out), which proves nothing either way.
     async identify(record, expected = null) {
         try {
             const resp = await fetch('/terminal/identity?target='+encodeURIComponent(record.pane_id));
             if (authLost(resp)) return;
             const data = await resp.json();
             if (data.ok && String(data.identity.pane_pid) === record.pane_pid
-                && (!expected || JSON.stringify(data.identity) === JSON.stringify(expected))) record.identity = data.identity;
-            else { record.dead = true; record.identity = null; }
+                && (!expected || JSON.stringify(data.identity) === JSON.stringify(expected))) { record.identity = data.identity; return true; }
+            record.dead = true; record.identity = null; return false;
         } catch (e) { /* no identity means no input */ }
+    },
+    // A pane can drop out of one tab list without ending: a /poll whose tmux
+    // list-panes failed lists no panes at all. Once a later list shows the same
+    // generation again and the server confirms the identity it had, the view
+    // comes back. A refused identity is final.
+    async revive(i, r) {
+        r.reviving = true;
+        const confirmed = await this.identify(r, r.expected);
+        r.reviving = false;
+        if (confirmed === false) { r.expected = null; return; }
+        if (!confirmed || !this.enabled || this.slots[i] !== r) return;
+        r.dead = false;
+        if (i === this.active) captureTerminal(); else this.other.watch(r);
+        this.update();
     },
     openPicker(slot=1) {
         if (!_termTarget) return;
@@ -271,7 +287,8 @@ const SplitView = {
     openWith(target) {
         const pane = _sessionPanes.find(p => p.target === target);
         if (!pane || !pane.pane_id || target === _termTarget) { this.openPicker(this.enabled ? 1-this.active : 1); return; }
-        if (this.slots.some(r => !r.dead && r.pane_id === pane.pane_id)) { showFlash('sent','Already in split view'); return; }
+        // Leaving split view keeps the old slots; only a split on screen counts.
+        if (this.enabled && this.slots.some(r => !r.dead && r.pane_id === pane.pane_id)) { showFlash('sent','Already in split view'); return; }
         if (!this.enabled) {
             const current = _sessionPanes.find(p => p.target === _termTarget);
             if (!current || !current.pane_id) return;
@@ -532,8 +549,10 @@ const SplitView = {
         for (let i=0;i<2;i++) {
             const r = this.slots[i], pane = panes.find(p=>p.target===r.target && this.same(r,p)) || panes.find(p=>this.same(r,p));
             if (!pane) {
-                if (!r.dead) { r.dead=true; r.identity=null; if (i!==this.active) this.other.close(); }
-            } else if (!r.dead && pane.target !== r.target) {
+                if (!r.dead) { r.dead=true; r.expected=r.identity || r.expected; r.identity=null; if (i!==this.active) this.other.close(); }
+            } else if (r.dead) {
+                if (r.expected && !r.reviving) this.revive(i,r);
+            } else if (pane.target !== r.target) {
                 const old = r.target; r.target=pane.target; r.session=pane.session; r.window=pane.window;
                 if (_draftCache[old]) { _draftCache[r.target]=_draftCache[old]; delete _draftCache[old]; }
                 if (i===this.active) { _termTarget=r.target; this.select(r); }

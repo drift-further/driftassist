@@ -65,7 +65,6 @@ _reexec_in_project_venv()
 # so `migrate-state`, `doctor` and `config` run without loading any of it.
 try:
     from cli import (
-        container,
         devices,
         expose,
         http,
@@ -78,7 +77,6 @@ try:
     )
     from cli.config import ConfigError, resolve
     from shared import paths
-    from shared.execution_park import FEATURES_PARKED
 except ModuleNotFoundError as exc:  # a legible failure beats a 12-line traceback
     print(
         f"assist: missing dependency '{exc.name}' — the CLI needs the project venv at\n"
@@ -136,6 +134,10 @@ Sessions:
                          Send text to a session pane
   wait SESSION [--timeout N] [--pane P] [--autoyes]
                          Wait for a session pane to settle
+  send-file PATH [--name NAME] [--no-wait] [--timeout N]
+  send-file (--status ID | --cancel ID)
+                         Offer a file to your signed-in browsers; one tap
+                         downloads it, once. Waits for pickup by default
   launch --session N [--cwd P] [--cols C] [--rows R]
       [--wait] [--timeout N] [--role R (--family F | --against F)]
                          Create a bare shell; takes no command
@@ -174,7 +176,14 @@ Wait exit codes:
   0   idle    — the pane went quiet, no prompt
   10  prompt  — quiet because it is asking something (summary printed)
   75  working — still changing at the deadline; not an error, re-run `assist wait`
-{container}
+
+Send-file exit codes:
+  0   picked up (or offered, with --no-wait)
+  2   refused before upload — not a file, unreadable, over the size limit
+  20  expired unclaimed (15 minutes)
+  21  dismissed on a device, or cancelled
+  75  still waiting at --timeout; re-run with --status ID
+
 Studio (design hub):
   studio [args]          Run the Studio CLI on PATH (sto, else studio)
 
@@ -186,19 +195,8 @@ Install / reinstall:
 
 """
 
-CONTAINER_HELP = """
-Container:
-  container status       Image info + running claude-session-* containers
-  container build        Build the container image (streams log)
-  container config       Print current container build config
-  container extensions   List registered extensions
-  container kill <name>  Kill a running claude-session-* container
-"""
-
-
-def help_text(parked: bool = FEATURES_PARKED) -> str:
-    """The container verbs still dispatch while parked; they are just not offered."""
-    return HELP_TEXT.replace("{container}", "" if parked else CONTAINER_HELP)
+def help_text() -> str:
+    return HELP_TEXT
 
 
 def version_text() -> str:
@@ -235,11 +233,11 @@ COMMANDS = {
     "config",
     "roster",
     "doctor",
-    "container",
     "ls",
     "view",
     "resume",
     "send",
+    "send-file",
     "wait",
     "launch",
     "kill",
@@ -378,6 +376,46 @@ def build_parser() -> AssistArgumentParser:
         metavar="N",
         type=float,
         help=f"wait at most N seconds (default: {wait_cli.DEFAULT_TIMEOUT:g})",
+    )
+
+    send_file_parser = subparsers.add_parser(
+        "send-file",
+        description="Offer a file to your signed-in browsers. Each shows a popup and a "
+        "files tray; the first download takes it and the link closes everywhere.",
+    )
+    send_file_parser.add_argument(
+        "path",
+        nargs="?",
+        help="the file to offer; its bytes are uploaded, not its path",
+    )
+    send_file_parser.add_argument(
+        "--name",
+        metavar="NAME",
+        help="the filename the browser saves it as (default: the file's own name)",
+    )
+    send_file_parser.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="return as soon as the file is offered instead of waiting for pickup",
+    )
+    send_file_parser.add_argument(
+        "--timeout",
+        metavar="N",
+        type=float,
+        help="stop waiting after N seconds and exit 75; the offer stays open "
+        "(default: wait until it is picked up, dismissed or expires)",
+    )
+    send_file_parser.add_argument(
+        "--status",
+        metavar="ID",
+        dest="status_id",
+        help="print an earlier offer's outcome and exit with its code",
+    )
+    send_file_parser.add_argument(
+        "--cancel",
+        metavar="ID",
+        dest="cancel_id",
+        help="withdraw an offer that has not been picked up",
     )
 
     wait_parser = subparsers.add_parser(
@@ -566,7 +604,6 @@ def build_parser() -> AssistArgumentParser:
     for verb in (
         "config",
         "doctor",
-        "container",
         "studio",
         "help",
     ):
@@ -704,8 +741,6 @@ def main(arguments: list[str] | None = None) -> int:
         return roster.command(resolved.roster_file, parsed.role, parsed.family)
     if parsed.verb == "doctor":
         return proc.doctor(resolved)
-    if parsed.verb == "container":
-        return container.dispatch(parsed.arguments)
     if parsed.verb in ("ls", "view", "send", "launch", "kill", "autoyes", "resume"):
         from cli import session
     if parsed.verb == "ls":
@@ -722,6 +757,17 @@ def main(arguments: list[str] | None = None) -> int:
             parsed.wait_for_completion,
             parsed.timeout,
             parsed.autoyes,
+        )
+    if parsed.verb == "send-file":
+        from cli import send_file
+
+        return send_file.command(
+            parsed.path,
+            parsed.name,
+            parsed.no_wait,
+            parsed.timeout,
+            parsed.status_id,
+            parsed.cancel_id,
         )
     if parsed.verb == "wait":
         return wait_cli.command(

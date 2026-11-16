@@ -15,10 +15,10 @@ from shared import devices
 # and /api/commands/run runs arbitrary commands by design. This gate is what
 # makes that unreachable without the token.
 #
-# /api/cli-proxy is exempt: containers call it from an isolated network
-# (docker/claude-mount.sh iptables-pins them to the host's :8089) and have no
-# way to hold the token. It is fail-closed on its own ASSIST_CLI_ALLOWED
-# allowlist, and nginx restricts it to the container subnet.
+# /api/cli-proxy is exempt: it was called by containers on an isolated network
+# that had no way to hold the token. It is parked (409 before any effect), and
+# behind that fail-closed on its own ASSIST_CLI_ALLOWED allowlist; nginx
+# restricts it to the container subnet.
 # /health is a liveness probe (assist-ctl polls it to decide whether a restart
 # succeeded) and carries no data worth gating.
 # /login.js is the sign-in page's approval script: static, no secret, and

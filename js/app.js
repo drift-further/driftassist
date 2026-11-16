@@ -172,6 +172,10 @@ async function consolidatedPoll() {
         // A sudo prompt in any pane — a Yes/No popup (prompt-popup.js)
         if (typeof _applySudoPrompts === 'function') _applySudoPrompts(data.sudo_prompts || []);
 
+        // Files an agent offered with `assist send-file` — popup and tray (outbox.js)
+        if (typeof _applyFileOffers === 'function') _applyFileOffers(data.outbox || []);
+        if (typeof renderOutboxTray === 'function') renderOutboxTray(data.outbox || []);
+
         // Composer drafts — tab markers, plus the resync that lets a draft
         // written on one device turn up on the other. Runs after the strip is
         // rebuilt so the markers land on the fresh nodes.
@@ -187,11 +191,6 @@ async function consolidatedPoll() {
             if (sessionCount > 0) parts.push(sessionCount + ' session' + (sessionCount > 1 ? 's' : ''));
             if (promptCount > 0) parts.push(promptCount + ' waiting');
             statusTitle.textContent = parts.join(' \u00B7 ');
-        }
-
-        // Automate status
-        if (typeof _updateAutoUI === 'function') {
-            _updateAutoUI(data.automate || null);
         }
 
         // Claude info bar

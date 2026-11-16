@@ -67,8 +67,6 @@ def create_app():
     from routes.git import git_bp
     from routes.commands import commands_bp
     from routes.autoyes import autoyes_bp
-    from routes.automate import automate_bp
-    from routes.container import container_bp
     from routes.poll import poll_bp
     from routes.delegates import delegates_bp
     from routes.completion import completion_bp
@@ -77,6 +75,7 @@ def create_app():
     from routes.tabstate import tabstate_bp
     from routes.drafts import drafts_bp
     from routes.updates import updates_bp
+    from routes.outbox import outbox_bp
 
     app.register_blueprint(static_bp)
     app.register_blueprint(access_bp)
@@ -86,8 +85,6 @@ def create_app():
     app.register_blueprint(git_bp)
     app.register_blueprint(commands_bp)
     app.register_blueprint(autoyes_bp)
-    app.register_blueprint(automate_bp)
-    app.register_blueprint(container_bp)
     app.register_blueprint(poll_bp)
     app.register_blueprint(delegates_bp)
     app.register_blueprint(completion_bp)
@@ -96,6 +93,7 @@ def create_app():
     app.register_blueprint(tabstate_bp)
     app.register_blueprint(drafts_bp)
     app.register_blueprint(updates_bp)
+    app.register_blueprint(outbox_bp)
 
     from routes.settings import settings_bp, init_start_time
 
@@ -115,12 +113,12 @@ def start_application_backgrounds():
 
     The activation-only candidate must establish its observation watermark and
     finish the old-generation snapshot without importing these modules or
-    starting any Flask, AutoYes, Automate, drafts, or Studio work.
+    starting any Flask, AutoYes, drafts, or Studio work.
     """
     from routes.autoyes import autoyes_scanner, restore_autoyes_from_settings
     from routes.delegates import delegate_watcher
-    from routes.automate import automate_recover
     from routes.drafts import start_sweeper as start_drafts_sweeper
+    from routes.outbox import start_sweeper as start_outbox_sweeper
     from routes.studio import studio_refresher
     from shared.studio_context import studio_observer, studio_context_refresher
     from shared.studio_events import studio_event_receiver, studio_event_consumer
@@ -136,8 +134,8 @@ def start_application_backgrounds():
     updater = update_manager()
     threading.Thread(target=updater.watch, daemon=True).start()
     start_drafts_sweeper()
+    start_outbox_sweeper()
     restore_autoyes_from_settings()
-    automate_recover()
 
 
 def start_extra_listeners(addresses, port, app):

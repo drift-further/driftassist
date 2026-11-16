@@ -1,4 +1,4 @@
-"""The first-party execution boundary for parked container-launch automation.
+"""The first-party execution boundary: every server-initiated effect runs here.
 
 Callers submit trusted provenance as an :class:`Intent` together with the
 complete effect closure.  The decision and the effect linearize under one
@@ -27,12 +27,6 @@ class Phase(str, Enum):
 
 
 class Intent(str, Enum):
-    AUTOMATE_START = "automate_start"
-    AUTOMATE_HARD_RELAUNCH = "automate_hard_relaunch"
-    AUTOMATE_SOFT_CLEAR = "automate_soft_clear"
-    AUTOMATE_SOFT_RESEND = "automate_soft_resend"
-    AUTOMATE_TRUST_ANSWER = "automate_trust_answer"
-    AUTOMATE_AUTO_ANSWER = "automate_auto_answer"
     TERMINAL_INIT_LAUNCH = "terminal_init_launch"
     TERMINAL_INIT_DUPLICATE = "terminal_init_duplicate"
     TERMINAL_RUN_INIT = "terminal_run_init"
@@ -55,26 +49,12 @@ class Intent(str, Enum):
 
 DENIED_INTENTS = frozenset(
     {
-        Intent.AUTOMATE_START,
-        Intent.AUTOMATE_HARD_RELAUNCH,
-        Intent.AUTOMATE_SOFT_CLEAR,
-        Intent.AUTOMATE_SOFT_RESEND,
-        Intent.AUTOMATE_TRUST_ANSWER,
-        Intent.AUTOMATE_AUTO_ANSWER,
         Intent.CONFIGURED_CLI_PROXY,
         Intent.CONFIGURED_IMAGE_BUILD,
     }
 )
 
 ALLOWED_INTENTS = frozenset(Intent) - DENIED_INTENTS
-
-# The one "parked" flag the surfaces read: while Automate start and image builds
-# are denied, the Automate and Container UI entries, the installer's container
-# step and the CLI help lines stay hidden rather than advertising a 409.
-FEATURES_PARKED = {
-    Intent.AUTOMATE_START,
-    Intent.CONFIGURED_IMAGE_BUILD,
-} <= DENIED_INTENTS
 
 
 @dataclass(frozen=True, slots=True)

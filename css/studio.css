@@ -75,7 +75,7 @@
 .plus-studio { color: var(--purple); border-color: rgba(182, 156, 242, 0.3); }
 .plus-studio:active { background: rgba(182, 156, 242, 0.15); }
 
-/* Panel frame — mirrors .container-panel, purple instead of amber */
+/* Panel frame — purple */
 .studio-panel {
     display: none; flex-shrink: 0; padding: 8px;
     background: linear-gradient(180deg, rgba(182, 156, 242, 0.06) 0%, rgba(182, 156, 242, 0.02) 100%);

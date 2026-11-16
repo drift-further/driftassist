@@ -9,7 +9,6 @@ from pathlib import Path
 
 from cli import http
 from cli.config import Config
-from shared.execution_park import FEATURES_PARKED
 
 
 GREEN = "\033[32m"
@@ -309,8 +308,6 @@ def doctor(resolved: Config) -> int:
         ok_all = False
     _check_command("xclip", "xclip")
     _check_command("xdotool", "xdotool")
-    if not FEATURES_PARKED:
-        _check_command("docker", "docker")
     _check_command("curl", "curl")
     _check_command("nginx", "nginx (only for the proxy setup)")
 
@@ -325,21 +322,6 @@ def doctor(resolved: Config) -> int:
             f"  {MARK_WARN} npx/claude "
             "(neither found — Claude Code launch will fail)"
         )
-
-    docker = None if FEATURES_PARKED else shutil.which("docker")
-    if docker:
-        try:
-            docker_result = subprocess.run(
-                [docker, "ps"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except OSError:
-            docker_result = None
-        if docker_result is not None and docker_result.returncode == 0:
-            print(f"  {MARK_OK} docker daemon reachable")
-        else:
-            print(f"  {MARK_WARN} docker installed but user lacks permission")
 
     print()
     print("Install:")

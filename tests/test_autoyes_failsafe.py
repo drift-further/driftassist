@@ -690,9 +690,14 @@ class AbsoluteSetTests(unittest.TestCase):
     def test_the_browser_no_longer_arms_sessions_on_its_own(self):
         """The server resolves enabled_default at scan time; the browser's own
         auto-enable raced its status fetch and toggled the wrong way."""
-        monitor = (ROOT / "js/monitor.js").read_text()
-        body = monitor[monitor.index("async function loadProjectSettings"):
-                       monitor.index("function renderProjectSettings")]
+        # The project-settings loader that did it went with the Automate panel
+        # (effort 621 phase 6); the one reader left only reads shell_ok.
+        for path in ROOT.glob("js/*.js"):
+            self.assertNotIn("function loadProjectSettings", path.read_text(), path.name)
+        actions = (ROOT / "js/actions.js").read_text()
+        body = actions[actions.index("async function _loadAyShellOk"):
+                       actions.index("function _renderAyShell")]
+        self.assertIn("/api/project-settings/", body)
         self.assertNotIn("AutoYes(", body)
 
 
@@ -763,8 +768,8 @@ class StopTargetTests(unittest.TestCase):
         self.assertIn("Answers this session's permission prompts after", (ROOT / "js/actions.js").read_text())
 
     def test_shell_panes_sits_in_the_delay_picker_not_the_automate_panel(self):
-        # The Automate panel is hidden while Automate is parked, so the toggle
-        # lives beside the delay, where it stays reachable.
+        # The toggle lives beside the delay, where it is reachable (the
+        # Automate panel it once sat in was retired).
         html = (ROOT / "index.html").read_text()
         picker = html[html.index('id="autoyes-picker"'):]
         picker = picker[:picker.index('id="autoyes-countdown"')]

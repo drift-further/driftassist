@@ -383,10 +383,19 @@ def _scan_snapshot_tree(snapshot, pane_pid):
     agent_pid = None
     agent_start_time = None
     has_wrapper = False
-    queue = [pane_pid]
+    # Task 2304. A candidate is an agent process with no agent of any kind
+    # above it: a launcher chain, an npm shim, a nested `claude -p` or the
+    # `codex exec` runs of Claude's Bash tool belong to the agent above them,
+    # which owns the pane TTY. The walk is breadth-first, so the first
+    # candidate is the nearest, and it wins over candidates of other kinds.
+    # Two candidates of the same kind leave the pane with no identity
+    # (`ambiguous`).
+    candidate_kinds = set()
+    ambiguous = False
+    queue = [(pane_pid, False)]
     seen = set()
     while queue:
-        pid = queue.pop(0)
+        pid, above = queue.pop(0)
         if pid in seen:
             continue
         seen.add(pid)
@@ -395,17 +404,25 @@ def _scan_snapshot_tree(snapshot, pane_pid):
         executable = os.path.basename(argv[0]) if argv else comm
         if comm in _WRAPPER_COMMS or executable in _WRAPPER_COMMS:
             has_wrapper = True
-        if agent_kind is None:
-            agent_kind = _kind_from_process(comm, argv)
-            if agent_kind is not None:
+        kind = _kind_from_process(comm, argv)
+        if kind is not None and not above:
+            if kind in candidate_kinds:
+                ambiguous = True
+            candidate_kinds.add(kind)
+            if agent_kind is None:
+                agent_kind = kind
                 agent_pid = pid
                 agent_start_time = start_times.get(pid) or _proc_start_time(pid)
-        queue.extend(children.get(pid, []))
+            above = True
+        queue.extend((child, above) for child in children.get(pid, []))
 
+    if ambiguous:
+        agent_kind = agent_pid = agent_start_time = None
     return {
         "agent_kind": agent_kind,
         "agent_pid": agent_pid,
         "agent_start_time": agent_start_time,
+        "ambiguous": ambiguous,
         "has_wrapper": has_wrapper,
         "root_start_time": start_times.get(pane_pid) or _proc_start_time(pane_pid),
     }
@@ -601,9 +618,21 @@ def declare_agent_command(target, command):
 
 def resolve_process(target, pane_pid, command):
     """Resolve identity without pane content; return None when still opaque."""
+    return resolve_process_detail(target, pane_pid, command)[0]
+
+
+def resolve_process_detail(target, pane_pid, command):
+    """(kind or None, refused) from ONE walk of the pane's tree.
+
+    `refused` is identity_refused's answer read off the same scan, for callers
+    that resolve many panes and must not walk each one twice (/poll)."""
     try:
         pane_pid = int(pane_pid) if pane_pid not in (None, "") else None
         scan = _scan_process_tree(target, pane_pid)
+        if scan and scan.get("ambiguous"):
+            # Refused: neither the pane command nor a declaration may name
+            # one of two same-kind agents (see identity_refused).
+            return None, True
         inferred = scan.get("agent_kind") if scan else None
         if inferred is None:
             inferred = _kind_from_command_name(command)
@@ -647,7 +676,7 @@ def resolve_process(target, pane_pid, command):
                 inferred_start = scan.get("agent_start_time")
                 if bound_pid is not None:
                     if bound_pid == inferred_pid and bound_start == inferred_start:
-                        return declaration["kind"]
+                        return declaration["kind"], False
                     # The declared process generation ended. A newly observed
                     # same-kind process stands on inference, not the old record.
                     tab_state.delete_agent_declaration(target)
@@ -663,7 +692,7 @@ def resolve_process(target, pane_pid, command):
                             "agent_start_time": inferred_start,
                         },
                     )
-                    return declaration["kind"]
+                    return declaration["kind"], False
                 else:
                     tab_state.delete_agent_declaration(target)
             elif inferred is None and bound_pid is not None:
@@ -674,22 +703,22 @@ def resolve_process(target, pane_pid, command):
                 <= time.time() - declaration["declared_at"]
                 <= _DECLARATION_STARTUP_GRACE
             ):
-                return declaration["kind"]
+                return declaration["kind"], False
             else:
                 tab_state.delete_agent_declaration(target)
 
         if inferred in AGENT_KINDS:
-            return inferred
+            return inferred, False
         # A transport can hide the real child process (Docker exec, SSH, etc.).
         # Abstain so callers with a capture can use the fingerprint tier.
         if scan is not None and scan.get("has_wrapper"):
-            return None
+            return None, False
         if scan is not None and (command or "") in SHELL_COMMANDS:
-            return "shell"
-        return None
+            return "shell", False
+        return None, False
     except Exception:
         _log_failure_once(target, "resolution failed")
-        return None
+        return None, False
 
 
 def refine_with_content(kind_or_none, tail):
@@ -714,6 +743,23 @@ def resolve(target, pane_pid, command, tail=None):
     if tail is None:
         return process_kind or "unknown"
     return refine_with_content(process_kind, tail)
+
+
+def identity_refused(target, pane_pid):
+    """Whether the pane's tree holds two agent candidates of the same kind.
+
+    Such a pane has no identity: resolve_process returns None for it, and the
+    Auto-Yes scanner leaves its prompts to the human even when the content tier
+    recognises the dialog. Reads the same cached walk identity uses. A walk
+    that cannot run (no pid, no /proc, an error) is not a refusal: those panes
+    keep the behaviour they had.
+    """
+    try:
+        scan = _scan_process_tree(target, pane_pid)
+        return bool(scan and scan.get("ambiguous"))
+    except Exception:
+        _log_failure_once(target, "ambiguity scan failed")
+        return False
 
 
 def _has_wrapper_descendant(target, pane_pid):

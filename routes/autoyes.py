@@ -14,6 +14,7 @@ from shared import execution_park as park
 from shared.agent_identity import (
     _ANSI_ESCAPE_RE,
     AGENT_KINDS,
+    identity_refused,
     refine_with_content,
     resolve_process,
 )
@@ -130,8 +131,23 @@ _NUMBERED_YES_RE = re.compile(
     r"(?:^|\n)\s*(?:[^\d\s]\s*)?1[\.\)]\s*Yes\b", re.IGNORECASE
 )
 # Detect highlighted/selected "Yes" option (arrow-key style, no number)
-# Matches lines like: ❯ Yes, ❯ Yes   (with optional trailing comma/text)
-_SELECTED_YES_RE = re.compile(r"(?:^|\n)\s*❯\s*Yes\b", re.IGNORECASE)
+# Matches rows like: ❯ Yes, ❯ Yes   (with optional trailing comma/text)
+_SELECTED_YES_RE = re.compile(r"^\s*❯\s*Yes\b", re.IGNORECASE)
+# Any row the arrow cursor sits on (Claude draws ❯, codex ›). The menu's
+# selection is the LAST such row above its footer: a "❯ Yes" quoted higher up
+# (a README, a diff of this file) is not what Enter picks when the live cursor
+# is on another option (task 2304).
+_CURSOR_ROW_RE = re.compile(r"^\s*[❯›]")
+
+
+def _selected_row_is_yes(lines, start, footer_line):
+    """Whether the cursor row nearest above the footer is a Yes row."""
+    for i in range(footer_line, start - 1, -1):
+        if _CURSOR_ROW_RE.match(lines[i]):
+            return bool(_SELECTED_YES_RE.match(lines[i]))
+    return False
+
+
 # Footer line that closes an arrow/number selection menu. Claude Code uses
 # "Enter to select · Esc to cancel"; Antigravity (Gemini) CLI uses
 # "↑/↓ Navigate · tab Amend · e edit command · ctrl+r Review". Both end the
@@ -405,7 +421,7 @@ def _detect_autoyes_prompt(tail, agent_kind):
             region = "\n".join(lines[region_start : footer_line + 1])
             if _NUMBERED_YES_RE.search(region):
                 return ("numbered-yes", "", True, _extract_summary(tail, "numbered"))
-            if _SELECTED_YES_RE.search(region):
+            if _selected_row_is_yes(lines, region_start, footer_line):
                 return ("selected-yes", "", True, _extract_summary(tail, "numbered"))
     return None
 
@@ -950,13 +966,16 @@ def prompt_popup_info(tail, agent_kind, autoyes_armed):
     }
 
 
-def autoyes_will_consider(target, enabled, source, process_kind, agent_kind):
+def autoyes_will_consider(target, enabled, source, process_kind, agent_kind, refused=False):
     """Whether the scanner would act on this pane's prompt at all.
 
     The same scope rule as _autoyes_scan_tick: agent panes only, judged by the
     process (a shell) AND by content (a non-agent program such as apt in the
-    foreground), unless the session is shell-ok (_shell_ok). And once the human
-    cancels a countdown, the scanner leaves that prompt alone for as long as it
+    foreground), unless the session is shell-ok (_shell_ok). A pane whose tree
+    holds two same-kind agents is `refused` (the caller's identity_refused
+    answer, read once per pane), so its popup and delegate alerts are not
+    suppressed for an answer that never comes. Once the human cancels a
+    countdown, the scanner leaves that prompt alone for as long as it
     stays on screen, so the question popup must not be suppressed for it either.
     """
     if not enabled:
@@ -964,6 +983,8 @@ def autoyes_will_consider(target, enabled, source, process_kind, agent_kind):
     if (process_kind == "shell" or agent_kind not in AGENT_KINDS) and not _shell_ok(
         target.rsplit(":", 1)[0], source
     ):
+        return False
+    if refused:
         return False
     with state.autoyes_lock:
         return not state.autoyes_cancelled.get(target)
@@ -1249,6 +1270,13 @@ def _autoyes_scan_tick():
         # pane on the host is in scope.
         process_kind = resolve_process(target, parts[3], parts[4])
         if process_kind == "shell" and not _shell_ok(session_name, source):
+            continue
+        # Two same-kind agents under one pane root (task 2304): which one the
+        # dialog belongs to is unknown, so the human answers it. A countdown
+        # already ticking is dropped rather than left on screen unsent.
+        if identity_refused(target, parts[3]):
+            with state.autoyes_lock:
+                state.autoyes_countdowns.pop(target, None)
             continue
 
         cap = subprocess.run(

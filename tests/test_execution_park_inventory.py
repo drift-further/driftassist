@@ -48,33 +48,6 @@ _classify("fixed:observe", "serve.py:start_extra_listeners")
 _classify("fixed:observe", "shared/tmux.py:venv_is_trusted")
 _classify("fixed:observe", "shared/opencode.py:pane_context", "shared/opencode.py:run_cli")
 _classify(
-    "intent:automate_trust_answer|automate_auto_answer",
-    "routes/automate.py:_automate_scheduled_answer.effect",
-)
-_classify(
-    "fixed:observe",
-    "routes/automate.py:automate_recover",
-    "routes/automate.py:automate_reconnect",
-    "routes/automate.py:_automate_monitor_iteration",
-)
-_classify("intent:automate_start", "routes/automate.py:_automate_start_inner")
-_classify(
-    "intent:automate_start|automate_hard_relaunch|stop",
-    "routes/automate.py:_automate_cleanup",
-)
-_classify(
-    "intent:automate_soft_clear", "routes/automate.py:_automate_soft_clear.effect"
-)
-_classify(
-    "intent:automate_soft_resend",
-    "routes/automate.py:_automate_soft_resend.effect",
-)
-_classify(
-    "intent:automate_hard_relaunch",
-    "routes/automate.py:_automate_relaunch_effect",
-)
-
-_classify(
     "fixed:observe",
     "routes/autoyes.py:_autoyes_scan_tick",
     "routes/autoyes.py:_prompt_still_on_screen",
@@ -86,15 +59,8 @@ _classify("intent:saved_command|stop", "routes/commands.py:_kill_command_pane")
 _classify("fixed:observe", "routes/commands.py:_pane_in_session")
 _classify("fixed:observe", "routes/completion.py:_session_cwd")
 
-_classify("fixed:observe", "routes/container.py:container_status")
-_classify("fixed:observe", "routes/container.py:_docker_image_exists")
-_classify(
-    "intent:configured_image_build",
-    "routes/container.py:_container_build_effect",
-    "routes/container.py:_run_build",
-)
-_classify("intent:stop", "routes/container.py:_container_kill_effect")
 _classify("fixed:observe", "routes/drafts.py:start_sweeper")
+_classify("fixed:observe", "routes/outbox.py:start_sweeper", "routes/outbox.py:describe_sender")
 
 _classify(
     "intent:fixed_git",
@@ -165,12 +131,12 @@ _classify(
 )
 _classify("intent:operator_interactive", "shared/tmux.py:get_clipboard")
 _classify(
-    "intent:automate_start|automate_hard_relaunch|automate_soft_clear|automate_soft_resend|automate_trust_answer|automate_auto_answer|terminal_init_launch|terminal_init_duplicate|terminal_run_init|saved_command|project_venv|fixed_git",
+    "intent:terminal_init_launch|terminal_init_duplicate|terminal_run_init|saved_command|project_venv|fixed_git",
     "shared/tmux.py:tmux_send_keys",
     "shared/tmux.py:tmux_send_text",
 )
 _classify(
-    "intent:automate_start|automate_hard_relaunch|terminal_init_launch|terminal_init_duplicate|bare_terminal|saved_command|fixed_git",
+    "intent:terminal_init_launch|terminal_init_duplicate|bare_terminal|saved_command|fixed_git",
     "shared/tmux.py:_create_tmux_resource",
 )
 # Reached from the three surfaces that open a pane in a project directory:
@@ -185,14 +151,6 @@ _classify(
 
 
 PARK_BINDINGS = {
-    "routes/automate.py:automate_start": ("AUTOMATE_START",),
-    "routes/automate.py:_automate_relaunch": ("AUTOMATE_HARD_RELAUNCH",),
-    "routes/automate.py:_automate_soft_clear": ("AUTOMATE_SOFT_CLEAR",),
-    "routes/automate.py:_automate_soft_resend": ("AUTOMATE_SOFT_RESEND",),
-    "routes/automate.py:_automate_scheduled_answer": (
-        "AUTOMATE_TRUST_ANSWER",
-        "AUTOMATE_AUTO_ANSWER",
-    ),
     "routes/autoyes.py:_deliver_autoyes_answer": ("AUTOYES_ANSWER",),
     "routes/input.py:send_key": ("OPERATOR_INTERACTIVE",),
     "routes/input.py:type_text": ("OPERATOR_INTERACTIVE",),
@@ -213,19 +171,12 @@ PARK_BINDINGS = {
     "routes/git.py:git_run": ("FIXED_GIT",),
     "routes/git.py:venv_create": ("PROJECT_VENV",),
     "routes/poll.py:cli_proxy": ("CONFIGURED_CLI_PROXY",),
-    "routes/container.py:container_build": ("CONFIGURED_IMAGE_BUILD",),
 }
 
 
 DIRECT_RETURN_BINDINGS = {
-    "routes/automate.py:automate_stop": "STOP",
     "routes/autoyes.py:_deliver_autoyes_answer": "AUTOYES_ANSWER",
     "routes/commands.py:stop_command": "STOP",
-    "routes/container.py:container_config_patch": "IMAGE_CONFIG",
-    "routes/container.py:extensions_add": "IMAGE_CONFIG",
-    "routes/container.py:extensions_update": "IMAGE_CONFIG",
-    "routes/container.py:extensions_delete": "IMAGE_CONFIG",
-    "routes/container.py:container_kill": "STOP",
     "routes/input.py:send_key": "OPERATOR_INTERACTIVE",
     "routes/input.py:type_text": "OPERATOR_INTERACTIVE",
     "routes/input.py:type_client_resume": "CLIENT_SESSION_RESUME",
@@ -236,24 +187,16 @@ DIRECT_RETURN_BINDINGS = {
 
 
 DENIED_HTTP_BINDINGS = {
-    "routes/automate.py:automate_start": "AUTOMATE_START",
     "routes/poll.py:cli_proxy": "CONFIGURED_CLI_PROXY",
-    "routes/container.py:container_build": "CONFIGURED_IMAGE_BUILD",
 }
 
 
 CLIENT_ENDPOINTS = {
-    "/api/automate/start": "intent:automate_start",
-    "/api/automate/stop": "intent:stop",
     "/api/commands/run": "intent:saved_command",
     "/api/commands/stop": "intent:stop",
     "/api/git/run": "intent:fixed_git",
     "/api/venv/create": "intent:project_venv",
     "/api/restart": "intent:configured_restart",
-    "/api/container/build": "intent:configured_image_build",
-    "/api/container/config": "intent:image_config",
-    "/api/container/extensions": "intent:image_config",
-    "/api/container/kill/": "intent:stop",
     "/terminal/explore/pick": "intent:native_folder_picker",
     "/terminal/launch": "intent:terminal_init_launch|bare_terminal",
     "/terminal/duplicate": "intent:terminal_init_duplicate|bare_terminal",
@@ -277,9 +220,8 @@ BACKGROUND_CALLBACKS = {
     "serve.py:studio_context_refresher": "fixed:observe",
     "serve.py:studio_event_receiver": "fixed:observe",
     "serve.py:studio_event_consumer": "fixed:observe",
-    "routes/automate.py:_automate_monitor": "fixed:observe|intent:automate_hard_relaunch|automate_soft_clear|automate_soft_resend|automate_trust_answer|automate_auto_answer",
-    "routes/container.py:_run_build": "intent:configured_image_build",
     "routes/drafts.py:drafts_sweeper": "fixed:observe",
+    "routes/outbox.py:outbox_sweeper": "fixed:observe",
     "routes/streaming.py:_terminal_streamer": "fixed:observe",
     "routes/git.py:_run_git": "intent:fixed_git",
 }
@@ -356,18 +298,11 @@ class ExecutionParkInventoryTests(unittest.TestCase):
                     self.assertIn(intent, intent_values)
 
     def test_park_bindings_name_only_compiled_provenance(self):
-        background_funnel = _function_source(
-            "routes/automate.py", "_perform_automate_background"
-        )
-        self.assertIn("park.perform", background_funnel)
         for qualified, intent_names in PARK_BINDINGS.items():
             relative, function = qualified.split(":", 1)
             source = _function_source(relative, function)
             with self.subTest(binding=qualified):
-                if relative == "routes/automate.py" and function != "automate_start":
-                    self.assertIn("_perform_automate_background", source)
-                else:
-                    self.assertIn("park.perform", source)
+                self.assertIn("park.perform", source)
                 for intent_name in intent_names:
                     self.assertIn(f"park.Intent.{intent_name}", source)
         perform_source = _function_source("shared/execution_park.py", "perform")
@@ -399,8 +334,7 @@ class ExecutionParkInventoryTests(unittest.TestCase):
             path.read_text(encoding="utf-8") for path in sorted((ROOT / "js").glob("*.js"))
         )
         cli_session = (ROOT / "cli/session.py").read_text(encoding="utf-8")
-        cli_container = (ROOT / "cli/container.py").read_text(encoding="utf-8")
-        client_text = "\n".join((js_text, cli_session, cli_container))
+        client_text = "\n".join((js_text, cli_session))
         for endpoint, result in CLIENT_ENDPOINTS.items():
             with self.subTest(endpoint=endpoint, result=result):
                 self.assertIn(endpoint, client_text)

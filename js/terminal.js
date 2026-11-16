@@ -574,7 +574,6 @@ function selectTab(target, auto) {
     onTabSwitchSkills();
     // Sync auto-yes state from server and update UI for this session
     if (typeof syncAutoYesState === 'function') syncAutoYesState().then(() => updateAutoYesUI(target.split(':')[0]));
-    if (typeof loadProjectSettings === 'function') loadProjectSettings(target.split(':')[0]);
 }
 
 async function _clearActivePane(target) {

@@ -2,6 +2,8 @@
 let _delegateNavigation = [];
 let expandedDelegateParent = null;
 let _delegateSheetOpen = false;
+// The inline rail would push the terminal under its floor (a phone): every child goes in the sheet.
+let _delegateSheetAll = false;
 const _delegateTabElements = new Map();
 function delegateState(pane) { return String(pane.delegate?.state || '').toUpperCase(); }
 
@@ -199,17 +201,23 @@ function _createDelegateChipMenu(chip, x, y) {
     },50);
 }
 function toggleDelegateRail(session) {
-    expandedDelegateParent=expandedDelegateParent===session?null:session;
-    _delegateSheetOpen=false;refreshDelegateRail();
+    openDelegateRail(expandedDelegateParent===session?null:session);
+}
+function openDelegateRail(session) {
+    expandedDelegateParent=session;
+    _delegateSheetOpen=false;_delegateSheetAll=false;refreshDelegateRail();
     _enforceDelegateFloor(true);
 }
 function delegateSelectTarget(target) {
     const unit=_delegateUnit(target);
-    if (unit?.session!==expandedDelegateParent) expandedDelegateParent=null;
-    _delegateSheetOpen=false;refreshDelegateRail();
+    if (unit?.session!==expandedDelegateParent || _delegateSheetAll) expandedDelegateParent=null;
+    _delegateSheetOpen=false;_delegateSheetAll=false;refreshDelegateRail();
 }
 function openDelegateSheet() { _delegateSheetOpen=true;refreshDelegateRail(); }
-function closeDelegateSheet() { _delegateSheetOpen=false;refreshDelegateRail(); }
+function closeDelegateSheet() {
+    if (_delegateSheetAll) expandedDelegateParent=null;
+    _delegateSheetOpen=false;_delegateSheetAll=false;refreshDelegateRail();
+}
 function refreshDelegateRail() {
     if (typeof _reorderModeTab !== 'undefined' && _reorderModeTab?.closest('.delegate-sheet')) return;
     const host=document.getElementById('delegate-rail-host');
@@ -217,7 +225,7 @@ function refreshDelegateRail() {
     host.innerHTML='';
     document.getElementById('delegate-sheet')?.remove();
     const unit=_delegateNavigation.find(u=>u.session===expandedDelegateParent && u.children.length);
-    if (!unit) { expandedDelegateParent=null;_delegateSheetOpen=false; }
+    if (!unit) { expandedDelegateParent=null;_delegateSheetOpen=false;_delegateSheetAll=false; }
     document.querySelectorAll('.delegate-disclosure').forEach(b=>{
         const session=JSON.parse(b.dataset.arg);
         b.setAttribute('aria-expanded',String(session===expandedDelegateParent));
@@ -225,10 +233,14 @@ function refreshDelegateRail() {
     });
     const bank=document.createElement('div');bank.hidden=true;host.appendChild(bank);
     for (const u of _delegateNavigation) for (const p of u.children) bank.appendChild(_delegateTabElements.get(p.target));
-    host.classList.toggle('is-open',!!unit);
+    host.classList.toggle('is-open',!!unit && !_delegateSheetAll);
     if (!unit) return;
-    const label=document.createElement('div');label.className='delegate-rail-label';label.textContent=shortName(unit.session)+' delegates';host.appendChild(label);
     const rows=delegateRailRows(unit.children,_termTarget,_tabState.snoozed);
+    if (_delegateSheetAll) {
+        _renderDelegateSheet(unit,[...rows.visible,...rows.hidden]);
+        return;
+    }
+    const label=document.createElement('div');label.className='delegate-rail-label';label.textContent=shortName(unit.session)+' delegates';host.appendChild(label);
     for (const p of rows.visible) {
         const tab=_delegateTabElements.get(p.target);tab.classList.add('delegate-child-row');tab.classList.remove('stale-tucked');
         tab.classList.toggle('active',p.target===_termTarget);
@@ -239,23 +251,29 @@ function refreshDelegateRail() {
         const finished=rows.hidden.every(p=>!['WORKING','WAITING','DEAD'].includes(delegateState(p)));
         more.textContent='+'+rows.hidden.length+(finished?' finished / idle':' more');host.appendChild(more);
     }
-    let sheet=document.getElementById('delegate-sheet');
-    if (sheet) sheet.remove();
-    if (_delegateSheetOpen) {
-        sheet=document.createElement('section');sheet.id='delegate-sheet';sheet.className='delegate-sheet';
-        sheet.setAttribute('role','dialog');sheet.setAttribute('aria-label',shortName(unit.session)+' delegates');
-        const close=document.createElement('button');close.textContent='Close delegates';close.dataset.action='closeDelegateSheet';sheet.appendChild(close);
-        for (const p of rows.hidden) { const tab=_delegateTabElements.get(p.target);tab.classList.add('delegate-child-row');tab.classList.remove('stale-tucked');sheet.appendChild(tab); }
-        document.body.appendChild(sheet);
-    }
+    if (_delegateSheetOpen) _renderDelegateSheet(unit,rows.hidden);
     requestAnimationFrame(()=>_enforceDelegateFloor(false));
 }
-function _enforceDelegateFloor(showMessage) {
-    if (!expandedDelegateParent) return;
+function _renderDelegateSheet(unit, panes) {
+    const sheet=document.createElement('section');sheet.id='delegate-sheet';sheet.className='delegate-sheet';
+    sheet.setAttribute('role','dialog');sheet.setAttribute('aria-label',shortName(unit.session)+' delegates');
+    const close=document.createElement('button');close.textContent='Close delegates';close.dataset.action='closeDelegateSheet';sheet.appendChild(close);
+    for (const p of panes) {
+        const tab=_delegateTabElements.get(p.target);tab.classList.add('delegate-child-row');tab.classList.remove('stale-tucked');
+        tab.classList.toggle('active',p.target===_termTarget);
+        sheet.appendChild(tab);
+    }
+    document.body.appendChild(sheet);
+}
+// Opened on purpose, a rail that leaves the terminal under its floor moves into the sheet
+// (on a phone it always does); a later resize, such as the keyboard opening, just closes it.
+function _enforceDelegateFloor(userOpened) {
+    if (!expandedDelegateParent || _delegateSheetAll) return;
     const display=document.getElementById('term-display');
     if (display && display.clientHeight<320) {
-        expandedDelegateParent=null;refreshDelegateRail();
-        if (showMessage) showFlash('error','Close a panel to show delegates');
+        if (userOpened) _delegateSheetAll=true;
+        else expandedDelegateParent=null;
+        refreshDelegateRail();
     }
 }
 if (typeof document!=='undefined') document.addEventListener('DOMContentLoaded',()=>{

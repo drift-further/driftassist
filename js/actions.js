@@ -40,8 +40,8 @@ function showAutoYesPicker() {
     _loadAyShellOk(session);
 }
 
-// "Shell panes" (autoyes.shell_ok, per session). It lives here rather than in
-// the Automate panel, which is hidden while Automate is parked.
+// "Shell panes" (autoyes.shell_ok, per session): the one place the browser
+// edits a project setting since the Automate panel was retired.
 let _ayShellOk = {};  // session -> bool, from that session's project settings
 
 async function _loadAyShellOk(session) {
@@ -389,7 +389,10 @@ const _OPT_RE = /^\s*(?:[^\d\s]\s*)?(\d+)[\.\)]\s+\S/;
 const _OPT_TEXT_RE = /^\s*(?:[^\d\s]\s*)?(\d+)[\.\)]\s+(.+)/;
 const _OPT_SEP_RE = /^[\s]*─{10,}/;
 const _OPT_FOOTER_RE = /(?:Enter to select|Esc to cancel|Navigate)\s*[·•]|Press enter to (?:confirm|continue)/;
-const _SELECTED_YES_RE = /(?:^|\n)\s*❯\s*Yes\b/i;
+const _SELECTED_YES_RE = /^\s*❯\s*Yes\b/i;
+// The menu's selection is the LAST cursor row above its footer; a quoted
+// "❯ Yes" higher up is not what Enter picks (routes/autoyes.py:_CURSOR_ROW_RE).
+const _CURSOR_ROW_RE = /^\s*[❯›]/;
 
 function _optionCount(lines, startIdx, endIdx) {
     let count = 0;
@@ -434,8 +437,6 @@ function _optionRegionStart(lines, footerIdx) {
     return anchored >= 0 ? anchored : Math.max(0, footerIdx - _OPT_LOOKBACK);
 }
 
-// Match routes/autoyes.py:_SELECTED_YES_RE inside the same live footer and
-// option-region bounds used by the server's numbered-menu branch.
 // Whether the option block above the footer is split by a divider. Without a
 // top anchor only a rule BELOW a numbered option counts: that is a question
 // whose top rule scrolled away. A rule with no option above it is the block's
@@ -455,11 +456,16 @@ function _blockHasDivider(lines, footerIdx) {
     return false;
 }
 
+// Match routes/autoyes.py:_selected_row_is_yes inside the same live footer and
+// option-region bounds used by the server's numbered-menu branch.
 function _isSelectedYesMenu(lines, footerIdx) {
     if (footerIdx < 0 || (lines.length - 1 - footerIdx) > _detectionDepth * 4) return false;
     const startIdx = _optionRegionStart(lines, footerIdx);
     if (_blockHasDivider(lines, footerIdx)) return false;
-    return _SELECTED_YES_RE.test(lines.slice(startIdx, footerIdx + 1).join('\n'));
+    for (let i = footerIdx; i >= startIdx; i--) {
+        if (_CURSOR_ROW_RE.test(lines[i])) return _SELECTED_YES_RE.test(lines[i]);
+    }
+    return false;
 }
 
 function _lastNonEmptyLine(tail) {

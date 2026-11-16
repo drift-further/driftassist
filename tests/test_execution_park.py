@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import inspect
-import copy
 import json
 import os
 import subprocess
@@ -19,7 +18,7 @@ from flask import Flask
 from shared import execution_park as park
 from shared import tmux as tmux_shared
 import shared.state as state
-from routes import automate, autoyes, commands, container, input as input_routes, poll, settings, streaming, terminal
+from routes import autoyes, commands, input as input_routes, poll, settings, streaming, terminal
 from routes import git as git_routes
 
 
@@ -50,14 +49,9 @@ class _FakeIdentity:
 
 class ExecutionParkPolicyTests(unittest.TestCase):
     def setUp(self):
-        with state.automate_lock:
-            self._automate_state = copy.deepcopy(state.automate)
         self._tmux_target = state.tmux_target
 
     def tearDown(self):
-        with state.automate_lock:
-            state.automate.clear()
-            state.automate.update(self._automate_state)
         state.tmux_target = self._tmux_target
 
     def test_compiled_policy_and_linearized_effect(self):
@@ -68,12 +62,6 @@ class ExecutionParkPolicyTests(unittest.TestCase):
         self.assertFalse(hasattr(park, "DECISION"))
         expected_denied = frozenset(
             {
-                park.Intent.AUTOMATE_START,
-                park.Intent.AUTOMATE_HARD_RELAUNCH,
-                park.Intent.AUTOMATE_SOFT_CLEAR,
-                park.Intent.AUTOMATE_SOFT_RESEND,
-                park.Intent.AUTOMATE_TRUST_ANSWER,
-                park.Intent.AUTOMATE_AUTO_ANSWER,
                 park.Intent.CONFIGURED_CLI_PROXY,
                 park.Intent.CONFIGURED_IMAGE_BUILD,
             }
@@ -155,89 +143,6 @@ class ExecutionParkPolicyTests(unittest.TestCase):
         self.assertNotIn("command", inspect.signature(policy.perform).parameters)
         self.assertNotIn("path", inspect.signature(policy.perform).parameters)
         self.assertNotIn("pane", inspect.signature(policy.perform).parameters)
-
-    def test_automate_intents_all_refuse_before_effect(self):
-        background_calls = (
-            (
-                park.Intent.AUTOMATE_HARD_RELAUNCH,
-                lambda: automate._automate_relaunch(7),
-            ),
-            (park.Intent.AUTOMATE_SOFT_CLEAR, automate._automate_soft_clear),
-            (
-                park.Intent.AUTOMATE_SOFT_RESEND,
-                lambda: automate._automate_soft_resend(
-                    7, "ordinary:0.0", "saved prompt", "/project"
-                ),
-            ),
-            (
-                park.Intent.AUTOMATE_TRUST_ANSWER,
-                lambda: automate._automate_scheduled_answer(
-                    park.Intent.AUTOMATE_TRUST_ANSWER,
-                    "project-auto:0.0",
-                    "1",
-                ),
-            ),
-            (
-                park.Intent.AUTOMATE_AUTO_ANSWER,
-                lambda: automate._automate_scheduled_answer(
-                    park.Intent.AUTOMATE_AUTO_ANSWER,
-                    "ordinary:0.0",
-                    "yes",
-                ),
-            ),
-        )
-
-        for phase in park.Phase:
-            with self.subTest(phase=phase.value, surface="http-start"), patch.object(
-                park, "_PROCESS_PARK", park.ExecutionPark(phase)
-            ):
-                app = Flask(f"automate-park-{phase.value}")
-                app.register_blueprint(automate.automate_bp)
-                before = copy.deepcopy(state.automate)
-                response = app.test_client().post("/api/automate/start", json={})
-                self.assertEqual(response.status_code, 409)
-                self.assertEqual(
-                    response.get_json(),
-                    _refusal_body(park.Intent.AUTOMATE_START),
-                )
-                self.assertEqual(state.automate, before)
-
-            for intent, invoke in background_calls:
-                with self.subTest(phase=phase.value, intent=intent.value), patch.object(
-                    park, "_PROCESS_PARK", park.ExecutionPark(phase)
-                ), patch.object(automate, "_automate_save") as save, patch.object(
-                    automate, "tmux_send_text"
-                ) as send_text, patch.object(
-                    automate, "tmux_send_keys"
-                ) as send_keys, patch.object(
-                    automate.subprocess, "run"
-                ) as spawn, patch.object(
-                    automate.threading, "Thread"
-                ) as thread, patch.object(
-                    automate.time, "sleep"
-                ) as sleep, patch.object(
-                    automate, "_automate_cleanup"
-                ) as cleanup:
-                    with state.automate_lock:
-                        state.automate["active"] = True
-                        state.automate["status"] = "running"
-                        state.automate["iterations_completed"] = 11
-                    result = invoke()
-                    self.assertIsInstance(result, park.Refusal)
-                    self.assertEqual(result.intent, intent)
-                    send_text.assert_not_called()
-                    send_keys.assert_not_called()
-                    spawn.assert_not_called()
-                    thread.assert_not_called()
-                    sleep.assert_not_called()
-                    cleanup.assert_not_called()
-                    save.assert_called_once_with()
-                    with state.automate_lock:
-                        self.assertFalse(state.automate["active"])
-                        self.assertEqual(
-                            state.automate["status"], "container_launch_parked"
-                        )
-                        self.assertEqual(state.automate["iterations_completed"], 11)
 
     def test_terminal_init_and_restart_routes_are_unparked(self):
         completed = lambda code=0, stdout="": subprocess.CompletedProcess(
@@ -389,7 +294,6 @@ class ExecutionParkPolicyTests(unittest.TestCase):
             app.register_blueprint(commands.commands_bp)
             app.register_blueprint(git_routes.git_bp)
             app.register_blueprint(poll.poll_bp)
-            app.register_blueprint(container.container_bp)
             client = app.test_client()
 
             with self.subTest(phase=phase.value, intent="saved_command"), patch.object(
@@ -443,29 +347,6 @@ class ExecutionParkPolicyTests(unittest.TestCase):
                 tempdir.assert_not_called()
                 remove.assert_not_called()
 
-            build_before = copy.deepcopy(container._build)
-            with self.subTest(
-                phase=phase.value, intent="configured_image_build"
-            ), patch.object(
-                park, "_PROCESS_PARK", park.ExecutionPark(phase)
-            ), patch.object(container.threading, "Thread") as thread, patch.object(
-                container, "_run_build"
-            ) as build, patch.object(
-                container, "_generate_extensions_script"
-            ) as generate, patch.object(
-                container.state, "patch_container_config"
-            ) as mutate:
-                response = client.post("/api/container/build")
-                self.assertEqual(response.status_code, 409)
-                self.assertEqual(
-                    response.get_json(),
-                    _refusal_body(park.Intent.CONFIGURED_IMAGE_BUILD),
-                )
-                thread.assert_not_called()
-                build.assert_not_called()
-                generate.assert_not_called()
-                mutate.assert_not_called()
-                self.assertEqual(container._build, build_before)
 
     def test_native_picker_reaches_platform_effect(self):
         for phase in park.Phase:

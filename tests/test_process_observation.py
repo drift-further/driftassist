@@ -394,37 +394,37 @@ LEGACY = {
     # works around without changing it for these callers.
     "judge_denied_comm": {
         "scan": {"agent_kind": None, "agent_pid": None, "agent_start_time": None,
-                 "has_wrapper": False, "root_start_time": "5000"},
+                 "ambiguous": False, "has_wrapper": False, "root_start_time": "5000"},
         "resolve": "shell", "children": [20],
     },
     "readable_claude": {
         "scan": {"agent_kind": "claude", "agent_pid": 20, "agent_start_time": "5100",
-                 "has_wrapper": False, "root_start_time": "5000"},
+                 "ambiguous": False, "has_wrapper": False, "root_start_time": "5000"},
         "resolve": "claude", "children": [20],
     },
     "agent_free_shell": {
         "scan": {"agent_kind": None, "agent_pid": None, "agent_start_time": None,
-                 "has_wrapper": False, "root_start_time": "5000"},
+                 "ambiguous": False, "has_wrapper": False, "root_start_time": "5000"},
         "resolve": "shell", "children": [30],
     },
     "wrapped_shell": {
         "scan": {"agent_kind": None, "agent_pid": None, "agent_start_time": None,
-                 "has_wrapper": True, "root_start_time": "5000"},
+                 "ambiguous": False, "has_wrapper": True, "root_start_time": "5000"},
         "resolve": None, "children": [30, 40],
     },
     "unrelated_stat_denied": {
         "scan": {"agent_kind": None, "agent_pid": None, "agent_start_time": None,
-                 "has_wrapper": False, "root_start_time": "5000"},
+                 "ambiguous": False, "has_wrapper": False, "root_start_time": "5000"},
         "resolve": "shell", "children": [30],
     },
     "unrelated_stat_gone": {
         "scan": {"agent_kind": None, "agent_pid": None, "agent_start_time": None,
-                 "has_wrapper": False, "root_start_time": "5000"},
+                 "ambiguous": False, "has_wrapper": False, "root_start_time": "5000"},
         "resolve": "shell", "children": [30],
     },
     "codex_under_node": {
         "scan": {"agent_kind": "codex", "agent_pid": 20, "agent_start_time": "5100",
-                 "has_wrapper": False, "root_start_time": "5000"},
+                 "ambiguous": False, "has_wrapper": False, "root_start_time": "5000"},
         "resolve": "codex", "children": [20],
     },
 }

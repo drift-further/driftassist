@@ -1,9 +1,10 @@
-"""What a first-time installer sees: prerequisites, the closing steps, the parked flag.
+"""What a first-time installer sees: prerequisites, the closing steps, no retired features.
 
 The installer used to recommend `assist container build` (parked, 409), and the
-UI and `assist help` offered Automate and Container as working features. One
-flag, `execution_park.FEATURES_PARKED`, now hides all of those while the
-intents are denied -- pinned both ways, so un-parking brings them back.
+UI and `assist help` offered Automate and Container as working features. A
+`FEATURES_PARKED` flag hid them while parked; effort 621 phase 6 retired both,
+so the entries, the flag and the installer's docker step are gone, and what
+stayed is pinned beside each absence.
 """
 
 import io
@@ -39,43 +40,39 @@ def _load_cli():
     return module
 
 
-class ParkedFlagTests(unittest.TestCase):
-    def test_flag_follows_the_denied_intents(self):
-        self.assertTrue(execution_park.FEATURES_PARKED)
-        self.assertIn(execution_park.Intent.AUTOMATE_START, execution_park.DENIED_INTENTS)
+class RetiredFeatureTests(unittest.TestCase):
+    def test_no_parked_flag_remains(self):
+        self.assertFalse(hasattr(execution_park, "FEATURES_PARKED"))
+        self.assertNotIn("FEATURES_PARKED", INSTALL)
+        self.assertNotIn("docker", INSTALL)
 
-    def test_ui_entries_ship_hidden_and_tagged(self):
+    def test_ui_has_no_automate_or_container_entry(self):
         html = (ROOT / "index.html").read_text()
-        for label in (">Container</button>", ">Automate</button>"):
-            line = next(l for l in html.splitlines() if label in l)
-            self.assertIn("data-parked", line)
-            self.assertIn('style="display:none"', line)
-        # Everything else in the deck stays visible.
+        for gone in (">Container</button>", ">Automate</button>", "data-parked",
+                     'id="auto-panel"', 'id="container-panel"', "/js/container.js",
+                     "/css/container.css"):
+            self.assertNotIn(gone, html)
+        # Everything else in the deck stays.
         for label in (">Projects</button>", ">Git</button>", ">Settings</button>"):
-            line = next(l for l in html.splitlines() if label in l)
-            self.assertNotIn("data-parked", line)
+            self.assertIn(label, html)
 
-    def test_state_js_unhides_only_when_the_server_says_unparked(self):
+    def test_state_js_no_longer_unhides_anything(self):
         source = (ROOT / "js" / "state.js").read_text()
-        self.assertIn("d.parked === false", source)
-        self.assertIn("[data-parked]", source)
+        self.assertNotIn("parked", source)
+        self.assertIn("fetch('/api/settings')", source)
 
-    def test_settings_api_reports_the_flag(self):
+    def test_settings_api_reports_no_flag(self):
         app = Flask("parked-flag")
         app.register_blueprint(settings.settings_bp)
         body = app.test_client().get("/api/settings").get_json()
-        self.assertIs(body["parked"], True)
-        with mock.patch.object(settings.park, "FEATURES_PARKED", False):
-            body = app.test_client().get("/api/settings").get_json()
-        self.assertIs(body["parked"], False)
+        self.assertTrue(body["ok"])
+        self.assertNotIn("parked", body)
 
-    def test_help_hides_container_while_parked_and_shows_it_after(self):
-        cli = _load_cli()
-        parked = cli.help_text(parked=True)
-        self.assertNotIn("container build", parked)
-        self.assertNotIn("activate-park-v16", parked)
-        self.assertIn("assist", parked)
-        self.assertIn("container build", cli.help_text(parked=False))
+    def test_help_has_no_container_verbs(self):
+        text = _load_cli().help_text()
+        self.assertNotIn("container", text)
+        self.assertNotIn("activate-park-v16", text)
+        self.assertIn("assist", text)
 
     def test_new_verbs_are_in_help(self):
         text = _load_cli().help_text()

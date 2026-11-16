@@ -116,10 +116,6 @@ if [[ "$CHECK_ONLY" == "1" ]]; then
     exit 0
 fi
 
-# One flag (shared/execution_park.py): while Automate and image builds are
-# parked, the installer neither checks for docker nor offers a container build.
-PARKED="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from shared.execution_park import FEATURES_PARKED; print(int(FEATURES_PARKED))' "$SCRIPT_DIR" 2>/dev/null || echo 1)"
-
 # Clipboard / key-send tools — fallback paths only (tmux path is always preferred).
 if [[ "$OS" == "Darwin" ]]; then
     # macOS: pbcopy/pbpaste are built-in; osascript handles folder picker and key-send.
@@ -155,18 +151,6 @@ else
     warn "  or Node.js: https://nodejs.org/"
 fi
 
-if [[ "$PARKED" == "1" ]]; then
-    :  # container features are parked; docker is not needed
-elif command -v docker >/dev/null; then
-    if docker ps >/dev/null 2>&1; then
-        ok "docker (user has access)"
-    else
-        warn "docker installed but user cannot run it — add user to docker group:"
-        warn "  sudo usermod -aG docker \$USER && newgrp docker"
-    fi
-else
-    warn "docker not found — container build/spawn features disabled"
-fi
 
 command -v curl >/dev/null && ok "curl" || warn "curl not found — assist CLI will fall back to python for HTTP"
 

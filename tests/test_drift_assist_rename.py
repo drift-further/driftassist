@@ -1,9 +1,9 @@
 """The rename to Drift Assist, and the one-release reads of pre-rename names.
 
-A live install made before the rename has only ~/.config/claude-assist/ and,
-possibly, only a claude-assist-container image. Both must keep working until
-the owner re-runs install.sh or rebuilds, and the new names must win as soon
-as they exist.
+A live install made before the rename has only ~/.config/claude-assist/;
+it must keep working until the owner re-runs install.sh, and the new name
+must win as soon as it exists. (The claude-assist-container image fallback
+went with Container in effort 621 phase 6.)
 """
 
 import contextlib
@@ -17,8 +17,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 from cli import config, proc
-from routes import container
-from shared import state
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -105,56 +103,6 @@ class ConfigDirFallbackTests(unittest.TestCase):
         self.assertNotIn("/claude-assist\"", source)
 
 
-class ContainerImageFallbackTests(unittest.TestCase):
-    def _resolve(self, name, built):
-        cfg = {"image": {"name": name}}
-        with patch.object(container, "_docker_image_exists", side_effect=lambda n: n in built):
-            return container.resolve_image_name(cfg)
-
-    def test_default_image_name_is_drift_assist(self):
-        self.assertEqual(
-            state.DEFAULT_CONTAINER_CONFIG["image"]["name"], "drift-assist-container"
-        )
-
-    def test_legacy_image_used_while_new_one_is_unbuilt(self):
-        self.assertEqual(
-            self._resolve("drift-assist-container", {"claude-assist-container"}),
-            "claude-assist-container",
-        )
-
-    def test_new_image_wins_once_built(self):
-        self.assertEqual(
-            self._resolve(
-                "drift-assist-container",
-                {"drift-assist-container", "claude-assist-container"},
-            ),
-            "drift-assist-container",
-        )
-
-    def test_explicit_name_never_falls_back(self):
-        self.assertEqual(
-            self._resolve("my-image", {"claude-assist-container"}), "my-image"
-        )
-
-    def test_status_reports_the_resolved_image(self):
-        seen = []
-
-        def fake_run(argv, **kwargs):
-            seen.append(argv)
-            return subprocess.CompletedProcess(argv, 0, "", "")
-
-        with patch.object(container, "resolve_image_name", return_value="claude-assist-container"), \
-                patch.object(container.subprocess, "run", side_effect=fake_run):
-            from flask import Flask
-            app = Flask("image-status")
-            app.register_blueprint(container.container_bp)
-            app.test_client().get("/api/container/status")
-        self.assertIn(
-            "claude-assist-container",
-            [argv[2] for argv in seen if argv[:2] == ["docker", "images"]],
-        )
-
-
 class StudioCliTests(unittest.TestCase):
     def _run(self, available):
         with patch.object(proc.shutil, "which", side_effect=lambda n: n if n in available else None), \
@@ -176,8 +124,6 @@ class ProductNameTests(unittest.TestCase):
         # The only pre-rename names allowed are the one-release fallbacks.
         allowed = {
             "cli/config.py",
-            "shared/state.py",
-            "docker/claude-mount.sh",
             "README.md",
             "tools/release/park_activation_handoff_harness.py",
             "tests/test_drift_assist_rename.py",

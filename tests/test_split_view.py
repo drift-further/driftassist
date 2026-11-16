@@ -133,3 +133,78 @@ console.log('PASS split owner, swap, phone visibility, dead target, simultaneous
         result=subprocess.run(['node','-e',script],cwd=ROOT,capture_output=True,text=True,timeout=10)
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
         self.assertIn('PASS split owner',result.stdout)
+
+    def test_pane_missing_from_one_list_revives_only_as_the_same_generation(self):
+        # One /poll whose tmux list-panes failed carries an empty (or partial)
+        # pane list. Split view marked the missing panes dead and nothing ever
+        # brought them back: both views stopped refreshing while the panes ran.
+        script = r'''
+const fs=require('fs'),vm=require('vm'),assert=require('assert/strict');
+const ids={'%1':{pane_id:'%1',pane_pid:11,server_pid:9},'%2':{pane_id:'%2',pane_pid:22,server_pid:9}};
+const context={console,innerWidth:1280,Date,Map,JSON,Math,String,setTimeout,clearTimeout,setInterval,clearInterval,
+ document:{hidden:false},window:{},_termTarget:'left:0.0',_attachments:[],_sessionPrompts:{},_draftCache:{},
+ localStorage:{setItem(){},getItem(){return null}},showFlash(){},authLost(){return false},captures:0,captureTerminal(){context.captures++},
+ fetch:async url=>{const id=decodeURIComponent(url.split('target=')[1]);return {json:async()=>({ok:true,identity:context.ids[id]})}},ids};
+vm.createContext(context);
+const source=fs.readFileSync('js/split-view.js','utf8').split('SplitView.init();')[0];
+vm.runInContext(source+'\nglobalThis.view=SplitView;',context);
+const view=context.view, watched=[];
+view.update=()=>{};view.other={watch(r){watched.push(r.target)},close(){},snapshot(){}};
+view.restored=true;view.enabled=true;view.active=0;
+const pane=(target,id,pid)=>({target,pane_id:id,pane_pid:String(pid),created:5,session:target.split(':')[0],window:0});
+const live=[pane('left:0.0','%1',11),pane('right:1.1','%2',22)];
+view.slots=[{...view.record(live[0]),identity:ids['%1']},{...view.record(live[1]),identity:ids['%2']}];
+const settle=()=>new Promise(r=>setTimeout(r,0));
+(async()=>{
+view.reconcile([],Date.now()+1);
+assert.deepEqual(view.slots.map(r=>r.dead),[true,true]);
+view.reconcile(live,Date.now()+2);await settle();await settle();
+assert.deepEqual(view.slots.map(r=>r.dead),[false,false],'both views come back');
+assert.deepEqual(view.slots.map(r=>r.identity.pane_pid),[11,22]);
+assert.equal(context.captures,1,'the input pane repaints');assert.deepEqual(watched,['right:1.1'],'the companion reconnects');
+// A partial list: only the companion drops out, and comes back.
+view.reconcile([live[0]],Date.now()+3);assert.deepEqual(view.slots.map(r=>r.dead),[false,true]);
+view.reconcile(live,Date.now()+4);await settle();await settle();assert.equal(view.slots[1].dead,false);
+// Must not revive: the same pane id now runs a new process.
+view.reconcile([live[0]],Date.now()+5);
+view.reconcile([live[0],pane('right:1.1','%2',99)],Date.now()+6);await settle();await settle();
+assert.equal(view.slots[1].dead,true,'a new pane generation is not the old view');
+// Must not revive: the list matches but the server reports another identity.
+context.ids['%2']={pane_id:'%2',pane_pid:22,server_pid:10};
+view.reconcile(live,Date.now()+7);await settle();await settle();
+assert.equal(view.slots[1].dead,true);assert.equal(view.slots[1].identity,null);
+view.reconcile(live,Date.now()+8);await settle();await settle();
+assert.equal(view.slots[1].dead,true,'a refused identity is final, not retried into life');
+console.log('PASS revival');
+})().catch(e=>{console.error(e);process.exitCode=1});
+'''
+        result=subprocess.run(['node','-e',script],cwd=ROOT,capture_output=True,text=True,timeout=10)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertIn('PASS revival',result.stdout)
+
+    def test_right_click_after_leaving_split_is_not_already_in_split(self):
+        # Leaving split view keeps the old slot records. The right-click guard
+        # read them anyway, so a tab from the last split said "Already in split
+        # view" and did nothing while no split was showing.
+        script = r'''
+const fs=require('fs'),vm=require('vm'),assert=require('assert/strict');
+const panes=[{target:'left:0.0',pane_id:'%1',pane_pid:'1',created:5},{target:'right:1.1',pane_id:'%2',pane_pid:'2',created:5}];
+const context={console,Date,Map,JSON,Math,String,document:{hidden:false},window:{},_termTarget:'left:0.0',_sessionPanes:panes,
+ flashes:[],showFlash(k,m){context.flashes.push(m)}};
+vm.createContext(context);
+const source=fs.readFileSync('js/split-view.js','utf8').split('SplitView.init();')[0];
+vm.runInContext(source+'\nglobalThis.view=SplitView;',context);
+const view=context.view, chosen=[];
+view.choose=(pane,slot)=>chosen.push([pane.target,slot]);
+view.slots=[view.record(panes[1]),view.record(panes[0])];view.enabled=false;
+view.openWith('right:1.1');
+assert.deepEqual(context.flashes,[]);assert.deepEqual(chosen,[['right:1.1',1]]);
+assert.equal(JSON.stringify(view.slots.map(r=>r.target)),'["left:0.0"]','a fresh split starts from the tab in view');
+// While a split is showing, the guard still holds.
+view.enabled=true;view.active=0;view.slots=[view.record(panes[0]),view.record(panes[1])];
+view.openWith('right:1.1');assert.deepEqual(context.flashes,['Already in split view']);assert.equal(chosen.length,1);
+console.log('PASS right-click');
+'''
+        result=subprocess.run(['node','-e',script],cwd=ROOT,capture_output=True,text=True,timeout=10)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertIn('PASS right-click',result.stdout)

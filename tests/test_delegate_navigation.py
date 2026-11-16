@@ -119,3 +119,41 @@ _runAction('selectTab',['del_a:0.1']);assert.equal(selected,'del_a:0.1');
 let opened=null;toggleDelegateRail=s=>{opened=s};
 _runAction('toggleDelegateRail',['a']);assert.equal(opened,'a');
 """)
+
+    def test_rail_under_terminal_floor_opens_sheet_instead_of_refusing(self):
+        # A phone: the inline rail leaves the terminal under 320px, so a tap moved nothing
+        # but a "Close a panel" flash. A tap now opens every child in the sheet; a resize
+        # alone (the keyboard) still closes the rail; a roomy terminal keeps it inline.
+        self.run_js(r"""
+class CL{constructor(){this.s=new Set()}add(n){this.s.add(n)}remove(n){this.s.delete(n)}
+ contains(n){return this.s.has(n)}toggle(n,on){on=on===undefined?!this.s.has(n):!!on;on?this.s.add(n):this.s.delete(n);return on}}
+class El{constructor(t){this.tagName=t;this.children=[];this.parentNode=null;this.classList=new CL();this.dataset={};this.attributes={};this.textContent=''}
+ set className(v){this.classList=new CL();String(v).split(/\s+/).filter(Boolean).forEach(n=>this.classList.add(n))}
+ set innerHTML(v){for(const c of this.children)c.parentNode=null;this.children=[]}
+ appendChild(c){if(c.parentNode)c.remove();c.parentNode=this;this.children.push(c);return c}
+ remove(){if(!this.parentNode)return;const k=this.parentNode.children;k.splice(k.indexOf(this),1);this.parentNode=null}
+ setAttribute(n,v){this.attributes[n]=String(v)}}
+const host=new El('div'),display={clientHeight:0},body=new El('body');
+globalThis.document={body,createElement:t=>new El(t),querySelectorAll:()=>[],
+ getElementById:id=>id==='delegate-rail-host'?host:id==='term-display'?display:id==='delegate-sheet'?body.children.find(c=>c.id==='delegate-sheet')||null:null};
+const frames=[];globalThis.requestAnimationFrame=fn=>frames.push(fn);const flush=()=>{while(frames.length)frames.shift()()};
+globalThis.shortName=s=>s;globalThis._termTarget='a:0.0';globalThis._tabState=ts;
+let flashes=0;globalThis.showFlash=()=>{flashes++};
+_delegateNavigation=buildDelegateNavigation(panes,ts);
+for(const u of _delegateNavigation)for(const c of u.children)_delegateTabElements.set(c.target,new El('button'));
+const sheet=()=>document.getElementById('delegate-sheet');
+display.clientHeight=250;
+toggleDelegateRail('a');flush();
+assert.equal(expandedDelegateParent,'a');assert.equal(flashes,0);
+assert.ok(!host.classList.contains('is-open'));
+assert.equal(sheet().children.filter(c=>c.classList.contains('delegate-child-row')).length,3);
+closeDelegateSheet();flush();
+assert.equal(expandedDelegateParent,null);assert.equal(sheet(),null);
+toggleDelegateRail('a');flush();delegateSelectTarget('del_a:0.0');flush();
+assert.equal(expandedDelegateParent,null);assert.equal(sheet(),null);
+display.clientHeight=600;
+toggleDelegateRail('a');flush();
+assert.ok(host.classList.contains('is-open'));assert.equal(sheet(),null);
+display.clientHeight=250;_enforceDelegateFloor(false);
+assert.equal(expandedDelegateParent,null);assert.ok(!host.classList.contains('is-open'));
+""")

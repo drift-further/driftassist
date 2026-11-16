@@ -1448,6 +1448,11 @@ body.tabs-wrap .tabs-scroll-btn { display: none; }
 .delegate-more { color: var(--purple); }
 .delegate-sheet { position: fixed; z-index: 200; bottom: 0; left: 0; right: 0; max-height: 65vh; overflow-y: auto; padding: 12px; border: 1px solid var(--border); border-radius: 8px 8px 0 0; background: var(--bg); display: flex; flex-direction: column; gap: 4px; }
 .delegate-sheet > button { min-height: 44px; }
+.delegate-sheet > button:not(.session-tab) { border: 1px solid var(--border); border-radius: 6px; background: var(--bg-raised); color: var(--text-strong); font: inherit; }
+/* A phone opens every delegate here: long names end in an ellipsis instead of running into the marks. */
+.delegate-sheet .delegate-child-row { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding-right: 44px; }
+.delegate-sheet .delegate-child-row .tab-model { display: none; }
+.delegate-sheet .delegate-child-row .delegate-age { margin-left: 8px; }
 .navigation-unit.stale-tucked { display: none; }
 
 .navigation-unit { font-size: 11px; }

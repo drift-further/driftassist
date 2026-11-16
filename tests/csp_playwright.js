@@ -36,7 +36,7 @@ if (/:8089\b|assist\.drift/.test(BASE)) throw new Error('refusing to run against
 const SKIP = new Set([
     'killSession', 'killPurgeSelected', 'restartServer', 'resetAllSettings',
     'gitPush', 'gitCommitPushConfirm', 'pickFolderNative', 'createVenv',
-    'clearHistory', 'automateRun', 'automateStop', 'copyAttachCommand', 'doPaste',
+    'clearHistory', 'copyAttachCommand', 'doPaste',
     'studioConnectSave', 'resumeTerminal', 'vaultSendDefault', 'triggerUpload',
     'sendKey', 'sendCombo', 'sendInsertMode', 'typeCmd', 'typePrefix', 'accessOpen',
     'toggleAutoYes', 'cancelAutoYesCountdown', 'ayPickConfirm', 'ayPickTurnOff',

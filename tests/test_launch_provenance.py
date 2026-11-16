@@ -12,7 +12,7 @@ from unittest import mock
 from shared import launch_provenance as provenance
 from shared import park_activation as activation
 from shared import tmux
-from routes import automate, commands, git, terminal
+from routes import commands, git, terminal
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -495,14 +495,12 @@ class LaunchProvenanceTests(unittest.TestCase):
         ]
         self.assertNotIn("initialize_for_startup", handoff_branch)
 
-    def test_all_six_creation_surfaces_receipt_before_delivery_or_success(self):
+    def test_every_creation_surface_receipts_before_delivery_or_success(self):
         surfaces = (
             (terminal._terminal_launch_effect, "fresh_terminal"),
             (terminal._terminal_duplicate_effect, "duplicate"),
             (commands._run_command_effect, "saved_command_split"),
             (git._git_run_effect, "temporary_git"),
-            (automate._automate_start_inner, "automate_start"),
-            (automate._automate_relaunch_effect, "automate_hard_relaunch"),
         )
         for function, surface in surfaces:
             with self.subTest(surface=surface):
@@ -559,12 +557,6 @@ class LaunchProvenanceTests(unittest.TestCase):
     def test_existing_terminal_reconnect_and_recovery_are_adoptions(self):
         checks = (
             (terminal._existing_terminal_effect, "existing_terminal", "state.tmux_target"),
-            (automate.automate_reconnect, "automate_reconnect", "_automate_save()"),
-            (
-                automate.automate_recover,
-                "automate_startup_recovery",
-                "state.automate.update(",
-            ),
         )
         for function, surface, later_effect in checks:
             with self.subTest(surface=surface):

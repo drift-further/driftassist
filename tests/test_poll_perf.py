@@ -143,8 +143,8 @@ class PollWireTests(unittest.TestCase):
         from shared import resume_line
         for kind in ('shell', 'claude', 'cursor', 'opencode', 'gemini', 'codex'):
             with self.subTest(kind=kind), \
-                 patch.object(self.poll, 'resolve_process', side_effect=lambda target, *args:
-                              kind if target.startswith('agent:') else 'shell'), \
+                 patch.object(self.poll, 'resolve_process_detail', side_effect=lambda target, *args:
+                              (kind if target.startswith('agent:') else 'shell', False)), \
                  patch.object(resume_line, 'RESOLVER', resume_line.Resolver()), \
                  patch.object(delegates, 'observe_process_tree', wraps=delegates.observe_process_tree) as observe, \
                  patch.object(self.poll, 'resume_for_pane', wraps=self.poll.resume_for_pane) as resume:
@@ -226,6 +226,62 @@ class PollWireTests(unittest.TestCase):
         with patch.object(self.poll, "SCAN_RECAPTURE_SEC", 0):
             self.get()
         self.assertEqual(self.captured(), ["agent", "busy", "quiet"])
+
+    def test_one_poll_builds_the_proc_snapshot_once_and_walks_each_pane_once(self):
+        # Task 2304 review: the Auto-Yes refusal is read from the same walk
+        # resolve_process makes, not from a second walk per pane in the scan
+        # loop, which outlived the snapshot's 0.25 s TTL and rebuilt /proc.
+        # The TTL is held open so only a second walk or a forced/direct build
+        # can show up here, never the clock. Every session is armed and the
+        # agent pane runs an agent, so the popup's Auto-Yes question is asked
+        # (gemini: no resume observation, which reads /proc on its own).
+        from collections import Counter
+
+        from shared import agent_identity
+        self._agent_tree(["gemini"])
+        with patch("routes.poll.state.autoyes_enabled_for", return_value=(True, "explicit")), \
+             patch.object(agent_identity, "_PROCESS_CACHE_TTL", 3600), patch.object(
+            agent_identity, "_build_process_snapshot", wraps=agent_identity._build_process_snapshot
+        ) as build, patch.object(
+            agent_identity, "_scan_process_tree", wraps=agent_identity._scan_process_tree
+        ) as walk:
+            self.get()
+        self.assertLessEqual(build.call_count, 1)
+        walks = Counter(c.args[0] for c in walk.call_args_list)
+        self.assertEqual(set(walks), {"agent:0.0", "busy:0.0", "quiet:0.0"})
+        self.assertEqual(set(walks.values()), {1}, walks)
+
+    def _agent_tree(self, *agents, session="agent"):
+        """A fake /proc with the session pane's real root and these agent children."""
+        from tests.test_process_observation import FakeProc
+        root = int(self.box.tmux("display-message", "-p", "-t", session, "#{pane_pid}").strip())
+        procs = {root: {"comm": "bash", "argv": ["bash"], "ppid": 1, "start": 1000}}
+        for i, argv in enumerate(agents, 1):
+            procs[root + 100 * i] = {"comm": argv[0], "argv": argv, "ppid": root, "start": 1000 + i}
+        FakeProc(procs).install(self)
+
+    def test_a_pane_with_two_same_kind_agents_keeps_its_question_popup(self):
+        # An armed pane showing a live Claude "❯ Yes" dialog, which the content
+        # tier recognises as Claude even with no process identity. One claude
+        # under the root: Auto-Yes owns the prompt, no popup. Two: the scanner
+        # refuses the pane, so the popup must not be suppressed.
+        from shared import resume_line
+        self.box.tmux("new-session", "-d", "-s", "ask", "-x", "120", "-y", "20",
+                      "printf '%s\\n' '────────────────────' ' Do you want to proceed?' "
+                      "' ❯ Yes' '   No' ' Enter to select · Esc to cancel'; sleep 600")
+        _settle(0.5)
+        with patch("routes.poll.state.autoyes_enabled_for", return_value=(True, "explicit")), \
+             patch.object(resume_line, "RESOLVER", resume_line.Resolver()):
+            self._agent_tree(["claude"], session="ask")
+            entry = self.scan(self.get())["ask"]
+            self.assertIn("❯ Yes", entry["tail"])
+            self.assertTrue(entry["prompt"]["autoyes"])
+            self._agent_tree(["claude"], ["claude"], session="ask")
+            entry = self.scan(self.get())["ask"]
+            # Refused at the process tier, still Claude by content: only the
+            # refusal can be what keeps Auto-Yes from owning this prompt.
+            self.assertEqual(entry["agent_kind"], "claude")
+            self.assertFalse(entry["prompt"]["autoyes"])
 
     def test_shell_children_come_from_the_proc_snapshot_not_pgrep(self):
         states = self.get()["states"]

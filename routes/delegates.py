@@ -32,7 +32,9 @@ from routes.autoyes import (
 from shared import delegate_signals, pane_scan, resume_line
 from shared.delegate_channel import Channel, SEED_OPTIONS, seed
 from shared.tmux import tmux_exact_target
-from shared.agent_identity import ROOT_UNKNOWN, observe_process_tree, refine_with_content, pane_root_start
+from shared.agent_identity import (
+    ROOT_UNKNOWN, identity_refused, observe_process_tree, pane_root_start, refine_with_content,
+)
 from shared.delegate_state import classify, identity_of
 
 log = logging.getLogger(__name__)
@@ -108,10 +110,11 @@ def _capture(pane_id):
     return cap.stdout if cap.returncode == 0 else None
 
 
-def _autoyes_copy(target, session, process_kind, agent_kind):
+def _autoyes_copy(target, session, process_kind, agent_kind, refused=False):
     """The scanner's live records for this target, copied under autoyes_lock."""
     enabled, source = state.autoyes_enabled_for(session)
-    armed = autoyes_will_consider(target, enabled, source, process_kind, agent_kind)
+    armed = autoyes_will_consider(target, enabled, source, process_kind, agent_kind,
+                                  refused=refused)
     with state.autoyes_lock:
         countdown = state.autoyes_countdowns.get(target)
         answered = state.autoyes_answered.get(target)
@@ -204,7 +207,8 @@ def _build_sample(row, now, settings):
         "changed_at": sampled.changed_at if sampled else None,
         "identity": identity, "content_kind": content_kind,
         "attention": attention, "request_id": request_id,
-        "autoyes": _autoyes_copy(target, row["session"], process_kind or content_kind, agent_kind),
+        "autoyes": _autoyes_copy(target, row["session"], process_kind or content_kind, agent_kind,
+                                 refused=identity_refused(target, row["pane_pid"])),
         "chrome": delegate_signals.chrome(raw, title),
         "claude_status": _claude_status(identity["agent_pid"], identity["agent_start"])
         if agent_kind == "claude" else None,
