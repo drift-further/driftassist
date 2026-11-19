@@ -142,7 +142,7 @@ function studioRenderTrigger(c) {
     trigger.setAttribute('aria-label', label);
     trigger.title = label;
     var session = document.getElementById('studio-panel-session');
-    if (session) session.textContent = target ? '/ ' + target.split(':')[0] : '';
+    if (session) session.textContent = target ? '/ ' + sessionOf(target) : '';
     var badge = document.getElementById('studio-badge');
     if (badge) {
         badge.textContent = count > 9 ? '9+' : String(count);
@@ -355,7 +355,7 @@ function studioConfirmComplete(task, card) {
     card.querySelector('.studio-confirm')?.remove();
     var box = studioNode('div', 'studio-confirm'); box.setAttribute('role', 'group'); box.setAttribute('aria-label', 'Confirm task completion');
     box.appendChild(studioNode('strong', '', 'Confirm this task is complete?'));
-    box.appendChild(studioNode('p', '', studioTarget().split(':')[0] + ' · ' + task.title));
+    box.appendChild(studioNode('p', '', sessionOf(studioTarget()) + ' · ' + task.title));
     box.appendChild(studioNode('p', '', 'You have reviewed the result. Studio will record the task as done. No code will be committed.'));
     var payload = Object.assign({}, studioFrozen(), {task_id: task.id, expected_status: task.status, task_revision: task.assist_revision, status: 'done', request_id: studioRequestId()});
     var yes = studioButton('Yes, confirm complete', function () { studioAction('/studio/task-status', payload, box); }, 'studio-primary studio-submit'); box.appendChild(yes);
@@ -374,7 +374,7 @@ function studioFeedbackEditor(task, card) {
         section.querySelector('.studio-confirm')?.remove();
         var box = studioNode('div', 'studio-confirm');
         box.appendChild(studioNode('strong', '', 'Save this feedback?'));
-        box.appendChild(studioNode('p', '', frozen.target.split(':')[0] + ' · ' + task.title));
+        box.appendChild(studioNode('p', '', sessionOf(frozen.target) + ' · ' + task.title));
         box.appendChild(studioNode('p', '', note.value.trim()));
         box.appendChild(studioNode('p', 'studio-context-muted', 'Adds a Studio task note. The task stays open. This does not send a message to the agent.'));
         var payload = Object.assign({}, frozen, {task_id: task.id, expected_status: task.status, task_revision: task.assist_revision, note: note.value.trim(), request_id: studioRequestId()});
@@ -451,7 +451,7 @@ function studioAnswer(qid, action, select, text) {
     var recommendation = action === 'accept' ? studioRecommendation(question) : null;
     if (action === 'accept' && !recommendation) return;
     confirmation.appendChild(studioNode('strong', '', 'Send this answer?'));
-    confirmation.appendChild(studioNode('p', '', studioTarget().split(':')[0] + ' · ' + question.prompt));
+    confirmation.appendChild(studioNode('p', '', sessionOf(studioTarget()) + ' · ' + question.prompt));
     confirmation.appendChild(studioNode('p', 'studio-confirm-answer', recommendation ? studioRecommendationText(recommendation) : select || text));
     var consequence = recommendation ? recommendation.selections.find(function (s) { return /^(waive|wontfix)$/i.test(s); }) : select;
     if (/^(waive|wontfix)$/i.test(consequence || '')) confirmation.appendChild(studioNode('p', 'studio-context-warning', /^waive$/i.test(consequence) ? 'Studio will waive linked gates and close current blocking findings.' : 'Studio will close current blocking findings without waiving gates.'));

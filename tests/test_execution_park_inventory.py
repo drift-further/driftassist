@@ -94,7 +94,6 @@ _classify(
 _classify(
     "fixed:observe",
     "routes/terminal.py:enrich_panes_with_agents",
-    "routes/terminal.py:terminal_sessions",
     "routes/terminal.py:terminal_cwd",
     "routes/terminal.py:terminal_duplicate",
 )
@@ -128,6 +127,10 @@ _classify(
     "shared/tmux.py:_tty_echo_off",
     "shared/tmux.py:tmux_target_exists",
     "shared/tmux.py:pane_tab_target",
+    # The one pane listing and the durable-key lookup (621 Phase 7).
+    "shared/tmux.py:list_panes",
+    "shared/tmux.py:resolve_pane_key",
+    "shared/tmux.py:bind_pane_key_status",
 )
 _classify("intent:operator_interactive", "shared/tmux.py:get_clipboard")
 _classify(

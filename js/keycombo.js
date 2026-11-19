@@ -62,7 +62,7 @@ let _comboQueue = Promise.resolve();
 function sendCombo(key) {
     const combo = { ctrl: _comboMods.ctrl, alt: _comboMods.alt, shift: _comboMods.shift, key: key };
     const label = _comboPrefix() + (_comboNames[key] || key);
-    const route = {target: getInputTarget(), ...(typeof inputIdentity === 'function' ? inputIdentity() : {})};
+    const route = inputRoute();
     _clearComboMods();
     _comboQueue = _comboQueue.then(() => _postCombo(combo, label, route));
     return _comboQueue;

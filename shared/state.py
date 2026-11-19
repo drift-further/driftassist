@@ -75,9 +75,13 @@ DEFAULT_SETTINGS = {
         "font_size": 13,
         "default_cols": 200,
         "default_rows": 60,
+        # Scrollback a tab opens with; 0 = all (up to limits.max_capture_lines).
         "capture_lines": 2000,
         "tmux_history_limit": 20000,
         "idle_threshold_sec": 300,
+        # The Fit menu's presets: "Name:COLS" or "Name:COLSxROWS", comma
+        # separated. A preset without rows fits the height to the screen.
+        "fit_presets": "Phone:58, Compact:100, Wide:160, Desktop:200",
     },
     "autoyes": {
         "default_delay": 5,
@@ -249,6 +253,32 @@ _FRACTIONAL_SETTINGS = frozenset({"autoyes.default_delay", "autoyes.delay"})
 # it (shared/studio_client.py:web_base).
 _URL_SETTINGS = frozenset({"studio.web_base", "studio.api_base"})
 PURGE_IDLE_THRESHOLDS = (3600, 14400, 43200, 86400, 259200)
+# Settings where 0 is a legal sentinel ("all") below the range's floor.
+_ZERO_MEANS_ALL = frozenset({"terminal.capture_lines"})
+# One Fit preset: a name, then cols, then optional xROWS.
+_FIT_PRESET_RE = re.compile(r"\s*([^:,]{1,24}?)\s*:\s*(\d{2,3})(?:\s*[x×]\s*(\d{2,3}))?\s*")
+FIT_PRESETS_MAX = 8
+
+
+def parse_fit_presets(value):
+    """Return [(name, cols, rows|None)] for a fit_presets string, or None if
+    any entry is malformed or out of the Fit menu's bounds (cols 40–400, rows
+    10–600). An empty string is no presets."""
+    if not value.strip():
+        return []
+    out = []
+    for entry in value.split(","):
+        m = _FIT_PRESET_RE.fullmatch(entry)
+        if not m or not m.group(1).strip():
+            return None
+        cols = int(m.group(2))
+        rows = int(m.group(3)) if m.group(3) else None
+        if not 40 <= cols <= 400 or (rows is not None and not 10 <= rows <= 600):
+            return None
+        out.append((m.group(1).strip(), cols, rows))
+    return out if len(out) <= FIT_PRESETS_MAX else None
+
+
 # A delegate session prefix: letters, digits, `_` or `-`, ending in `_`.
 _DELEGATE_PREFIX_RE = re.compile(r"[A-Za-z0-9_-]+_")
 
@@ -288,7 +318,7 @@ def check_setting(path, value, default, enforce_range=True):
             return False, value
         if enforce_range and path in SETTING_RANGES:
             low, high = SETTING_RANGES[path]
-            if not low <= value <= high:
+            if not low <= value <= high and not (value == 0 and path in _ZERO_MEANS_ALL):
                 return False, value
         return True, value
     if isinstance(default, str):
@@ -300,6 +330,8 @@ def check_setting(path, value, default, enforce_range=True):
             return value in CLAUDE_COMMANDS, value
         if path in _URL_SETTINGS:
             return (value == "" or _is_http_url(value)), value
+        if path == "terminal.fit_presets":
+            return parse_fit_presets(value) is not None, value
         return True, value
     if isinstance(default, list):
         ok = isinstance(value, list) and all(isinstance(v, str) for v in value)

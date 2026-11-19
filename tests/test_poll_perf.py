@@ -149,8 +149,8 @@ class PollWireTests(unittest.TestCase):
                  patch.object(delegates, 'observe_process_tree', wraps=delegates.observe_process_tree) as observe, \
                  patch.object(self.poll, 'resume_for_pane', wraps=self.poll.resume_for_pane) as resume:
                 self.get()
-                self.assertEqual(resume.call_count, int(kind in ('codex', 'claude')))
-                self.assertEqual(observe.call_count, int(kind in ('codex', 'claude')))
+                self.assertEqual(resume.call_count, int(kind in ('codex', 'claude', 'gemini')))
+                self.assertEqual(observe.call_count, int(kind in ('codex', 'claude', 'gemini')))
 
     def get(self, since=None):
         self.calls.clear()
@@ -234,11 +234,11 @@ class PollWireTests(unittest.TestCase):
         # The TTL is held open so only a second walk or a forced/direct build
         # can show up here, never the clock. Every session is armed and the
         # agent pane runs an agent, so the popup's Auto-Yes question is asked
-        # (gemini: no resume observation, which reads /proc on its own).
+        # (cursor-agent: no resume observation, which reads /proc on its own).
         from collections import Counter
 
         from shared import agent_identity
-        self._agent_tree(["gemini"])
+        self._agent_tree(["cursor-agent"])
         with patch("routes.poll.state.autoyes_enabled_for", return_value=(True, "explicit")), \
              patch.object(agent_identity, "_PROCESS_CACHE_TTL", 3600), patch.object(
             agent_identity, "_build_process_snapshot", wraps=agent_identity._build_process_snapshot

@@ -64,6 +64,12 @@ CORPUS = [
      _dialog("Do you trust the contents of this directory?", _RULE,
              "  › 1. Yes, continue", "    2. No, quit", "Press enter to continue"),
      "numbered-yes"),
+    # Finding 6976: agy-modal must not shadow numbered-options on gemini numbered permission menus
+    ("gemini numbered permission menu", "gemini",
+     "\n".join(["Requesting permission for: git status", _RULE,
+                "  > 1. Yes, allow tool call", "    2. No, deny access",
+                "  ↑/↓ Navigate · enter Confirm"]),
+     "numbered-yes"),
     ("selected yes", "claude",
      _dialog(_RULE, "  ❯ Yes", "    2. No", "Enter to select · Esc to cancel"),
      "selected-yes"),
@@ -142,6 +148,49 @@ CORPUS = [
     ("cursor trust, already answered", "cursor",
      "\n".join(["│  ⚠ Workspace Trust Required", "│  [a] Trust this workspace",
                 "│  ⏳ Trusting workspace..."]), None),
+    # Finding 6967: agy folder trust must NEVER be auto-answered by Auto-Yes!
+    ("agy folder trust, yes selected (never auto-yes)", "gemini",
+     "\n".join(["Accessing workspace:", "", "/tmp/example-project", "",
+                "Do you trust the contents of this project?", "",
+                "Antigravity CLI requires permission to read, edit, and execute files here.", "",
+                "> Yes, I trust this folder", "  No, exit", "",
+                "  ↑/↓ Navigate · enter Confirm",
+                "                                                        Gemini 4 Neon · high"]), None),
+    ("agy folder trust, 40-col wrapped (never auto-yes)", "gemini",
+     "\n".join(["Accessing workspace:", "", "/tmp/example-project", "",
+                "Do you trust the contents of this", "project?", "",
+                "> Yes, I trust this folder", "  No, exit", "",
+                "  ↑/↓ Navigate · enter Confirm",
+                "Gemini 4 Neon · high"]), None),
+    ("agy folder trust, no selected", "gemini",
+     "\n".join(["Do you trust the contents of this project?", "",
+                "  Yes, I trust this folder", "> No, exit", "",
+                "  ↑/↓ Navigate · enter Confirm"]), None),
+    ("agy folder trust, quoted above idle composer", "gemini",
+     "\n".join(["Do you trust the contents of this project?", "",
+                "> Yes, I trust this folder", "  No, exit",
+                "  ↑/↓ Navigate · enter Confirm",
+                _RULE, "> ", _RULE, "? for shortcuts      Gemini 4 Neon · high"]), None),
+    ("agy 24-row data-sharing wizard is never auto-answered", "gemini",
+     "\n".join(["Terms of Service & Data Use", "",
+                *[f"  Terms paragraph line {i}" for i in range(1, 15)],
+                "> [x] Yes, I agree to help improve Antigravity CLI by allowing Google to collect",
+                "      and use my Interactions data",
+                "  ↑/↓ Navigate · enter Toggle",
+                "                                                        Gemini 4 Neon · high"]), None),
+    ("agy color scheme modal is never auto-answered", "gemini",
+     "\n".join(["Choose your color scheme:", "", "> Dark", "  Light",
+                "  ↑/↓ Navigate · enter Confirm",
+                "                                                        Gemini 4 Neon · high"]), None),
+    ("agy settings error modal is never auto-answered", "gemini",
+     "\n".join(["⚠ Settings Error", "", "Failed to parse settings.json",
+                "> Continue with defaults", "  Exit",
+                "  enter Confirm · esc Exit",
+                "                                                        Gemini 4 Neon · high"]), None),
+    ("agy trust dialog on non-gemini pane", "claude",
+     "\n".join(["Do you trust the contents of this project?", "",
+                "> Yes, I trust this folder", "  No, exit",
+                "  ↑/↓ Navigate · enter Confirm"]), None),
     ("opencode row without its header", "opencode",
      "△ nothing here\n  Allow once  Allow always  Reject", None),
     ("y/n/a on a non-claude pane", "codex", _dialog("Allow this? (y/n/a)"), None),
@@ -285,11 +334,12 @@ console.log(JSON.stringify({
         return [answers(detectionTail(wire)), answers(detectionTail(stream))];
     }),
     // The attention decision (spec 7185 §4.4): is there a prompt a human has
-    // to look at? Compared as a boolean against routes/autoyes.py:observe_attention.
+    // to look at, and of which kind (answerable | menu | question | null)?
     attention: corpus.map(([k, wire, stream]) => {
         kind = k;
-        return [observeAttention(detectionTail(wire), k) !== null,
-                observeAttention(detectionTail(stream), k) !== null];
+        const w = observeAttention(detectionTail(wire), k);
+        const s = observeAttention(detectionTail(stream), k);
+        return [w ? w.kind : null, s ? s.kind : null];
     }),
 }));
 """
@@ -356,7 +406,8 @@ class AttentionParityTests(unittest.TestCase):
     def _server(self, tail, kind, depth):
         from routes.autoyes import observe_attention
         with _depth_patch(depth):
-            return observe_attention(_capture(tail, ansi=False), kind) is not None
+            got = observe_attention(_capture(tail, ansi=False), kind)
+            return got["kind"] if got is not None else None
 
     def test_server_and_browser_agree_on_every_fixture(self):
         for depth in DEPTHS:
@@ -369,8 +420,12 @@ class AttentionParityTests(unittest.TestCase):
             for (name, kind, tail), (wire, stream) in zip(rows, got):
                 with self.subTest(depth=depth, fixture=name):
                     want = self._server(tail, kind, depth)
-                    self.assertEqual(wire, want, "via /poll")
-                    self.assertEqual(stream, want, "via the stream")
+                    self.assertEqual(wire is not None, want is not None, "via /poll")
+                    self.assertEqual(stream is not None, want is not None, "via the stream")
+                    # agy modals must also agree on exact kind ('menu' vs 'question' vs None)
+                    if kind == "gemini" and name.startswith("agy "):
+                        self.assertEqual(wire, want, "agy kind via /poll")
+                        self.assertEqual(stream, want, "agy kind via the stream")
 
     def test_the_attention_corpus_covers_both_directions(self):
         from routes.autoyes import observe_attention

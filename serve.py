@@ -123,6 +123,13 @@ def start_application_backgrounds():
     from shared.studio_context import studio_observer, studio_context_refresher
     from shared.studio_events import studio_event_receiver, studio_event_consumer
     from shared.updates import manager as update_manager
+    from shared import drafts, tab_state
+
+    # Pane-keyed state (621 Phase 7 step B): convert a pre-upgrade drafts.json
+    # and tab_state.json now, before any request, so a session rename cannot
+    # reach them first. Each retries on first use if the listing fails here.
+    drafts.ensure_converted()
+    tab_state.ensure_converted()
 
     threading.Thread(target=autoyes_scanner, daemon=True).start()
     threading.Thread(target=delegate_watcher, daemon=True).start()

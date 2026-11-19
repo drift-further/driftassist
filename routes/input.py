@@ -20,7 +20,7 @@ import time
 import uuid
 from pathlib import Path
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, g, jsonify, request
 
 import shared.segments as segments
 import shared.state as state
@@ -31,10 +31,13 @@ from shared.key_combo import ComboError, combo_to_tmux
 from shared.tmux import (
     TMUX_KEY_MAP,
     ExpectedTargetIdentity,
+    bind_pane_key_status,
     expected_target_identity,
     generation_bound_delivery,
     get_clipboard,
+    identity_matches_binding,
     pane_awaits_secret,
+    parse_pane_key,
     prompt_owner_waiting,
 )
 from shared.utils import (
@@ -50,9 +53,55 @@ log = logging.getLogger(__name__)
 _favorites_lock = threading.RLock()
 
 
+def _key_binding(data):
+    """(is_key, binding) for the request's target. A durable key is bound to
+    its pane and tmux server (shared/tmux.py:bind_pane_key_status), once per
+    request; binding is None when the key names no live pane or tmux could
+    not be asked (`_absent` tells the two apart)."""
+    value = data.get("target")
+    if not isinstance(value, str) or not parse_pane_key(value.strip()):
+        return False, None
+    if "pane_key_binding" not in g:
+        g.pane_key_binding = bind_pane_key_status(value)
+    return True, g.pane_key_binding[0]
+
+
+def _request_target(data):
+    """The display target for bookkeeping (activity, history): a key's from
+    its binding (None when it names no live pane), else resolve_target's."""
+    is_key, binding = _key_binding(data)
+    if is_key:
+        return binding.display_target if binding else None
+    return resolve_target(data)
+
+
+def _absent(data):
+    """The refusal for a target with no deliverable identity: 409
+    target_absent, or 503 tmux_unavailable when a key could not be checked
+    because tmux did not answer (a timeout is not the pane being gone)."""
+    is_key, _binding = _key_binding(data)
+    if is_key and g.pane_key_binding[1] == "unknown":
+        return jsonify({"ok": False, "error": "tmux_unavailable"}), 503
+    return jsonify({"ok": False, "error": "target_absent"}), 409
+
+
 def _input_identity(data, target):
-    """A carried browser identity cannot adopt a new pane at the old name."""
-    live = expected_target_identity(target) if target else None
+    """A carried browser identity cannot adopt a new pane at the old name.
+
+    For a durable key the identity is selected by the key's own `%N`, never by
+    the display address it resolved to (a pane swapped or replaced there in
+    between would be selected instead), and it must be the key's pane on the
+    key's server: pane id, server pid and start time, and socket.
+    """
+    is_key, binding = _key_binding(data)
+    if is_key:
+        if binding is None:
+            return None
+        live = expected_target_identity(binding.pane_id)
+        if not identity_matches_binding(live, binding):
+            return None
+    else:
+        live = expected_target_identity(target) if target else None
     if "expected_target_identity" not in data:
         return live
     try:
@@ -214,11 +263,11 @@ def _send_key_effect():
     if keys not in allowed:
         return jsonify({"ok": False, "error": "Key combo not allowed"}), 403
 
-    target = resolve_target(data)
+    target = _request_target(data)
 
     expected = _input_identity(data, target)
     if expected is None:
-        return jsonify({"ok": False, "error": "target_absent"}), 409
+        return _absent(data)
     if keys == "ctrl+shift+v":
         try:
             content = get_clipboard()
@@ -254,10 +303,10 @@ def _send_combo(data):
         tmux_key = combo_to_tmux(data["combo"])
     except ComboError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
-    target = resolve_target(data)
+    target = _request_target(data)
     expected = _input_identity(data, target)
     if expected is None:
-        return jsonify({"ok": False, "error": "target_absent"}), 409
+        return _absent(data)
     result = generation_bound_delivery(expected, keys=(tmux_key,))
     if not result.ok:
         status = 409 if result.status == "target_absent" else 502
@@ -319,7 +368,10 @@ def _type_text_effect(require_carried_identity=False):
     """Complete one explicit operator composer/CLI action under the lock."""
     data = request.get_json(silent=True) or {}
     enter = data.get("enter", True)
-    target = resolve_target(data)
+    target = _request_target(data)
+    if target is None:
+        # A durable key naming no live pane (shared/utils.py:resolve_target).
+        return _absent(data)
     if require_carried_identity:
         try:
             expected = ExpectedTargetIdentity.from_value(
@@ -327,10 +379,13 @@ def _type_text_effect(require_carried_identity=False):
             )
         except (KeyError, TypeError, ValueError):
             expected = None
+        is_key, binding = _key_binding(data)
+        if is_key and not identity_matches_binding(expected, binding):
+            expected = None
     else:
         expected = _input_identity(data, target)
     if expected is None:
-        return jsonify({"ok": False, "error": "target_absent"}), 409
+        return _absent(data)
     if _prompt_answer_is_stale(data, expected):
         return jsonify({"ok": False, "error": "prompt_gone"}), 409
 

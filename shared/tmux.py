@@ -1,5 +1,6 @@
 """shared/tmux.py — tmux observation and generation-bound delivery helpers."""
 
+import hashlib
 import os
 import platform
 import re
@@ -918,6 +919,378 @@ def pane_tab_target(pane_id):
     return f"{parts[1]}:{parts[2]}.{parts[3]}"
 
 
+# --- Pane identity: one listing, PaneRef rows, durable keys (621 Phase 7) ---
+#
+# The one `list-panes -a` format. The first six fields are the Auto-Yes
+# scanner's old order, so a five- or six-field fixture still parses; `#{pid}`
+# and `#{socket_path}` (the server's, the same on every row) give the server
+# generation without another tmux call.
+LIST_PANES_FIELDS = (
+    "session_name", "window_index", "pane_index", "pane_pid",
+    "pane_current_command", "pane_id", "pane_width", "pane_height",
+    "session_activity", "session_created", "pane_tty", "window_activity",
+    "history_size", "cursor_x", "cursor_y", "alternate_on", "@assist_parent",
+    "pane_dead", "pid", "socket_path",
+)
+_LIST_PANES_FORMAT = "\t".join(f"#{{{name}}}" for name in LIST_PANES_FIELDS)
+_MIN_LIST_FIELDS = 5
+
+# `<generation>:<pane_id>`: 16 hex digits of the server generation, then `%N`.
+_PANE_KEY_RE = re.compile(r"([0-9a-f]{16}):(%\d+)")
+# `session:window.pane`; a session name may itself hold `:` or `.`.
+_DISPLAY_TARGET_RE = re.compile(r"(.*):(\d+)\.(\d+)")
+
+
+def stderr_means_no_server(stderr):
+    """True when tmux's error says no server is running: "no server running",
+    or a socket that is absent or refuses connections (a socket left by a dead
+    server). A permission error, a timeout or anything else means cannot tell.
+    The one classifier for the listing, the key binding and the delegate
+    watcher (sign-off M3 F1: an absent socket used to read as unknown here, so
+    the pane-state conversion waited and a later pane inherited old entries).
+    """
+    stderr = stderr or ""
+    return "no server running" in stderr or (
+        "error connecting to" in stderr
+        and ("(No such file or directory)" in stderr or "(Connection refused)" in stderr)
+    )
+
+
+class TmuxListError(RuntimeError):
+    """`list-panes` failed. Distinct from an empty listing, which is no panes."""
+
+    def __init__(self, stderr):
+        super().__init__(stderr or "list-panes failed")
+        self.stderr = stderr or ""
+        self.no_server = stderr_means_no_server(self.stderr)
+
+
+@dataclass(frozen=True, slots=True)
+class PaneRef:
+    """One listed pane: its identity plus the fields /poll needs.
+
+    `generation` is None when the server's start time could not be read; such
+    a pane has no durable key rather than a guessed one.
+    """
+
+    pane_id: str
+    generation: str | None
+    session: str
+    display_target: str
+    window: int = 0
+    pane: int = 0
+    pane_pid: str = ""
+    command: str = ""
+    width: int = 0
+    height: int = 0
+    session_activity: int = 0
+    session_created: int = 0
+    pane_tty: str = ""
+    assist_parent: str = ""
+    pane_dead: str = "0"
+    # (window_activity, history_size, cursor_x, cursor_y, width, height,
+    # alternate_on, pane_id): capture_pane_if_changed's order. None when the
+    # row was too short to carry it.
+    marker: tuple | None = None
+
+    @property
+    def key(self):
+        if not self.generation or not self.pane_id:
+            return None
+        return f"{self.generation}:{self.pane_id}"
+
+
+def generation_of(socket_path, server_pid, server_start):
+    """Hash of one tmux server's lifetime: socket path, pid and start time.
+
+    An Assist restart with the same tmux server keeps it; a tmux server
+    restart changes it even when the new server reuses every `%N`.
+    """
+    raw = f"{socket_path}\n{int(server_pid)}\n{server_start}".encode()
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _server_generation(server_pid, socket_path):
+    if not server_pid.isdigit() or not socket_path:
+        return None
+    start = _process_start_time(int(server_pid))
+    if start is None:
+        return None
+    return generation_of(socket_path, int(server_pid), start)
+
+
+def _int(value):
+    return int(value) if value.isdigit() else 0
+
+
+def _pane_ref(parts, generations):
+    if len(parts) < _MIN_LIST_FIELDS or not parts[1].isdigit() or not parts[2].isdigit():
+        return None
+    parts = parts + [""] * (len(LIST_PANES_FIELDS) - len(parts))
+    pane_id = parts[5]
+    server = (parts[18], parts[19])
+    if server not in generations:
+        generations[server] = _server_generation(*server)
+    return PaneRef(
+        pane_id=pane_id,
+        generation=generations[server],
+        session=parts[0],
+        display_target=f"{parts[0]}:{parts[1]}.{parts[2]}",
+        window=int(parts[1]),
+        pane=int(parts[2]),
+        pane_pid=parts[3],
+        command=parts[4],
+        width=_int(parts[6]),
+        height=_int(parts[7]),
+        session_activity=_int(parts[8]),
+        session_created=_int(parts[9]),
+        pane_tty=parts[10],
+        assist_parent=parts[16],
+        pane_dead=parts[17] or "0",
+        marker=(parts[11], parts[12], parts[13], parts[14], parts[6], parts[7], parts[15], pane_id)
+        if parts[15] != "" else None,
+    )
+
+
+def list_panes(socket=None):
+    """Every pane on the tmux server, as PaneRef rows, in one tmux call.
+
+    Raises TmuxListError when tmux fails (`no_server` says whether the server
+    is gone); an empty list means a reachable server with no panes.
+    """
+    command = ["tmux"] + (["-S", os.fspath(socket)] if socket else [])
+    proc = subprocess.run(
+        command + ["list-panes", "-a", "-F", _LIST_PANES_FORMAT],
+        capture_output=True, text=True, timeout=5,
+    )
+    if proc.returncode != 0:
+        raise TmuxListError(proc.stderr)
+    generations = {}
+    refs = []
+    for line in (proc.stdout or "").split("\n"):
+        if not line:
+            continue
+        ref = _pane_ref(line.split("\t"), generations)
+        if ref is not None:
+            refs.append(ref)
+    return refs
+
+
+def parse_pane_key(text):
+    """(generation, pane_id) for a durable key, else None."""
+    match = _PANE_KEY_RE.fullmatch(text or "")
+    return (match.group(1), match.group(2)) if match else None
+
+
+def resolve_pane_key(key):
+    """The live PaneRef a durable key names, or None.
+
+    One tmux call. None when the pane is gone or the key belongs to another
+    server generation: a reused `%N` on a restarted server is not this pane.
+    """
+    parsed = parse_pane_key(key)
+    if parsed is None:
+        return None
+    generation, pane_id = parsed
+    try:
+        proc = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane_id,
+             "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pid}\t#{socket_path}"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    parts = proc.stdout.rstrip("\n").split("\t")
+    # display-message falls back to another pane for a missing -t: the echoed
+    # pane id must be the one asked for.
+    if proc.returncode != 0 or len(parts) != 6 or parts[0] != pane_id:
+        return None
+    if not parts[2].isdigit() or not parts[3].isdigit():
+        return None
+    if _server_generation(parts[4], parts[5]) != generation:
+        return None
+    return PaneRef(
+        pane_id=pane_id,
+        generation=generation,
+        session=parts[1],
+        display_target=f"{parts[1]}:{parts[2]}.{parts[3]}",
+        window=int(parts[2]),
+        pane=int(parts[3]),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PaneKeyBinding:
+    """What a durable key names right now: its pane on one tmux server life.
+
+    `server_pid`, `server_start_time` and `socket_identity` (st_dev, st_ino of
+    the server's socket) pin that server; within one server a `%N` is never
+    reused, so while they hold, `pane_id` is still the key's pane.
+    `display_target` is where the pane sat when bound: presentation and
+    bookkeeping only, never an address.
+    """
+
+    key: str
+    pane_id: str
+    generation: str
+    socket_path: str
+    socket_identity: tuple
+    server_pid: int
+    server_start_time: str
+    display_target: str
+
+
+def bind_pane_key_status(key):
+    """(binding, status) for a durable key. status is "bound"; "gone" when
+    the key's pane or tmux server is definitely not there (no server, no such
+    pane, another server generation on the socket); or "unknown" when tmux
+    could not be asked (timeout, cannot run): the caller must not read that
+    as the key having expired."""
+    parsed = parse_pane_key((key or "").strip())
+    if parsed is None:
+        return None, "gone"
+    generation, pane_id = parsed
+    try:
+        proc = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane_id,
+             "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pid}\t#{socket_path}"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except FileNotFoundError:
+        return None, "gone"  # no tmux binary: no server either
+    except (OSError, subprocess.TimeoutExpired):
+        return None, "unknown"
+    parts = proc.stdout.rstrip("\n").split("\t")
+    if proc.returncode != 0:
+        # "no server running", "can't find pane", "error connecting": the
+        # server or the pane is not there. Anything else is unknown.
+        err = proc.stderr or ""
+        definite = stderr_means_no_server(err) or "can't find" in err.lower()
+        return None, "gone" if definite else "unknown"
+    if len(parts) != 6 or parts[0] != pane_id:
+        return None, "gone"  # display-message answered for another pane
+    if not parts[2].isdigit() or not parts[3].isdigit() or not parts[4].isdigit():
+        return None, "unknown"
+    server_pid = int(parts[4])
+    socket_before = _socket_identity(parts[5])
+    start = _process_start_time(server_pid)
+    if socket_before is None or start is None:
+        return None, "gone"
+    if generation_of(parts[5], server_pid, start) != generation:
+        return None, "gone"
+    binding = PaneKeyBinding(
+        key=f"{generation}:{pane_id}",
+        pane_id=pane_id,
+        generation=generation,
+        socket_path=parts[5],
+        socket_identity=socket_before,
+        server_pid=server_pid,
+        server_start_time=start,
+        display_target=f"{parts[1]}:{parts[2]}.{parts[3]}",
+    )
+    # The socket must still be this server's after the read, too.
+    if not pane_key_binding_current(binding):
+        return None, "gone"
+    return binding, "bound"
+
+
+def bind_pane_key(key):
+    """Bind a durable key to its live pane and server, or None (gone or
+    unknown; bind_pane_key_status tells which). One tmux call."""
+    return bind_pane_key_status(key)[0]
+
+
+def pane_key_binding_current(binding):
+    """True while the same tmux server still owns the key's socket. No tmux
+    call: one stat and one process start-time read."""
+    return (
+        _socket_identity(binding.socket_path) == binding.socket_identity
+        and _process_start_time(binding.server_pid) == binding.server_start_time
+    )
+
+
+def identity_matches_binding(identity, binding):
+    """An ExpectedTargetIdentity selects the key's pane on the key's server."""
+    return (
+        identity is not None
+        and binding is not None
+        and identity.pane_id == binding.pane_id
+        and identity.server_pid == binding.server_pid
+        and identity.server_start_time == binding.server_start_time
+        and (identity.socket_device, identity.socket_inode) == tuple(binding.socket_identity)
+    )
+
+
+def capture_pane_by_key(binding, lines=2000, tui=None, prev=None, max_age=2.0, min_interval=0.0):
+    """capture_pane_if_changed for a bound key: capture the key's `%N`, then
+    publish only if the binding still holds. A failed capture, or a server
+    that changed under it, is (None, None, None) — the key has expired."""
+    if not pane_key_binding_current(binding):
+        return None, None, None
+    content, info, prev_next = capture_pane_if_changed(
+        binding.pane_id, lines, tui=tui, prev=prev, max_age=max_age, min_interval=min_interval,
+    )
+    if info is None or not pane_key_binding_current(binding):
+        return None, None, None
+    # display-message can answer for another pane when -t names a missing one.
+    if info.get("pane_id", binding.pane_id) != binding.pane_id:
+        return None, None, None
+    return content, info, prev_next
+
+
+def _find_pane(target_or_key, panes):
+    if not target_or_key:
+        return None
+    if panes is None:
+        try:
+            panes = list_panes()
+        except (TmuxListError, OSError, subprocess.TimeoutExpired):
+            return None
+    if parse_pane_key(target_or_key):
+        return next((p for p in panes if p.key == target_or_key), None)
+    if _TMUX_ID_RE.fullmatch(target_or_key) and target_or_key.startswith("%"):
+        return next((p for p in panes if p.pane_id == target_or_key), None)
+    return next((p for p in panes if p.display_target == target_or_key), None)
+
+
+def find_pane(target_or_key, panes):
+    """The PaneRef in `panes` that a display target, `%N` or durable key names."""
+    return _find_pane(target_or_key, panes)
+
+
+def display_target_of(value):
+    """A client target as `session:w.p`/`%N`: a durable key becomes its live
+    pane's display target, None when it names no live pane; anything else is
+    returned as given (the caller validates it)."""
+    if isinstance(value, str) and parse_pane_key(value.strip()):
+        ref = resolve_pane_key(value.strip())
+        return ref.display_target if ref else None
+    return value
+
+
+def session_of(target_or_key, panes=None):
+    """The session a display target, `%N` or durable key belongs to, or None.
+
+    A display target names its session without asking tmux. A key or `%N` is
+    looked up in `panes` (listed once if not given); a key from another server
+    generation names no session.
+    """
+    if not target_or_key:
+        return None
+    if not parse_pane_key(target_or_key):
+        match = _DISPLAY_TARGET_RE.fullmatch(target_or_key)
+        if match:
+            return match.group(1)
+    ref = _find_pane(target_or_key, panes)
+    return ref.session if ref else None
+
+
+def canonical_key(target_or_key, panes=None):
+    """The durable key of the live pane a display target, `%N` or key names."""
+    ref = _find_pane(target_or_key, panes)
+    return ref.key if ref else None
+
+
 def detect_venv(project_path):
     """Detect virtualenv directory in a project. Returns relative venv path or None."""
     for venv_dir in ("venv", ".venv", "env"):
@@ -1095,6 +1468,7 @@ def capture_pane_if_changed(target, lines=2000, tui=None, prev=None, max_age=2.0
             info["command_display"] = prettify_command(info.get("command", ""))
             info["alternate_on"] = alternate_on
             if len(parts) >= 11:
+                info["pane_id"] = parts[10]
                 marker = (
                     parts[7], parts[8], parts[9], parts[3],
                     parts[1], parts[2], parts[4], parts[10],

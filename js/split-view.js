@@ -8,7 +8,7 @@ class PaneView {
         this.latest = element.querySelector('.split-latest');
         this.record = null;
         this.content = '';
-        this.lines = 2000;
+        this.lines = defaultTermLines();
         this.paused = false;
         this.programmatic = false;
         this.generation = 0;
@@ -22,7 +22,7 @@ class PaneView {
             SplitView.activate(1 - SplitView.active);
         });
         element.querySelector('.split-more').onclick = () => {
-            this.lines = Math.min(20000, this.lines + 2000);
+            this.lines = Math.min(maxTermLines(), this.lines + 2000);
             this.subscribe();
             this.capture(this.generation);
         };
@@ -36,7 +36,7 @@ class PaneView {
         this.record = record;
         this.content = record.content || '';
         this.paused = !!record.paused;
-        this.lines = record.lines || 2000;
+        this.lines = record.lines || defaultTermLines();
         this.pre.innerHTML = ansiToHtml((record.paused ? record.displayContent : record.content) || '');
         this.displayContent = record.displayContent || '';
         this.element.scrollTop = record.top || 0; this.element.scrollLeft = record.left || 0;
@@ -241,7 +241,7 @@ const SplitView = {
     record(pane) {
         return {target:pane.target, pane_id:pane.pane_id, pane_pid:String(pane.pane_pid), created:pane.created,
             window:pane.window, session:pane.session, command:pane.agent_kind || pane.command_display || pane.command,
-            dead:false, identity:null, content:'', paused:false, lines:2000};
+            dead:false, identity:null, content:'', paused:false, lines:defaultTermLines()};
     },
     same(a,b) { return !!a && !!b && a.pane_id === b.pane_id && a.pane_pid === String(b.pane_pid) && a.created === b.created; },
     // true: the server confirmed this pane generation. false: it refused it.
@@ -374,7 +374,7 @@ const SplitView = {
     select(record) {
         this.switching = true; selectTab(record.target); this.switching = false;
         _termLatestContent = record.content || ''; _termLastContent = '';
-        _termPaused = false; _termLines = record.lines || 2000;
+        _termPaused = false; _termLines = record.lines || defaultTermLines();
         _doRender((record.paused ? record.displayContent : record.content) || '',_paneInfo[record.target],record.target);
         _termLatestContent = record.content || '';
         _termPaused = !!record.paused;
@@ -447,7 +447,7 @@ const SplitView = {
         this.closePopout(false);
         this.snapshot(); this.enabled = false; this.other.close(); this.closeMenu();
         this.update(); this.persist();
-        onTabSwitchCommands((_termTarget || '').split(':')[0]);
+        onTabSwitchCommands(sessionOf(_termTarget));
         syncAutoYesState().then(() => _renderAutoYesCountdown());
     },
     inputTarget() {
@@ -555,7 +555,7 @@ const SplitView = {
             } else if (pane.target !== r.target) {
                 const old = r.target; r.target=pane.target; r.session=pane.session; r.window=pane.window;
                 if (_draftCache[old]) { _draftCache[r.target]=_draftCache[old]; delete _draftCache[old]; }
-                if (i===this.active) { _termTarget=r.target; this.select(r); }
+                if (i===this.active) { setTermTarget(r.target, pane.key); this.select(r); }
             }
         }
         this.update();

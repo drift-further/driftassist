@@ -8,6 +8,7 @@ from datetime import datetime
 from flask import Blueprint, jsonify, request
 from shared import studio_context as contexts
 from shared.studio_client import client
+from shared.tmux import display_target_of
 
 context_bp = Blueprint("studio_context", __name__)
 _actions = {}
@@ -72,7 +73,10 @@ def present(target):
 
 @context_bp.get("/studio/context")
 def studio_context():
-    return jsonify(present(request.args.get("target", "")))
+    # A durable pane key reads as its live pane's display target; one naming no
+    # live pane reads as no target.
+    target = display_target_of(request.args.get("target", "")) or ""
+    return jsonify(present(target))
 
 
 def failure(message, status=409, **extra):

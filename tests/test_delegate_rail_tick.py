@@ -34,7 +34,7 @@ globalThis._reorderModeTab=null;globalThis._reorderCleanup=null;globalThis._stal
 globalThis._getStaleThreshold=()=>120;globalThis._isPinned=()=>false;globalThis._isSnoozed=()=>false;
 globalThis._autoTuckEnabled=()=>true;globalThis._revealActiveTab=()=>{};globalThis._syncTabScrollButtons=()=>{};
 globalThis._formatIdleTime=()=>"6m";
-globalThis._sessionOf=t=>t.split(":")[0];
+globalThis._sessionOf=t=>t.split(":")[0];globalThis.sessionOf=globalThis._sessionOf;
 globalThis._tabLabelText=()=>'';globalThis.escHtml=x=>x;
 globalThis._buildTabRow=()=>{const row=document.createElement('div'),name=document.createElement('span');name.className='row-name';row.appendChild(name);return row};
 const tabs=fs.readFileSync('js/tabs.js','utf8');

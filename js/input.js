@@ -127,8 +127,8 @@ async function doPaste() {
             (SplitView.slots[SplitView.active].dead || !SplitView.slots[SplitView.active].identity)) {
         showFlash('error','Choose a live pane before sending'); return;
     }
-    const sendTarget = getInputTarget();
-    const sendIdentity = typeof inputIdentity === 'function' ? inputIdentity() : {};
+    // Routed now, before any await: a tab switch mid-send must not move it.
+    const sendRoute = inputRoute();
     // The tab whose draft this message IS. Captured up front: a tab switch
     // mid-send must not clear the wrong tab's draft. Note this is _termTarget,
     // not getInputTarget() — input routing can aim the send at a split pane,
@@ -158,7 +158,7 @@ async function doPaste() {
     if (!raw && !_attachments.length) {
         // Empty send = press Enter in terminal
         if (_termTarget) {
-            try { await fetch('/type', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text: '', enter: true, target: getInputTarget(), ...(typeof inputIdentity === 'function' ? inputIdentity() : {})}) }); } catch(e) {}
+            try { await fetch('/type', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text: '', enter: true, ...inputRoute()}) }); } catch(e) {}
         }
         return;
     }
@@ -223,7 +223,7 @@ async function doPaste() {
             // composer opts in — the quick-action command buttons POST here too and
             // must keep sending shell text byte-for-byte.
             body: JSON.stringify({text: finalText, enter: true, expand: expand,
-                                  secret: secret, target: sendTarget, ...sendIdentity}),
+                                  secret: secret, ...sendRoute}),
         });
         const data = await resp.json();
         if (data.ok) {
@@ -324,7 +324,7 @@ async function sendKey(keys) {
         const resp = await fetch('/key', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({keys: keys, target: getInputTarget(), ...(typeof inputIdentity === 'function' ? inputIdentity() : {})}),
+            body: JSON.stringify({keys: keys, ...inputRoute()}),
         });
         const data = await resp.json();
         if (data.ok) {
@@ -343,7 +343,7 @@ async function typeCmd(cmd) {
         const resp = await fetch('/type', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({text: cmd, enter: true, target: getInputTarget(), ...(typeof inputIdentity === 'function' ? inputIdentity() : {})}),
+            body: JSON.stringify({text: cmd, enter: true, ...inputRoute()}),
         });
         const data = await resp.json();
         if (data.ok) {
@@ -368,7 +368,7 @@ async function typePrefix(ch) {
         const resp = await fetch('/type', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({text: ch, enter: false, no_history: true, target: getInputTarget(), ...(typeof inputIdentity === 'function' ? inputIdentity() : {})}),
+            body: JSON.stringify({text: ch, enter: false, no_history: true, ...inputRoute()}),
         });
         const data = await resp.json();
         if (data.ok) {
@@ -423,7 +423,7 @@ async function sendInsertMode() {
         const resp = await fetch('/type', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ text: 'i', enter: false, target: getInputTarget(), ...(typeof inputIdentity === 'function' ? inputIdentity() : {}) }),
+            body: JSON.stringify({ text: 'i', enter: false, ...inputRoute() }),
         });
         const data = await resp.json();
         if (data.ok) {

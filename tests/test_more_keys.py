@@ -52,6 +52,9 @@ global.document = {
 };
 let target = 'work:1.0';
 global.getInputTarget = () => target;
+// No pane is listed with a key, so the route is the display target (js/pane-ref.js).
+global._termTarget = null; global._termKey = null; global._sessionPanes = [];
+__PANEREF__
 var lastAction = 0;
 function updateStatusTime() {}
 function showFlash() {}
@@ -110,7 +113,8 @@ def _run(name):
     source = (ROOT / "js" / "keycombo.js").read_text()
     with tempfile.TemporaryDirectory() as raw:
         script = Path(raw) / "harness.js"
-        script.write_text(_HARNESS.replace("__KEYCOMBO__", source))
+        pane_ref = (ROOT / "js" / "pane-ref.js").read_text(encoding="utf-8")
+        script.write_text(_HARNESS.replace("__PANEREF__", pane_ref).replace("__KEYCOMBO__", source))
         out = subprocess.run(
             ["node", str(script), name],
             capture_output=True, text=True, timeout=20, check=True,

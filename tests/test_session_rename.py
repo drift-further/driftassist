@@ -164,6 +164,9 @@ globalThis.localStorage = {setItem: (k, v) => calls.push(['store', k, v])};
 globalThis.noteTargetChosen = (t, created) => calls.push(['chosen', t, created]);
 globalThis.selectTab = (t, auto) => calls.push(['select', t, auto, _termTarget]);
 globalThis._lastTabTapTime = Date.now();
+globalThis._termKey = null;
+globalThis._sessionPanes = [];
+vm.runInThisContext(require('fs').readFileSync('js/pane-ref.js', 'utf8'), {filename: 'js/pane-ref.js'});
 vm.runInThisContext(SOURCE, {filename: 'js/tabs.js'});
 BODY
 console.log(JSON.stringify({calls, target: globalThis._termTarget}));

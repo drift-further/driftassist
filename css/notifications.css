@@ -164,3 +164,11 @@
 .outbox-download { color: var(--green); border-color: rgba(131, 215, 162, 0.5); }
 .outbox-dismiss { color: var(--text-dim); border-color: var(--border); }
 .outbox-sheet-foot { color: var(--text-muted); font-size: 10px; }
+
+/* Orphaned drafts (js/drafts.js): the outbox sheet's frame, one row per draft
+   no live pane owns, each with its explicit "Copy to this pane" and Dismiss. */
+.btn-orphans[hidden] { display: none; }
+.btn-orphans { color: var(--amber); }
+.orphan-row-text { flex: 1; min-width: 0; color: var(--text); overflow-wrap: anywhere; white-space: pre-wrap; }
+.orphan-copy, .orphan-dismiss { min-height: 44px; white-space: nowrap; }
+.orphan-dismiss { color: var(--text-dim); border-color: var(--border); }

@@ -21,17 +21,25 @@ from shared.agent_identity import (
     _ANSI_ESCAPE_RE,
     _VERSION_CMD_RE,
     child_pids,
+    last_agent_argv,
     pane_root_start,
     refine_with_content,
     resolve_process_detail,
 )
-from shared.agent_model import observe as observe_model
+from shared.agent_model import observe as observe_model, observe_details as observe_model_details
 from shared import pane_scan
 # Re-exported: tests/test_poll_perf.py and tests/test_autoyes_parity.py patch and
 # read the cache through this module. /poll passes its own binding to
 # pane_scan.sample(), so a patched dict here is the one every write lands in.
 from shared.pane_scan import _SCAN_CACHE, _SCAN_LOCK, _activity_tail
-from shared.tmux import capture_reusable, prettify_command, sudo_prompt_waiting, tmux_exact_target
+from shared.tmux import (
+    TmuxListError,
+    capture_reusable,
+    list_panes,
+    prettify_command,
+    sudo_prompt_waiting,
+    tmux_exact_target,
+)
 from routes.autoyes import (
     autoyes_will_consider,
     detection_depth,
@@ -344,22 +352,14 @@ def consolidated_poll():
     }
 
     # --- Sessions ---
-    proc = subprocess.run(
-        [
-            "tmux",
-            "list-panes",
-            "-a",
-            "-F",
-            "#{session_name}\t#{window_index}\t#{pane_index}\t"
-            "#{pane_current_command}\t#{pane_width}\t#{pane_height}\t"
-            "#{session_activity}\t#{pane_pid}\t#{pane_id}\t#{session_created}\t"
-            "#{pane_tty}\t#{window_activity}\t#{history_size}\t#{cursor_x}\t"
-            "#{cursor_y}\t#{alternate_on}\t#{@assist_parent}\t#{pane_dead}",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
+    # One listing (shared/tmux.py:list_panes); the durable key rides on it, so
+    # adding `key` costs no tmux call per pane.
+    try:
+        refs = list_panes()
+        listed = True
+    except (TmuxListError, OSError, subprocess.TimeoutExpired):
+        refs = []
+        listed = False
 
     panes = []
     # Kept off the pane dicts: the browser has no use for a tty path.
@@ -369,44 +369,35 @@ def consolidated_poll():
     pane_markers = {}
     seen_sessions = set()
     now = time.time()
-    if proc.returncode == 0:
-        for line in proc.stdout.strip().split("\n"):
-            if not line:
-                continue
-            parts = line.split("\t")
-            if len(parts) >= 6:
-                target = f"{parts[0]}:{parts[1]}.{parts[2]}"
-                pane_pid = parts[7] if len(parts) >= 8 else ""
-                pane_id = parts[8] if len(parts) >= 9 else ""
-                # Epoch seconds the tmux session was opened — the key behind
-                # "sort by opened date" in the tab strip.
-                created = int(parts[9]) if len(parts) >= 10 and parts[9].isdigit() else 0
-                pane_ttys[target] = parts[10] if len(parts) >= 11 else ""
-                if len(parts) >= 16:
-                    pane_markers[target] = (
-                        parts[11], parts[12], parts[13], parts[14],
-                        parts[4], parts[5], parts[15], pane_id,
-                    )
-                is_subpane = parts[0] in seen_sessions
-                seen_sessions.add(parts[0])
-                panes.append(
-                    {
-                        "target": target,
-                        "session": parts[0],
-                        "created": created,
-                        "_assist_parent": parts[16] if len(parts) > 16 else "",
-                        "pane_dead": parts[17] if len(parts) > 17 else "0",
-                        "window": int(parts[1]),
-                        "pane": int(parts[2]),
-                        "command": parts[3],
-                        "width": int(parts[4]),
-                        "height": int(parts[5]),
-                        "pane_pid": pane_pid,
-                        "pane_id": pane_id,
-                        "is_subpane": is_subpane,
-                        "command_display": prettify_command(parts[3]),
-                    }
-                )
+    if listed:
+        for ref in refs:
+            target = ref.display_target
+            pane_ttys[target] = ref.pane_tty
+            if ref.marker is not None:
+                pane_markers[target] = ref.marker
+            is_subpane = ref.session in seen_sessions
+            seen_sessions.add(ref.session)
+            panes.append(
+                {
+                    "target": target,
+                    "key": ref.key,
+                    "session": ref.session,
+                    # Epoch seconds the tmux session was opened — the key
+                    # behind "sort by opened date" in the tab strip.
+                    "created": ref.session_created,
+                    "_assist_parent": ref.assist_parent,
+                    "pane_dead": ref.pane_dead,
+                    "window": ref.window,
+                    "pane": ref.pane,
+                    "command": ref.command,
+                    "width": ref.width,
+                    "height": ref.height,
+                    "pane_pid": ref.pane_pid,
+                    "pane_id": ref.pane_id,
+                    "is_subpane": is_subpane,
+                    "command_display": prettify_command(ref.command),
+                }
+            )
 
         enrich_panes_with_agents(panes)
 
@@ -473,12 +464,18 @@ def consolidated_poll():
             # not merely two adjacent calls. pane_id keys the memo to this
             # generation of the pane (Step 1, S4) so a killed-and-recreated
             # pane at the same target does not inherit the old model.
-            model, model_effort, model_changed_at = observe_model(
-                target, agent_kind, pane.get("pane_id"), tail
+            model_details = observe_model_details(
+                target,
+                agent_kind,
+                pane.get("pane_id"),
+                tail,
+                argv=last_agent_argv(target),
             )
-            pane["model"] = model
-            pane["model_effort"] = model_effort
-            pane["model_changed_at"] = model_changed_at
+            pane["model"] = model_details["model"]
+            pane["model_effort"] = model_details["effort"]
+            pane["model_changed_at"] = model_details["changed_at"]
+            pane["permission_mode"] = model_details["permission_mode"]
+            pane["context_pct"] = model_details["context_pct"]
             if tail:
                 # Every open browser pops these (js/prompt-popup.js), whichever
                 # tab is in view.
@@ -530,12 +527,12 @@ def consolidated_poll():
 
     # Clean up stale targets no longer in tmux — only after a complete listing;
     # a failed list-panes must not read as "every pane vanished".
-    if proc.returncode == 0:
+    if listed:
         tab_state.sweep_agent_declarations(live_targets)
         with state._activity_lock:
             for stale in set(state.pane_model) - live_targets:
                 state.pane_model.pop(stale, None)
-    idle_changed |= pane_scan.forget_missing(live_targets, proc.returncode == 0, cache=_SCAN_CACHE)
+    idle_changed |= pane_scan.forget_missing(live_targets, listed, cache=_SCAN_CACHE)
 
     # Persist idle state when it changed, else now and then. An fsync'd write
     # on every poll from every browser was pure cost on a quiet host.
@@ -546,6 +543,10 @@ def consolidated_poll():
     # --- States ---
     AGENT_COMMANDS = {
         "claude",
+        "codex",
+        "agy",
+        "antigravity",
+        "gemini",
         "opencode",
         "node",
         "python",
@@ -627,28 +628,32 @@ def consolidated_poll():
             # Reuse the resolved kind: only supported agent panes need the
             # ownership observation; shells and unsupported agents stay cheap.
             kind = process_kinds.get(pane["target"])
-            if kind in ("codex", "claude"):
+            if kind in ("codex", "claude", "gemini"):
                 pane["resume"], pane["resume_reason"] = resume_for_pane(
                     pane, tail=resume_tails.get(pane["target"], ""))
             else:
                 pane["resume"] = None
                 pane["resume_reason"] = (
-                    "unsupported" if kind in ("cursor", "opencode", "gemini") else "no agent")
+                    "unsupported" if kind in ("cursor", "opencode") else "no agent")
 
     enrich_parents(panes, tuple(state.get_settings()["delegates"]["prefixes"]))
 
     # --- Tab order / pin / snooze ---
     # Runs after the states block so the wake sweep sees fresh activity times.
     # apply_order returns a new list, so result["sessions"] is reassigned.
-    tab_state.sweep_wakes(live_targets, now)
+    # Snoozes are keyed by durable key: the sweep and the stamping read this
+    # poll's own listing, and a failed listing sweeps nothing.
+    tab_state.sweep_wakes(refs if listed else None, now)
     result["sessions"] = tab_state.apply_order(panes)
-    result["tab_state"] = tab_state.get_tab_state()
+    result["tab_state"] = tab_state.get_tab_state(refs if listed else [])
 
     # --- Composer drafts ---
     # Markers + revision stamps only; the bodies come from GET /api/draft. A
     # draft can be thousands of characters and this payload ships every 5s to
-    # every open browser.
-    result["drafts"] = drafts.poll_block()
+    # every open browser. Projected per protocol: `proto=2` (a browser that
+    # addresses panes by durable key) gets keys, an older one `session:w.p`.
+    proto = 2 if request.args.get("proto") == "2" else 1
+    result["drafts"] = drafts.poll_block(refs if listed else None, proto=proto)
 
     # --- Claude session metadata ---
     if state.tmux_target:

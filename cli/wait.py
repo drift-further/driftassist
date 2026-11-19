@@ -1,6 +1,7 @@
 """Polling state machine for waiting on an Assist tmux pane."""
 
 import hashlib
+import sys
 import time
 from urllib.parse import urlencode
 
@@ -11,6 +12,9 @@ DEFAULT_TIMEOUT = 110.0
 POLL_INTERVAL = 2.0
 # Tracks /poll's approximately five-second recompute cadence.
 _POLL_STALENESS_SECONDS = 5.0
+# Maximum time `send --wait` waits for any observable pane change before
+# concluding the send did not land.
+NO_CHANGE_GRACE_SECONDS = 10.0
 QUIET_STATES = {"idle", "shell"}
 
 
@@ -47,32 +51,60 @@ def _agent_kind(poll_response: dict, target: str) -> str | None:
     return None
 
 
-def _prompt_detail(tail: str, agent_kind: str | None) -> str | None:
+def detect_prompt(tail: str, agent_kind: str | None) -> tuple[str, str] | None:
+    """Return `(prompt_type, summary)` when the pane is waiting on a prompt, else None."""
     # Imported here, not at module load: the detector lives with the server's
     # state, and bin/assist imports this module for every verb's parser.
-    from routes.autoyes import _detect_autoyes_prompt
+    from routes.autoyes import _detect_autoyes_prompt, observe_attention
     from shared.agent_identity import _ANSI_ESCAPE_RE
 
     plain_tail = _ANSI_ESCAPE_RE.sub("", tail)
     detected = _detect_autoyes_prompt(plain_tail, agent_kind)
-    if detected is None:
+    if detected is not None:
+        prompt_type, _send_text, _with_enter, summary = detected
+        return prompt_type, summary or "(no summary)"
+    attention = observe_attention(plain_tail, agent_kind)
+    if attention is not None:
+        return str(attention["kind"]), str(attention.get("summary") or "(no summary)")
+    return None
+
+
+def _prompt_detail(tail: str, agent_kind: str | None) -> str | None:
+    found = detect_prompt(tail, agent_kind)
+    if found is None:
         return None
-    prompt_type, _send_text, _with_enter, summary = detected
-    return f"{prompt_type}: {summary or '(no summary)'}"
+    prompt_type, summary = found
+    return f"{prompt_type}: {summary}"
 
 
 def wait_for(
     target: str,
     timeout: float,
     baseline_hash: str | None = None,
+    require_change: bool = False,
+    no_change_grace: float = NO_CHANGE_GRACE_SECONDS,
 ) -> tuple[str, str | None]:
-    """Wait for a pane to become idle, present a prompt, or reach timeout."""
-    deadline = time.monotonic() + max(0.0, float(timeout))
+    """Wait for a pane to become idle, present a prompt, or reach timeout.
+
+    When `require_change` is True (used by `assist send --wait`), the pane must
+    show an observable content change relative to `baseline_hash` before it can
+    be reported idle or prompt; if no change appears within `no_change_grace`
+    seconds (bounded by `timeout`), returns `("no_change", None)` instead of
+    silently succeeding on stale idle state.
+    """
+    if require_change and baseline_hash is None:
+        raise ValueError("require_change requires baseline_hash")
+
+    start = time.monotonic()
+    deadline = start + max(0.0, float(timeout))
+    no_change_deadline = min(deadline, start + max(0.0, float(no_change_grace)))
     content_changed = baseline_hash is None
     first_poll = True
 
     while True:
         if not first_poll and time.monotonic() >= deadline:
+            if require_change and not content_changed:
+                return "no_change", None
             return "working", None
 
         poll_response = http.get("/poll")
@@ -98,7 +130,7 @@ def wait_for(
         fresh = (
             baseline_hash is None
             or content_changed
-            or idle_seconds >= _POLL_STALENESS_SECONDS
+            or (not require_change and idle_seconds >= _POLL_STALENESS_SECONDS)
         )
         if fresh and not changed_this_poll:
             prompt_quiet = quiet or idle_seconds >= POLL_INTERVAL
@@ -114,11 +146,24 @@ def wait_for(
             if quiet:
                 return "idle", None
 
+        if require_change and not content_changed:
+            now = time.monotonic()
+            if (not first_poll and now >= no_change_deadline) or now >= deadline:
+                return "no_change", None
+
         first_poll = False
-        remaining = deadline - time.monotonic()
+        now = time.monotonic()
+        remaining = deadline - now
         if remaining <= 0:
+            if require_change and not content_changed:
+                return "no_change", None
             return "working", None
-        time.sleep(min(POLL_INTERVAL, remaining))
+        sleep_for = min(POLL_INTERVAL, remaining)
+        if require_change and not content_changed:
+            grace_remaining = no_change_deadline - now
+            if grace_remaining > 0:
+                sleep_for = min(sleep_for, grace_remaining)
+        time.sleep(sleep_for)
 
 
 def _wait_with_autoyes(
@@ -126,13 +171,14 @@ def _wait_with_autoyes(
     target: str,
     timeout: float,
     baseline_hash: str | None,
+    require_change: bool = False,
 ) -> tuple[str, str | None]:
     status = http.get("/autoyes/status")
     was_enabled = bool((status.get("sessions") or {}).get(session))
     try:
         if not was_enabled:
             http.post("/autoyes/set", {"session": session, "enabled": True})
-        return wait_for(target, timeout, baseline_hash)
+        return wait_for(target, timeout, baseline_hash, require_change=require_change)
     finally:
         if not was_enabled:
             restored_status = http.get("/autoyes/status")
@@ -153,6 +199,7 @@ def run_wait(
     timeout: float,
     baseline_hash: str | None,
     autoyes: bool = False,
+    require_change: bool = False,
 ) -> int:
     if autoyes:
         state, detail = _wait_with_autoyes(
@@ -160,9 +207,15 @@ def run_wait(
             target,
             timeout,
             baseline_hash,
+            require_change=require_change,
         )
     else:
-        state, detail = wait_for(target, timeout, baseline_hash)
+        state, detail = wait_for(
+            target,
+            timeout,
+            baseline_hash,
+            require_change=require_change,
+        )
 
     from cli.session import print_resume_hint, print_delegate_hint
     print_resume_hint(target)
@@ -172,6 +225,13 @@ def run_wait(
     if state == "prompt":
         print(detail)
         return 10
+    if state == "no_change":
+        print(
+            f"assist: input was sent to {target} but no visible change was seen "
+            f"(check: assist view {session})",
+            file=sys.stderr,
+        )
+        return 3
     print(
         f"still working after {_timeout_label(timeout)}s — "
         f"re-run: assist wait {session}"

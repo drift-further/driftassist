@@ -23,6 +23,7 @@ _VERSION_CMD_RE = re.compile(r"\d+(?:\.\d+){1,3}")
 
 _WRAPPER_COMMS = ("docker", "podman", "lxc-attach", "kubectl", "ssh")
 _PROCESS_CACHE = {}
+_LAST_AGENT_ARGV = {}
 _PROCESS_CACHE_LOCK = threading.Lock()
 _PROCESS_CACHE_TTL = 0.25
 _DECLARATION_STARTUP_GRACE = 10.0
@@ -42,6 +43,12 @@ _CLAUDE_DIALOG_FINGERPRINT_RE = re.compile(
     r"|^\s*❯\s+Yes\s*$[\s\S]*^\s+No\s*$[\s\S]*"
     r"Enter to select\s*[·•]\s*Esc to cancel",
     re.MULTILINE,
+)
+_AGY_FINGERPRINT_RE = re.compile(
+    r"Antigravity CLI\b"
+    r"|Do you trust the contents of this project\?[\s\S]*Yes,\s+I trust this folder"
+    r"|(?:Gemini\s+\d+(?:\.\d+)?\s+[A-Za-z0-9-]+|Claude\s+(?:Opus|Sonnet|Haiku|Fable)\s+\d+(?:\.\d+)?|GPT-OSS\s+\S+)\s*[·•]\s*(?:low|medium|high|xhigh|max)\b",
+    re.IGNORECASE,
 )
 
 _DIRECT_EXECUTABLE_KINDS = {
@@ -382,6 +389,7 @@ def _scan_snapshot_tree(snapshot, pane_pid):
     agent_kind = None
     agent_pid = None
     agent_start_time = None
+    agent_argv = None
     has_wrapper = False
     # Task 2304. A candidate is an agent process with no agent of any kind
     # above it: a launcher chain, an npm shim, a nested `claude -p` or the
@@ -413,11 +421,13 @@ def _scan_snapshot_tree(snapshot, pane_pid):
                 agent_kind = kind
                 agent_pid = pid
                 agent_start_time = start_times.get(pid) or _proc_start_time(pid)
+                agent_argv = list(argv) if argv else None
             above = True
         queue.extend((child, above) for child in children.get(pid, []))
 
     if ambiguous:
-        agent_kind = agent_pid = agent_start_time = None
+        agent_kind = agent_pid = agent_start_time = agent_argv = None
+    snapshot.setdefault("root_agent_argv", {})[pane_pid] = agent_argv
     return {
         "agent_kind": agent_kind,
         "agent_pid": agent_pid,
@@ -548,6 +558,12 @@ def _scan_process_tree(target, pane_pid, _force_snapshot=False):
         # A child exit/switch or root PID reuse invalidates the snapshot now,
         # without waiting for its short TTL.
         return _scan_process_tree(target, pane_pid, _force_snapshot=True)
+    argv = (snapshot.get("root_agent_argv") or {}).get(pane_pid)
+    with _PROCESS_CACHE_LOCK:
+        if not result.get("ambiguous") and argv:
+            _LAST_AGENT_ARGV[target] = list(argv)
+        else:
+            _LAST_AGENT_ARGV.pop(target, None)
     return result
 
 
@@ -621,6 +637,13 @@ def resolve_process(target, pane_pid, command):
     return resolve_process_detail(target, pane_pid, command)[0]
 
 
+def last_agent_argv(target):
+    """Return the agent argv cached by the most recent resolve_process_detail walk."""
+    with _PROCESS_CACHE_LOCK:
+        argv = _LAST_AGENT_ARGV.get(target)
+        return list(argv) if argv else None
+
+
 def resolve_process_detail(target, pane_pid, command):
     """(kind or None, refused) from ONE walk of the pane's tree.
 
@@ -629,6 +652,9 @@ def resolve_process_detail(target, pane_pid, command):
     try:
         pane_pid = int(pane_pid) if pane_pid not in (None, "") else None
         scan = _scan_process_tree(target, pane_pid)
+        if scan is None:
+            with _PROCESS_CACHE_LOCK:
+                _LAST_AGENT_ARGV.pop(target, None)
         if scan and scan.get("ambiguous"):
             # Refused: neither the pane command nor a declaration may name
             # one of two same-kind agents (see identity_refused).
@@ -730,6 +756,8 @@ def refine_with_content(kind_or_none, tail):
     fingerprint = "\n".join(nonempty[-5:])
     if _CODEX_FINGERPRINT_RE.search(fingerprint):
         return "codex"
+    if _AGY_FINGERPRINT_RE.search("\n".join(nonempty[-10:])):
+        return "gemini"
     if _CLAUDE_FINGERPRINT_RE.search(fingerprint) or _CLAUDE_DIALOG_FINGERPRINT_RE.search(
         fingerprint
     ):

@@ -134,7 +134,9 @@ async function consolidatedPoll() {
     const requestedAt = Date.now();
     const req = pollBegin();
     try {
-        const url = req.since ? '/poll?since=' + encodeURIComponent(req.since) : '/poll';
+        // proto=2: this page addresses panes by durable key, so the drafts
+        // block comes keyed by key (shared/drafts.py:poll_block).
+        const url = '/poll?proto=2' + (req.since ? '&since=' + encodeURIComponent(req.since) : '');
         const resp = await fetch(url, {signal: AbortSignal.timeout(8000)});
         if (authLost(resp)) return;
         const data = await resp.json();
@@ -146,7 +148,7 @@ async function consolidatedPoll() {
         // Health
         dot.className = 'status-dot ' + (data.status === 'ok' ? 'ok' : 'err');
         if (data.tmux_target && !_termTarget) {
-            _termTarget = data.tmux_target;
+            setTermTarget(data.tmux_target);
             updateTmuxIndicator();
             try { localStorage.setItem('term_target', _termTarget); } catch(e) {}
         }
@@ -383,26 +385,32 @@ function _applySessionsData(panes, activeTarget, requestedAt) {
     }
 
     const hadTarget = !!_termTarget;
-    if (current && panes.some(p => p.target === current)) {
-        _termTarget = current;
-        noteTargetListed(current);
+    if (current && !_termTarget) setTermTarget(current);
+    // The selection is its pane, by durable key (js/pane-ref.js): renumbered
+    // or renamed, it follows; a stranger that took its address is not it.
+    const where = followTermPane(panes);
+    if (where === 'same' || where === 'moved') {
+        noteTargetListed(_termTarget);
+        if (where === 'moved') {
+            try { localStorage.setItem('term_target', _termTarget); } catch(e) {}
+            if (typeof studioOnTargetChange === 'function') studioOnTargetChange(_termTarget);
+        }
     } else if (current && panes.length > 0 && targetMissingIsStale(current, requestedAt || 0)) {
         // Missing only because this list predates a pane we just created — keep
         // it. Mirrors loadSessions() in terminal.js — keep the two in sync.
-        _termTarget = current;
     } else if (current && panes.length > 0) {
         // Viewed pane vanished (e.g. a subagent pane exited): fall back to
         // that session's first surviving pane rather than a dead target.
         // Mirrors loadSessions() in terminal.js — keep the two in sync.
-        const sess = current.split(':')[0];
+        const sess = sessionOf(current);
         const fallback = panes.find(p => p.session === sess) || panes[0];
-        selectTab(fallback.target, true);   // automatic, not a tap — see selectTab
+        selectTab(fallback.target, true, true);   // automatic, and the pane is gone — see selectTab
         // selectTab covers markActiveTab/indicator/unhide; still run the
         // reorder hook on the freshly rebuilt strip before bailing out.
         if (typeof _postTabRender === 'function') _postTabRender();
         return;
     } else if (panes.length > 0 && !_termTarget) {
-        _termTarget = panes[0].target;
+        setTermTarget(panes[0].target, panes[0].key);
     }
 
     if (_termTarget) {
@@ -454,7 +462,7 @@ function _applyStatesData(states) {
             effectiveState = 'done';
             _sessionStates[target] = { state: 'done', since: now, prevState: 'running' };
             const isActive = _termOpen && target === _termTarget;
-            if (!isActive) sendDoneNotification(target.split(':')[0]);
+            if (!isActive) sendDoneNotification(sessionOf(target));
         } else if (prev && prev.state === 'done' && (now - prev.since) > 60000) {
             effectiveState = info.state;
             _sessionStates[target] = { state: effectiveState, since: now, prevState: 'done' };
@@ -668,7 +676,7 @@ document.addEventListener('visibilitychange', () => {
 // Restore tmux target from localStorage
 try {
     const saved = localStorage.getItem('term_target');
-    if (saved) _termTarget = saved;
+    if (saved) setTermTarget(saved, null);  // bound to its key by the first poll
 } catch(e) {}
 updateTmuxIndicator();
 updateRouteIndicator();
@@ -676,7 +684,7 @@ updateRouteIndicator();
 // Terminal always on — start loading
 loadProjects();
 startPolling();
-syncAutoYesState().then(() => { if (_termTarget) updateAutoYesUI(_termTarget.split(':')[0]); });
+syncAutoYesState().then(() => { if (_termTarget) updateAutoYesUI(sessionOf(_termTarget)); });
 
 // Service worker (sw.js). Browsers register it only in a secure context, so it
 // is inert on the plain-HTTP phone origin until TLS lands. Registered here

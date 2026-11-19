@@ -21,7 +21,9 @@ from shared.agent_identity import (
 from shared.tmux import (
     DeliveryResult,
     expected_target_identity,
+    TmuxListError,
     generation_bound_delivery,
+    list_panes,
     tmux_exact_target,
 )
 from routes.streaming import broadcast_autoyes_event
@@ -123,6 +125,35 @@ _CURSOR_PERMISSION_LINES = 14
 _CURSOR_TRUST_OPT_RE = re.compile(r"\[a\] Trust this workspace")
 _CURSOR_TRUST_FOOTER_RE = re.compile(r"Use arrow keys to navigate")
 _CURSOR_TRUST_LINES = 8
+# Antigravity (agy) startup modals (verified live on agy 1.5.12):
+#   - folder trust: "Do you trust the contents of this project?" (may wrap
+#     across two rows at 40 cols) + "Yes, I trust this folder" + "Navigate · enter Confirm"
+#   - first-run Terms of Service & Data Use wizard (~24 rows, "Navigate · enter Toggle")
+#   - Color Scheme picker ("Navigate · enter Confirm") & Settings Error ("enter Confirm · esc Exit")
+# None of these are EVER auto-answered by Auto-Yes (trust is a human or explicit
+# `--trust-cwd` decision); all of them read as asking in `observe_attention` so
+# `assist wait` exits 10 and never reports idle 0.
+_AGY_TRUST_HDR_RE = re.compile(
+    r"Do\s+you\s+trust\s+the\s+contents\s+of\s+this\s+project\?",
+    re.IGNORECASE,
+)
+_AGY_TRUST_ANY_OPT_RE = re.compile(
+    r"^\s*(?:[>❯›]\s*)?Yes,\s+I\s+trust\s+this\s+folder\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+_AGY_TRUST_FOOTER_RE = re.compile(r"Navigate\s*[·•]\s*enter\s+Confirm", re.IGNORECASE)
+_AGY_MODAL_FOOTER_RE = re.compile(
+    r"(?:Navigate\s*[·•]\s*enter\s+(?:Confirm|Select|Toggle)|enter\s+Confirm\s*[·•]\s*esc\s+Exit)",
+    re.IGNORECASE,
+)
+_AGY_MODAL_LINES = 36
+_AGY_WIZARD_RE = re.compile(
+    r"Terms\s+of\s+Service\s+&\s+Data\s+Use"
+    r"|collects\s+usage\s+data\s+to\s+help\s+Google\s+enhance\s+performance"
+    r"|help\s+improve\s+Antigravity\s+CLI\s+by\s+allowing\s+Google"
+    r"|Navigate\s*[·•]\s*enter\s+Toggle",
+    re.IGNORECASE,
+)
 # Bracket/word-style prompts ([Y/n], [y/N], (yes/no)) are readline prompts
 # that wait for Enter — a bare "y" just echoes and re-triggers a fresh
 # countdown each tick (yyy…). TUI-style (y/n) prompts react to the bare key.
@@ -735,6 +766,7 @@ def _prompt_identity(tail, prompt_type, agent_kind):
 # proceed` is an option row.
 _CLAUDE_COMPOSER_RE = re.compile(r"^\s*❯(?:\s|$)(?!\s*(?:\d+[.)]|Yes\b))")
 _CODEX_COMPOSER_RE = re.compile(r"^\s*›\s+(?!\d+[.)])")
+_AGY_COMPOSER_RE = re.compile(r"^\s*>(?:\s|$)(?!\s*Yes,\s+I trust\b)", re.IGNORECASE)
 _ATTENTION_KINDS = ("claude", "codex", "gemini")
 # A working-chrome ROW, by shape: a status glyph, one word (`Working`,
 # `Pondering…`), then a parenthesised status that holds `esc to interrupt` and
@@ -752,6 +784,11 @@ def _composer_below(lines, below, agent_kind):
         ln = lines[i]
         if agent_kind == "codex":
             if _CODEX_COMPOSER_RE.match(ln):
+                return True
+        elif agent_kind == "gemini" and _AGY_COMPOSER_RE.match(ln):
+            above = i - 1 >= 0 and _OPTION_SEP_RE.match(lines[i - 1])
+            under = i + 1 < len(lines) and _OPTION_SEP_RE.match(lines[i + 1])
+            if above and under:
                 return True
         elif _CLAUDE_COMPOSER_RE.match(ln):
             above = i - 1 >= 0 and _OPTION_SEP_RE.match(lines[i - 1])
@@ -796,6 +833,58 @@ def _attention_region(tail, agent_kind):
         return ("answerable", answer, start, below, lines, answer[3])
     if agent_kind not in _ATTENTION_KINDS:
         return None
+    if agent_kind == "gemini":
+        agy_start = max(0, len(lines) - max(depth, _AGY_MODAL_LINES))
+        agy_bottom = "\n".join(lines[agy_start:])
+        if (
+            _AGY_TRUST_HDR_RE.search(agy_bottom)
+            and _AGY_TRUST_ANY_OPT_RE.search(agy_bottom)
+            and _AGY_TRUST_FOOTER_RE.search(agy_bottom)
+        ):
+            footer_idx = None
+            for idx in range(len(lines) - 1, agy_start - 1, -1):
+                if _AGY_TRUST_FOOTER_RE.search(lines[idx]):
+                    footer_idx = idx
+                    break
+            if footer_idx is not None and not _composer_below(lines, footer_idx, "gemini"):
+                start = agy_start
+                for idx in range(footer_idx, agy_start - 1, -1):
+                    if _AGY_TRUST_HDR_RE.search(_joined(lines[idx : footer_idx + 1])):
+                        start = idx
+                        break
+                return ("menu", None, start, footer_idx, lines, "Trust project folder")
+        if _AGY_WIZARD_RE.search(agy_bottom):
+            wizard_start = None
+            wizard_end = None
+            for idx in range(agy_start, len(lines)):
+                if _AGY_WIZARD_RE.search(lines[idx]):
+                    if wizard_start is None:
+                        wizard_start = idx
+                    wizard_end = idx
+                elif _AGY_MODAL_FOOTER_RE.search(lines[idx]) and wizard_start is not None:
+                    wizard_end = idx
+            if wizard_end is not None and not _composer_below(lines, wizard_end, "gemini"):
+                return ("question", None, wizard_start, wizard_end, lines, "Terms of Service & Data Use")
+        if _AGY_MODAL_FOOTER_RE.search(agy_bottom):
+            footer_idx = None
+            for idx in range(len(lines) - 1, agy_start - 1, -1):
+                if _AGY_MODAL_FOOTER_RE.search(lines[idx]):
+                    footer_idx = idx
+                    break
+            if footer_idx is not None and not _composer_below(lines, footer_idx, "gemini"):
+                # Require an unnumbered option cursor (`> ...`) or modal header above the footer
+                # so stray prose mentioning "Navigate · enter Confirm" alone cannot fire.
+                region_above = lines[agy_start:footer_idx]
+                if any(re.match(r"^\s*[>❯›]\s+\S", ln) for ln in region_above):
+                    summary = "Antigravity modal"
+                    start = agy_start
+                    for idx in range(agy_start, footer_idx):
+                        text = lines[idx].strip()
+                        if text:
+                            start = idx
+                            summary = text[:80]
+                            break
+                    return ("menu", None, start, footer_idx, lines, summary)
     last_footer = None
     for m in _NUMBERED_FOOTER_RE.finditer(window):
         last_footer = m
@@ -1172,23 +1261,12 @@ def _autoyes_scan_tick():
                 state.autoyes_effective = {}
                 return
 
-    proc = subprocess.run(
-        [
-            "tmux",
-            "list-panes",
-            "-a",
-            "-F",
-            "#{session_name}\t#{window_index}\t#{pane_index}\t"
-            "#{pane_pid}\t#{pane_current_command}\t#{pane_id}",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    if proc.returncode != 0:
+    try:
+        refs = list_panes()
+    except TmuxListError as exc:
         # tmux server gone — every session is dead; drop all auto-yes state
         # so ghost countdowns/toggles aren't served for the process lifetime.
-        if "no server" in (proc.stderr or "").lower():
+        if exc.no_server:
             # Cancellations are kept: only two quiet scans release one.
             with state.autoyes_lock:
                 state.autoyes_countdowns.clear()
@@ -1206,15 +1284,11 @@ def _autoyes_scan_tick():
     live_sessions = set()
     live_targets = set()
     pane_rows = []
-    for line in proc.stdout.strip().split("\n"):
-        if not line:
-            continue
-        parts = line.split("\t")
-        if len(parts) < 5:
-            continue
-        live_sessions.add(parts[0])
-        live_targets.add(f"{parts[0]}:{parts[1]}.{parts[2]}")
-        pane_rows.append(parts)
+    for ref in refs:
+        live_sessions.add(ref.session)
+        live_targets.add(ref.display_target)
+        pane_rows.append([ref.session, str(ref.window), str(ref.pane),
+                          ref.pane_pid, ref.command, ref.pane_id])
 
     with state.autoyes_lock:
         for sess in list(state.autoyes_sessions):

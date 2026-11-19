@@ -33,7 +33,7 @@ function _currentPaneDisplayName() {
     if (!_termTarget) return '';
     const pane = (_sessionPanes || []).find(p => p.target === _termTarget);
     if (pane && pane.agent_name) return agentDisplayName(pane);
-    return shortName(_termTarget.split(':')[0]);
+    return shortName(sessionOf(_termTarget));
 }
 
 function updateTmuxIndicator() {
@@ -52,7 +52,7 @@ function updateTmuxIndicator() {
 function updateRouteIndicator() {
     if (_termTarget) {
         const name = _currentPaneDisplayName();
-        const session = _termTarget.split(':')[0];
+        const session = sessionOf(_termTarget);
         routeDot.className = 'route-dot tmux';
         routeLabel.textContent = 'tmux \u2192 ' + name;
         routeLabel.style.color = 'var(--cyan)';

@@ -15,7 +15,7 @@ function _followRenamedSession(oldSession, newSession) {
     const oldPrefix = oldSession + ':';
     if (!_termTarget || !_termTarget.startsWith(oldPrefix)) return;
     const target = newSession + ':' + _termTarget.slice(oldPrefix.length);
-    _termTarget = target;
+    setTermTarget(target, _termKey);   // the same pane, renamed: its key stays
     _lastTabTapTime = 0;   // not a tap: never read as a double-tap clear
     noteTargetChosen(target, true);
     selectTab(target, true);
@@ -45,7 +45,7 @@ let _tabState = { pinned: [], order: [], snoozed: {}, sort: 'manual' };
 const _SORT_MODES = ['manual', 'name', 'created'];
 const _SORT_LABELS = { manual: 'Manual', name: 'Name', created: 'Opened' };
 
-function _sessionOf(target) { return (target || '').split(':')[0]; }
+function _sessionOf(target) { return sessionOf(target); }
 function _isPinned(target) { return _tabState.pinned.includes(_sessionOf(target)); }
 function _isSnoozed(target) { return !!(target && _tabState.snoozed[target]); }
 
@@ -251,7 +251,7 @@ function _saveSnooze(target, on) {
     return fetch('/api/tab-state/snooze', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({target: target, on: !!on}),
+        body: JSON.stringify({...wireTarget(target), on: !!on}),
     }).then(r => r.json()).then(d => {
         if (d.ok) _applyTabState(d.tab_state);
     }).catch(() => {});
@@ -282,7 +282,7 @@ function _wakeSnoozed(target) {
 function _createContextMenu(tab, x, y) {
     _removeContextMenu();
     const target = tab.dataset.target;
-    const session = target.split(':')[0];
+    const session = sessionOf(target);
     const isPinned = _isPinned(target);
     const isSnoozed = _isSnoozed(target);
 
@@ -929,7 +929,7 @@ function _applyStaleGroup() {
     // Build a session -> [tabs] map so we can check "any child running"
     const bySession = {};
     allTabs.forEach(t => {
-        const session = (t.dataset.target || '').split(':')[0];
+        const session = sessionOf(t.dataset.target);
         if (!bySession[session]) bySession[session] = [];
         bySession[session].push(t);
     });
@@ -965,7 +965,7 @@ function _applyStaleGroup() {
         if (idle < threshold) return false;
         // Team-lead/agent unit: if the session has any running child, keep
         // the whole group in the strip.
-        const session = (target || '').split(':')[0];
+        const session = sessionOf(target);
         if (sessionHasRunning[session]) return false;
         return true;
     });
@@ -1064,7 +1064,7 @@ function _applyStaleGroup() {
 // is the only place that tab is visible.
 function _buildTabRow(tab, isTucked) {
     const target = tab.dataset.target || '';
-    const session = target.split(':')[0];
+    const session = sessionOf(target);
     const row = document.createElement('div');
     row.className = 'stale-sheet-row';
     row.dataset.target = target;

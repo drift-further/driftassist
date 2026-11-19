@@ -111,7 +111,7 @@ class RosterTests(unittest.TestCase):
             'codex -m gpt-6-astra -c model_reasoning_effort="low" --yolo\n',
         )
 
-    def test_launch_builds_the_same_enter_autoyes_wait_send(self):
+    def test_launch_role_sends_without_autoyes(self):
         launch_response = {
             "session": "judge-run",
             "target": "judge-run:2.3",
@@ -120,9 +120,11 @@ class RosterTests(unittest.TestCase):
             "existed": False,
         }
         output = io.StringIO()
+        error = io.StringIO()
         with mock.patch.object(session.http, "post", return_value=launch_response), \
                 mock.patch.object(session, "send", return_value=0) as send, \
-                redirect_stdout(output):
+                mock.patch.dict("os.environ", {"ASSIST_NO_HINTS": "0"}), \
+                redirect_stdout(output), redirect_stderr(error):
             code = session.launch(
                 "judge-run",
                 role="judge",
@@ -137,13 +139,18 @@ class RosterTests(unittest.TestCase):
             pane="2.3",
             wait_for_completion=True,
             timeout=110,
-            autoyes=True,
+            autoyes=False,
             show_next_hint=False,
         )
         self.assertIn(
             'command: codex -m gpt-6-astra -c model_reasoning_effort="high" --yolo',
             output.getvalue(),
         )
+        self.assertIn("next:", error.getvalue())
+        self.assertNotIn("autoyes", error.getvalue().lower())
+        self.assertNotIn("--on", error.getvalue())
+        self.assertNotIn("continue", error.getvalue().lower())
+        self.assertIn("assist send judge-run --file BRIEF.md --enter --wait", error.getvalue())
 
     def test_role_launch_refuses_existing_session_without_sending(self):
         launch_response = {

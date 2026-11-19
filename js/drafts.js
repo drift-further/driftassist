@@ -5,9 +5,14 @@
 // Switching tabs swaps all three together; unsent text simply IS that tab's
 // draft — there is no mode to toggle and no save command.
 //
-// Keyed by _termTarget (the TAB), never getInputTarget(): input routing can
-// point sends at a split pane, but the composer you are typing into still
-// belongs to the tab you are looking at.
+// Keyed by the selected PANE (currentPaneId(): its durable key when the server
+// sends one, else _termTarget), never getInputTarget(): input routing can point
+// sends at a split pane, but the composer you are typing into still belongs to
+// the tab you are looking at. By key, a draft stays with its pane through a
+// renumber or a rename and never lands on a pane that took its old address
+// (effort 621 Phase 7 step B); requests carry it with proto 2 (wireTarget).
+// Drafts no live pane owns are listed, and copied only on request, by the
+// orphan sheet at the end of this file.
 
 const _DRAFT_SAVE_MS = 600;          // debounce after typing stops
 const _DRAFT_EMPTY = { text: '', attachments: [], enter_armed: true, updated_at: 0 };
@@ -36,7 +41,7 @@ function _bumpDraftSeq(target) {
     return _draftSeq[target];
 }
 
-function _draftTarget() { return _termTarget || ''; }
+function _draftTarget() { return currentPaneId(); }
 
 function _draftEntry(target) {
     return _draftCache[target] || { ..._DRAFT_EMPTY };
@@ -71,7 +76,7 @@ function _draftHasContent(entry) {
 function _renderDraftMarks() {
     const local = _draftTarget();
     document.querySelectorAll('.session-tab[data-target]').forEach(tab => {
-        const target = tab.dataset.target;
+        const target = paneIdOf(tab.dataset.target);
         // The active tab is authoritative about itself: its own composer is on
         // screen, and waiting for the next poll to confirm what you just typed
         // makes the marker feel broken.
@@ -121,7 +126,7 @@ function _applyDraftToComposer(target, force) {
     _composerSynced = { target: target, text: input.value };
     _attachments = (d.attachments || []).map(a => ({ ...a, uploading: false }));
     if (typeof SplitView !== 'undefined' && SplitView.enabled) {
-        const record = SplitView.slots.find(r => r.target === target);
+        const record = SplitView.slots.find(r => paneIdOf(r.target) === target);
         const tray = record && SplitView.trays.get(record.pane_id);
         if (tray) {
             const pending = tray.filter(a => a.uploading);
@@ -178,7 +183,7 @@ async function flushDraft(target) {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                target: target,
+                ...wireTarget(target),
                 text: d.text || '',
                 attachments: d.attachments || [],
                 enter_armed: d.enter_armed !== false,
@@ -221,7 +226,7 @@ async function loadDraft(target, force) {
     _applyDraftToComposer(target, force);
     const seq = _draftSeq[target] || 0;
     try {
-        const resp = await fetch('/api/draft?target=' + encodeURIComponent(target));
+        const resp = await fetch('/api/draft?' + new URLSearchParams(wireTarget(target)));
         const data = await resp.json();
         if (!data.ok) return;
         // Switched away, or changed this draft locally, while the fetch was in
@@ -276,6 +281,7 @@ async function clearDraftAfterSend(target) {
 // ================================================================
 function _applyDraftsData(block) {
     if (!block) return;
+    _renderOrphanCount(block.orphans || 0);
     _draftMarks = new Set(block.marks || []);
     const rev = block.rev || {};
     const target = _draftTarget();
@@ -372,3 +378,147 @@ document.addEventListener('visibilitychange', () => {
         flushDraft(target);
     }
 });
+
+// ================================================================
+// Orphaned drafts — listed, copied only on request, dismissed by hand
+// ================================================================
+// A draft whose pane is gone (a tmux server restart, a pane closed before the
+// upgrade, a pre-upgrade name that matched no pane) is never attached to
+// another pane by name: a pane that takes the old address or `%N` is a
+// different pane. /poll counts them (`orphans`, proto 2); this sheet lists
+// them and offers "Copy to this pane", onto the tab on screen when its
+// composer is empty. The server refuses a copy onto a pane holding a draft,
+// so nothing is ever overwritten. A copy leaves the orphan where it is (sign-
+// off M3 R3): whatever then happens to the pane's draft, the text is still
+// here until Dismiss, or 30 days.
+let _orphanSheetOpen = false;
+
+function _renderOrphanCount(count) {
+    const btn = document.getElementById('draft-orphans');
+    if (!btn) return;
+    btn.hidden = !count;
+    btn.textContent = '\u2691 ' + count;
+    if (!count && _orphanSheetOpen) closeOrphanDrafts();
+}
+
+function closeOrphanDrafts() {
+    _orphanSheetOpen = false;
+    document.getElementById('orphan-sheet')?.remove();
+}
+
+function _orphanButton(label, action, arg, className) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = className;
+    btn.textContent = label;
+    btn.dataset.action = action;
+    if (arg !== undefined) btn.dataset.arg = JSON.stringify(arg);
+    return btn;
+}
+
+async function openOrphanDrafts() {
+    let orphans = [];
+    try {
+        const resp = await fetch('/api/drafts/orphans');
+        const data = await resp.json();
+        if (!data.ok) { showFlash('error', 'Drafts unavailable'); return; }
+        orphans = data.orphans || [];
+    } catch (e) { showFlash('error', 'Offline'); return; }
+    _orphanSheetOpen = true;
+    document.getElementById('orphan-sheet')?.remove();
+    const sheet = document.createElement('section');
+    sheet.id = 'orphan-sheet';
+    sheet.className = 'outbox-sheet orphan-sheet';
+    sheet.setAttribute('role', 'dialog');
+    sheet.setAttribute('aria-label', 'Orphaned drafts');
+    const head = document.createElement('div');
+    head.className = 'outbox-sheet-head';
+    const title = document.createElement('span');
+    title.textContent = 'Orphaned drafts';
+    head.appendChild(title);
+    head.appendChild(_orphanButton('\u00d7', 'closeOrphanDrafts', undefined, 'outbox-sheet-close'));
+    sheet.appendChild(head);
+    if (!orphans.length) {
+        const none = document.createElement('div');
+        none.className = 'outbox-row-note';
+        none.textContent = 'None left.';
+        sheet.appendChild(none);
+    }
+    for (const o of orphans) {
+        const row = document.createElement('div');
+        row.className = 'outbox-row orphan-row';
+        const text = document.createElement('div');
+        text.className = 'orphan-row-text';
+        const body = document.createElement('div');
+        const preview = (o.text || '').trim();
+        body.textContent = preview.length > 160 ? preview.slice(0, 160) + '\u2026' : (preview || '(attachments only)');
+        const note = document.createElement('div');
+        note.className = 'outbox-row-note';
+        const files = (o.attachments || []).length;
+        note.textContent = (o.reason === 'legacy'
+            ? 'from before the upgrade: ' + o.key
+            : o.reason === 'legacy-after-rollback'
+                ? 'written while an older Assist ran: ' + (o.legacy_from || o.key)
+                : 'its pane or tmux server is gone')
+            + (files ? ' \u00b7 ' + files + ' file' + (files > 1 ? 's' : '') : '');
+        if (o.copied_at) note.textContent += ' \u00b7 copied';
+        text.appendChild(body);
+        text.appendChild(note);
+        row.appendChild(text);
+        row.appendChild(_orphanButton('Copy to this pane', 'copyOrphanDraft', o.key, 'action-btn orphan-copy'));
+        row.appendChild(_orphanButton('Dismiss', 'dismissOrphanDraft', o.key, 'action-btn orphan-dismiss'));
+        sheet.appendChild(row);
+    }
+    document.body.appendChild(sheet);
+}
+
+async function copyOrphanDraft(key) {
+    const here = _draftTarget();
+    if (!here) { showFlash('error', 'No session'); return; }
+    // Never over what this tab already holds, saved or not.
+    if ((input.value || '').trim() || (_attachments || []).length) {
+        showFlash('error', 'Clear this tab\u2019s composer first');
+        return;
+    }
+    // A clear still waiting on its debounce lands first, so the server does
+    // not refuse the copy over text the composer no longer shows.
+    if (_draftDirtyFor === here) await flushDraft(here);
+    let data = null;
+    try {
+        const resp = await fetch('/api/drafts/copy', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ from: key, ...wireTarget(here) }),
+        });
+        data = await resp.json();
+    } catch (e) {
+        data = null;
+    }
+    if (!data) { showFlash('error', 'Offline \u2014 the draft is still listed'); return; }
+    if (!data.ok) {
+        showFlash('error', data.error === 'destination_has_draft' ? 'This tab already has a draft'
+            : data.error === 'storage_full' ? 'No space for its files \u2014 try again later'
+            : 'Could not copy it');
+        return;
+    }
+    showFlash('ok', 'Copied to this pane');
+    // The answer itself is never painted: it can arrive after this pane was
+    // edited, cleared or left. A fresh read shows what the server holds now,
+    // and loadDraft's own guards keep anything typed since.
+    if (here === _draftTarget()) loadDraft(here);
+    if (_orphanSheetOpen) openOrphanDrafts();
+}
+
+async function dismissOrphanDraft(key) {
+    if (!confirm('Delete this orphaned draft for good?')) return;
+    try {
+        const resp = await fetch('/api/drafts/dismiss', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key: key }),
+        });
+        const data = await resp.json();
+        if (!data.ok && data.error !== 'not_found') { showFlash('error', 'Could not dismiss it'); return; }
+    } catch (e) { showFlash('error', 'Offline'); return; }
+    if (_orphanSheetOpen) openOrphanDrafts();
+}

@@ -97,7 +97,9 @@ Server:
   restart                Restart the server
   update [--check] [--json]
                          Check/install an upstream update; restart separately
-  status                 Show server status
+  status [SESSION] [--pane P] [--json]
+                         Show server status, or one-line/JSON status for SESSION
+                         (model, effort, perms, context %, working/idle/asking)
   logs [N | -f | --follow]
                          Tail last N lines (default 100), or follow
   service install | uninstall | status
@@ -120,18 +122,24 @@ Reach it from your phone:
 
 Config & diagnostics:
   config                 Print resolved paths, ports, and env
-  roster [ROLE] [--family F]
-                         List model-family commands, or print one command
+  roster [--role R] [--family F] [--json]
+  roster [ROLE] [--family F | --against F]
+  roster set|note|quota|ban|rm|show|doctor|migrate ...
+                         Inspect or manage the structured model roster, quotas,
+                         bans, and judge rules (atomic writes + timestamped .bak)
   doctor                 Check prerequisites + server health
   --version              Print the version
 
 Sessions:
-  ls [--json] [--cwd]    List sessions and panes
-  view SESSION [-n N] [--pane P]
-                         Capture a session pane
+  ls [--json] [--cwd]    List sessions and panes (state, model, effort, perms, context %)
+  status SESSION [--pane P] [--json]
+                         One-line (or JSON) status: model, effort, perms,
+                         context %, and working/idle/asking state
+  view SESSION [-n N] [--pane P] [--plain]
+                         Capture a session pane (--plain strips ANSI escapes)
   send SESSION [TEXT | --file F] [--enter] [--pane P]
       [--wait] [--timeout N] [--autoyes]
-                         Send text to a session pane
+                         Send text (or bare --enter) to a session pane
   wait SESSION [--timeout N] [--pane P] [--autoyes]
                          Wait for a session pane to settle
   send-file PATH [--name NAME] [--no-wait] [--timeout N]
@@ -140,8 +148,16 @@ Sessions:
                          downloads it, once. Waits for pickup by default
   launch --session N [--cwd P] [--cols C] [--rows R]
       [--wait] [--timeout N] [--role R (--family F | --against F)]
+      [--brief FILE] [--trust-cwd] [--approved-by-daniel] [--approved-by-karen]
                          Create a bare shell; takes no command
                          With --role, resolve and send its roster command
+                         (enforces [[bans]] and entry approval; never arms Auto-Yes).
+                         With --brief, gate on the agent's banner (model, effort,
+                         permissions) before pasting FILE as one message and
+                         confirming work started; --trust-cwd accepts agy's
+                         folder-trust dialog only (never other prompts or wizards);
+                         --approved-by-daniel / --approved-by-karen satisfy matching
+                         approval gates (never override hard bans)
   resume SESSION [--pane P] [--agent-only]
                          Print a verified resume command when available
   kill SESSION [--pane P]
@@ -173,9 +189,10 @@ Next-step hints:
   is omitted.
 
 Wait exit codes:
-  0   idle    — the pane went quiet, no prompt
-  10  prompt  — quiet because it is asking something (summary printed)
-  75  working — still changing at the deadline; not an error, re-run `assist wait`
+  0   idle      — the pane went quiet, no prompt
+  3   no-change — input was sent via `send --wait`, but no visible change was seen
+  10  prompt    — quiet because it is asking something (summary printed)
+  75  working   — still changing at the deadline; not an error, re-run `assist wait`
 
 Send-file exit codes:
   0   picked up (or offered, with --no-wait)
@@ -225,10 +242,10 @@ PROCESS_HANDLERS = {
     "start": proc.start,
     "stop": proc.stop,
     "restart": proc.restart,
-    "status": proc.status,
 }
 COMMANDS = {
     *PROCESS_HANDLERS,
+    "status",
     "logs",
     "config",
     "roster",
@@ -281,6 +298,31 @@ def build_parser() -> AssistArgumentParser:
         command_parser = subparsers.add_parser(verb, add_help=False)
         command_parser.add_argument("arguments", nargs=argparse.REMAINDER)
 
+    status_parser = subparsers.add_parser(
+        "status",
+        description=(
+            "Show server status (when SESSION is omitted), or one-line/JSON "
+            "status for a session pane (model, effort, permissions, context %, state)."
+        ),
+    )
+    status_parser.add_argument(
+        "session",
+        nargs="?",
+        help="tmux session name (omit for server status)",
+    )
+    status_parser.add_argument(
+        "--pane",
+        default=None,
+        metavar="P",
+        help="pane selector within SESSION (default: primary pane)",
+    )
+    status_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="emit structured JSON for SESSION and suppress next-step hints",
+    )
+
     logs_parser = subparsers.add_parser("logs", add_help=False)
     logs_parser.add_argument("-f", "--follow", action="store_true")
     logs_parser.add_argument("lines", nargs="?", default="100")
@@ -324,6 +366,11 @@ def build_parser() -> AssistArgumentParser:
         metavar="P",
         help="pane selector within SESSION (default: 0.0)",
     )
+    view_parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="strip ANSI escape sequences from captured output",
+    )
 
     send_parser = subparsers.add_parser(
         "send",
@@ -337,7 +384,7 @@ def build_parser() -> AssistArgumentParser:
     send_parser.add_argument(
         "text",
         nargs="?",
-        help="text to send (mutually exclusive with --file)",
+        help="text to send (mutually exclusive with --file; omit with --enter to press Enter)",
     )
     send_parser.add_argument(
         "--file",
@@ -348,7 +395,7 @@ def build_parser() -> AssistArgumentParser:
     send_parser.add_argument(
         "--enter",
         action="store_true",
-        help="press Enter after sending the text",
+        help="press Enter after sending the text (or by itself when no text/--file is given)",
     )
     send_parser.add_argument(
         "--pane",
@@ -486,7 +533,7 @@ def build_parser() -> AssistArgumentParser:
     )
     launch_parser.add_argument(
         "--role",
-        help="resolve and launch this role from roster.toml",
+        help="resolve and launch this role from roster.toml (never arms Auto-Yes)",
     )
     launch_family = launch_parser.add_mutually_exclusive_group()
     launch_family.add_argument(
@@ -498,6 +545,33 @@ def build_parser() -> AssistArgumentParser:
         "--against",
         metavar="F",
         help="use the one competing family other than F for --role",
+    )
+    launch_parser.add_argument(
+        "--brief",
+        dest="brief_path",
+        metavar="FILE",
+        help=(
+            "gated launch (requires --role): verify banner model, effort and "
+            "permissions mode, then paste FILE as one message and confirm work started"
+        ),
+    )
+    launch_parser.add_argument(
+        "--trust-cwd",
+        action="store_true",
+        help=(
+            "accept agy's folder-trust dialog during --role launch (never accepts "
+            "first-run wizards or other prompts; never arms Auto-Yes)"
+        ),
+    )
+    launch_parser.add_argument(
+        "--approved-by-daniel",
+        action="store_true",
+        help="explicit approval for models matching an ask_daniel ban or entry approval (never overrides hard bans)",
+    )
+    launch_parser.add_argument(
+        "--approved-by-karen",
+        action="store_true",
+        help="explicit approval for roster entries with approval = ask_karen",
     )
 
     purge_parser = subparsers.add_parser(
@@ -582,23 +656,6 @@ def build_parser() -> AssistArgumentParser:
             "act on the all-sessions switch instead of one session: arms every "
             "agent pane at the global delay, with per-session opt-out"
         ),
-    )
-
-    roster_parser = subparsers.add_parser(
-        "roster",
-        description=(
-            "List configured role commands, or print one role command for scripts."
-        ),
-    )
-    roster_parser.add_argument(
-        "role",
-        nargs="?",
-        help="role whose command to print",
-    )
-    roster_parser.add_argument(
-        "--family",
-        metavar="F",
-        help="family to select (requires ROLE when supplied)",
     )
 
     for verb in (
@@ -711,6 +768,9 @@ def main(arguments: list[str] | None = None) -> int:
     if verb == "devices":
         # Its own argument handling, so `assist devices -h` reaches it.
         return devices.command(argv[1:])
+    if verb == "roster":
+        # Own parser covering read queries + set/note/quota/ban/rm/show/doctor/migrate.
+        return roster.cli_main(argv[1:], resolved.roster_file)
     if verb == "migrate-state":
         from cli import migrate_state
 
@@ -724,6 +784,18 @@ def main(arguments: list[str] | None = None) -> int:
 
     if parsed.verb in PROCESS_HANDLERS:
         return PROCESS_HANDLERS[parsed.verb](resolved)
+    if parsed.verb == "status":
+        if parsed.session is None:
+            if parsed.json_output or parsed.pane is not None:
+                print(
+                    "assist: SESSION is required with --json or --pane",
+                    file=sys.stderr,
+                )
+                return 2
+            return proc.status(resolved)
+        from cli import session
+
+        return session.status(parsed.session, parsed.pane, parsed.json_output)
     if parsed.verb == 'update':
         from cli import update
 
@@ -734,11 +806,6 @@ def main(arguments: list[str] | None = None) -> int:
         return proc.logs(resolved, lines=parsed.lines, follow=parsed.follow)
     if parsed.verb == "config":
         return proc.config(resolved)
-    if parsed.verb == "roster":
-        if parsed.family is not None and parsed.role is None:
-            print("assist: --family requires ROLE", file=sys.stderr)
-            return 2
-        return roster.command(resolved.roster_file, parsed.role, parsed.family)
     if parsed.verb == "doctor":
         return proc.doctor(resolved)
     if parsed.verb in ("ls", "view", "send", "launch", "kill", "autoyes", "resume"):
@@ -746,7 +813,7 @@ def main(arguments: list[str] | None = None) -> int:
     if parsed.verb == "ls":
         return session.list_sessions(parsed.json_output, parsed.include_cwd)
     if parsed.verb == "view":
-        return session.view(parsed.session, parsed.pane, parsed.lines)
+        return session.view(parsed.session, parsed.pane, parsed.lines, parsed.plain)
     if parsed.verb == "send":
         return session.send(
             parsed.session,
@@ -788,6 +855,10 @@ def main(arguments: list[str] | None = None) -> int:
             parsed.family,
             parsed.against,
             resolved.roster_file,
+            parsed.brief_path,
+            parsed.trust_cwd,
+            parsed.approved_by_daniel,
+            parsed.approved_by_karen,
         )
     if parsed.verb == "resume":
         return session.resume(parsed.session, parsed.pane, parsed.agent_only)

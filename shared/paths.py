@@ -189,6 +189,10 @@ STATE_ITEMS = (
     ("favorites.json", "data", "favorites.json"),
     ("drafts.json", "data", "drafts.json"),
     ("tab_state.json", "data", "tab_state.json"),
+    # Pane-keyed state in its own files (621 Phase 7 step B, sign-off M3 F5):
+    # drafts.json and tab_state.json above stay in the pre-7B format.
+    ("drafts.v2.json", "data", "drafts.v2.json"),
+    ("tab_state.v2.json", "data", "tab_state.v2.json"),
     ("idle_state.json", "data", "idle_state.json"),
     ("devices.json", "data", "devices.json"),
     ("container_config.json", "data", "container_config.json"),

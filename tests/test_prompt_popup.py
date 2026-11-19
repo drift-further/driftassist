@@ -989,7 +989,9 @@ console.log(JSON.stringify({
         poll = (ROOT / "routes/poll.py").read_text()
         self.assertIn('result["sudo_prompts"] = sudo_prompts', poll)
         self.assertIn('"prompt": prompt,', poll)
-        self.assertIn("#{pane_tty}", poll)
+        # The tty rides on the one listing (shared/tmux.py:list_panes).
+        self.assertIn("pane_tty", tmux.LIST_PANES_FIELDS)
+        self.assertIn("pane_ttys[target] = ref.pane_tty", poll)
 
 
 class SudoArgvReaderTests(unittest.TestCase):

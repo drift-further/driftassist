@@ -21,12 +21,12 @@
     <link rel="stylesheet" href="/css/studio.css?v=10">
     <link rel="stylesheet" href="/css/access.css?v=5">
     <link rel="stylesheet" href="/css/chrome.css?v=7">
-    <link rel="stylesheet" href="/css/notifications.css?v=6">
+    <link rel="stylesheet" href="/css/notifications.css?v=8">
     <link rel="stylesheet" href="/css/updates.css?v=1">
 </head>
 <body>
     <script src="/js/prepaint.js?v=1"></script>
-    <script src="/js/actions-registry.js?v=5"></script>
+    <script src="/js/actions-registry.js?v=7"></script>
 
     <!-- Top chrome: a utility bar over a full-width session rail. The badge
          headroom the tabs need lives INSIDE the rail's scrollport (8px of top
@@ -445,15 +445,14 @@
 
             <div class="fit-menu" id="fit-menu">
                 <button class="fit-item" data-cols="auto" data-action="fitMenuPick" data-arg='"auto"' title="Fit to viewport">Auto</button>
-                <button class="fit-item" data-cols="58" data-action="fitMenuPick" data-arg="58">Phone 58</button>
-                <button class="fit-item" data-cols="100" data-action="fitMenuPick" data-arg="100">Compact 100</button>
-                <button class="fit-item" data-cols="160" data-action="fitMenuPick" data-arg="160">Wide 160</button>
-                <button class="fit-item" data-cols="200" data-action="fitMenuPick" data-arg="200">Desktop 200</button>
+                <!-- Presets come from Settings → Terminal → Fit Presets (js/terminal.js:renderFitPresets). -->
+                <div class="fit-presets" id="fit-presets"></div>
                 <button class="fit-item fit-follow" data-action="fitMenuUnpin" title="Unpin window size so it follows whatever terminal you tmux attach (removes the padding dots). Next Fit re-pins it.">Follow attach</button>
                 <div class="fit-custom">
-                    <input type="number" class="fit-custom-input" id="fit-custom-input" min="40" max="400" placeholder="cols" inputmode="numeric">
+                    <input type="number" class="fit-custom-input" id="fit-custom-input" min="40" max="400" placeholder="cols: auto" inputmode="numeric">
                     <span class="fit-custom-x">&times;</span>
-                    <input type="number" class="fit-custom-input" id="fit-custom-rows" min="10" max="600" placeholder="rows" inputmode="numeric">
+                    <input type="number" class="fit-custom-input" id="fit-custom-rows" min="10" max="600" placeholder="rows: auto" inputmode="numeric">
+                    <button class="fit-item fit-auto-rows" data-action="fitMenuRowsAuto" title="Clear the height so Apply fits it to the screen">Auto</button>
                     <button class="fit-item fit-apply" data-action="fitMenuApplyCustom">Apply</button>
                 </div>
             </div>
@@ -680,6 +679,10 @@
             <button class="action-btn btn-enter-lock" id="enter-lock" data-action="toggleEnterLock"
                     aria-pressed="false" aria-label="Enter key behaviour"
                     title="Enter sends &mdash; tap for multi-line">&#8629;</button>
+            <!-- Drafts no live pane owns (a tmux restart, or a pane gone before
+                 the upgrade): listed, copied only on request, dismissed by hand — js/drafts.js. -->
+            <button type="button" class="action-btn btn-orphans" id="draft-orphans" data-action="openOrphanDrafts"
+                    title="Orphaned drafts" aria-label="Orphaned drafts" hidden>&#9873; 0</button>
             <button class="action-btn btn-vault hidden" id="vault-quick-send"
                     data-action="vaultSendDefault" aria-label="Send stored secret"
                     title="Send stored secret">&#128273;</button>
@@ -707,36 +710,37 @@
         </div>
     </div>
 
-    <script src="/js/state.js?v=7"></script>
+    <script src="/js/state.js?v=8"></script>
+    <script src="/js/pane-ref.js?v=1"></script>
     <script src="/js/target-hold.js?v=1"></script>
     <script src="/js/poll-sync.js?v=2"></script>
     <script src="/js/ui.js?v=7"></script>
-    <script src="/js/vault.js?v=3"></script>
-    <script src="/js/input.js?v=13"></script>
+    <script src="/js/vault.js?v=4"></script>
+    <script src="/js/input.js?v=14"></script>
     <script src="/js/autocomplete.js?v=2"></script>
     <script src="/js/segments.js?v=3"></script>
-    <script src="/js/drafts.js?v=5"></script>
+    <script src="/js/drafts.js?v=7"></script>
     <script src="/js/keylabels.js?v=4"></script>
-    <script src="/js/keycombo.js?v=2"></script>
-    <script src="/js/terminal.js?v=35"></script>
+    <script src="/js/keycombo.js?v=3"></script>
+    <script src="/js/terminal.js?v=36"></script>
     <script src="/js/opencode.js?v=2"></script>
-    <script src="/js/actions.js?v=21"></script>
-    <script src="/js/commands.js?v=5"></script>
+    <script src="/js/actions.js?v=22"></script>
+    <script src="/js/commands.js?v=6"></script>
     <script src="/js/studio.js?v=4"></script>
-    <script src="/js/studio-context.js?v=6"></script>
+    <script src="/js/studio-context.js?v=7"></script>
     <script src="/js/access.js?v=4"></script>
     <script src="/js/devices.js?v=2"></script>
     <script src="/js/chrome.js?v=3"></script>
-    <script src="/js/monitor.js?v=13"></script>
+    <script src="/js/monitor.js?v=14"></script>
     <script src="/js/notifications.js?v=1"></script>
-    <script src="/js/prompt-popup.js?v=6"></script>
+    <script src="/js/prompt-popup.js?v=7"></script>
     <script src="/js/outbox.js?v=2"></script>
-    <script src="/js/tabs.js?v=17"></script>
+    <script src="/js/tabs.js?v=18"></script>
     <script src="/js/updates.js?v=1"></script>
     <script src="/js/settings.js?v=13"></script>
-    <script src="/js/split-view.js?v=5"></script>
+    <script src="/js/split-view.js?v=6"></script>
     <script src="/js/delegate-nav.js?v=5"></script>
-    <script src="/js/app.js?v=35"></script>
+    <script src="/js/app.js?v=36"></script>
     <script src="/js/selection.js?v=2"></script>
 </body>
 </html>

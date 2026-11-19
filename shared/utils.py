@@ -10,6 +10,7 @@ import time
 # rebound by state._apply_settings() when settings are patched at runtime, so
 # importing it by value would freeze the startup value forever.
 import shared.state as state
+from shared.tmux import parse_pane_key, resolve_pane_key
 
 _history_lock = threading.Lock()
 
@@ -230,6 +231,19 @@ def add_to_history(text):
 
 
 def resolve_target(data):
-    """Return the tmux target to use: prefer client-supplied, fall back to global."""
+    """Return the tmux target to use: prefer client-supplied, fall back to global.
+
+    A client target may be `session:w.p`, a pane id `%N`, or a durable pane key
+    `<generation>:%N` (shared/tmux.py:PaneRef.key). A key resolves to its live
+    pane's `session:w.p`, so everything keyed by target downstream (activity,
+    idle state) keeps today's keys; a key for a gone pane or another tmux
+    server generation resolves to None, never to the global target and never
+    to whatever pane now holds that `%N`.
+    """
     client_target = (data.get("target") or "").strip()
-    return client_target or state.tmux_target
+    if not client_target:
+        return state.tmux_target
+    if parse_pane_key(client_target):
+        ref = resolve_pane_key(client_target)
+        return ref.display_target if ref else None
+    return client_target

@@ -392,7 +392,7 @@ async function _launchFromPath(path, name) {
         const data = await resp.json();
         if (data.ok) {
             _trackRecentExplore(path, name);
-            _termTarget = data.target;
+            setTermTarget(data.target, null);  // a new pane: its key arrives with the next poll
             noteTargetChosen(_termTarget, true);
             updateTmuxIndicator();
             try { localStorage.setItem('term_target', _termTarget); } catch(e) {}
@@ -435,7 +435,7 @@ async function launchProject(name, btnEl) {
         const data = await resp.json();
         launchData = data;
         if (data.ok) {
-            _termTarget = data.target;
+            setTermTarget(data.target, null);  // a new pane: its key arrives with the next poll
             noteTargetChosen(_termTarget, true);
             _termExpectedIdentity = data.expected_target_identity || null;
             updateTmuxIndicator();
@@ -507,9 +507,16 @@ const _DOUBLE_TAP_MS = 500;
 // session Assist just launched. It reaches the composer as "do not replace what
 // is being typed": a tap is permission to swap the text out, a switch that
 // happens TO you is not.
-function selectTab(target, auto) {
+// `paneGone` (with `auto`): the selected pane no longer exists. Its composer is
+// flushed under its durable key, where it stays as an orphaned draft, and the
+// pane we land on shows its own draft: the old pane's text must not land on
+// another pane (621 Phase 7 step B). Without a key it follows, as before.
+function selectTab(target, auto, paneGone) {
     if (typeof SplitView !== 'undefined' && SplitView.intercept(target)) return;
-    if (!(typeof SplitView !== 'undefined' && SplitView.enabled) && target === _termTarget && (Date.now() - _lastTabTapTime) < _DOUBLE_TAP_MS) {
+    // Never for an automatic switch: a fallback can land on the same display
+    // name (another pane took the address of the one that closed), and that
+    // is not a double tap.
+    if (!auto && !(typeof SplitView !== 'undefined' && SplitView.enabled) && target === _termTarget && (Date.now() - _lastTabTapTime) < _DOUBLE_TAP_MS) {
         _lastTabTapTime = 0;  // consume; require fresh sequence for next clear
         _clearActivePane(target);
         return;
@@ -518,8 +525,13 @@ function selectTab(target, auto) {
     // The composer belongs to the tab: flush what is on screen to the tab we
     // are leaving, then swap in the new one's text, tray and Enter lock. Must
     // run BEFORE _termTarget moves — the draft module reads it for "here".
-    if (typeof onTabSwitchDraft === 'function') onTabSwitchDraft(_termTarget, target, !auto);
-    _termTarget = target;
+    // The draft module keys by pane (js/pane-ref.js): the one being left, and
+    // the one at `target` in the list the user tapped.
+    const nextKey = selectionKeyOf(target);   // the listed pane's, not the current binding
+    const leaving = currentPaneId();
+    const replace = !auto || (paneGone && isPaneKey(leaving));
+    if (typeof onTabSwitchDraft === 'function') onTabSwitchDraft(leaving, nextKey || target, replace);
+    setTermTarget(target, nextKey);
     if (typeof studioOnTargetChange === 'function') studioOnTargetChange(target);
     noteTargetChosen(target, false);
     if (typeof OpenCodeOutput !== 'undefined') OpenCodeOutput.onTargetChange();
@@ -533,7 +545,7 @@ function selectTab(target, auto) {
     if (typeof applyKeyLabels === 'function') applyKeyLabels(target);
     _termPaused = false;
     _tabSwitchScrollLock = true;  // suppress scroll-freeze until content renders
-    _termLines = 2000;
+    _termLines = defaultTermLines();
     _termHasNew = false;
     _getSmartState(target).dismissedContent = null; // Reset dismiss so smart actions reappear on return
     // Drop any throttled render queued for the old target so it cannot fire
@@ -570,10 +582,10 @@ function selectTab(target, auto) {
     if (typeof _revealActiveTab === 'function') _revealActiveTab(true);
 
     // Show/hide command output overlay for this session
-    onTabSwitchCommands(target.split(':')[0]);
+    onTabSwitchCommands(sessionOf(target));
     onTabSwitchSkills();
     // Sync auto-yes state from server and update UI for this session
-    if (typeof syncAutoYesState === 'function') syncAutoYesState().then(() => updateAutoYesUI(target.split(':')[0]));
+    if (typeof syncAutoYesState === 'function') syncAutoYesState().then(() => updateAutoYesUI(sessionOf(target)));
 }
 
 async function _clearActivePane(target) {
@@ -651,6 +663,9 @@ function _isOpenCodeTui(target = _termTarget) {
  *  mode is one bundle, not just gestures. */
 function _tuiSubscribeFrame(target, lines) {
     const msg = {type: 'subscribe', target: target, lines: lines};
+    // By durable key with proto 2 when the pane has one (js/pane-ref.js): the
+    // server then streams that pane wherever it moves, and never another.
+    Object.assign(msg, wireTarget(target));
     const o = _tuiOverride[target];
     if (o) msg.tui = (o === 'tui');
     return JSON.stringify(msg);
@@ -1006,7 +1021,8 @@ function onWsMessage(event) {
         }
         _lastWsUpdateTime = now;
 
-        _applyTerminalContent(data.content || '', data.info, data.target);
+        // A key-subscribed frame names the key: render it as its tab.
+        _applyTerminalContent(data.content || '', data.info, displayOf(data.target));
     } catch(e) {}
 }
 
@@ -1054,7 +1070,7 @@ document.addEventListener('visibilitychange', () => {
         _termHiddenStopped = false;
         if (_termOpen && _termTarget) startPolling();
         if (typeof syncAutoYesState === 'function') {
-            syncAutoYesState().then(() => { if (_termTarget) updateAutoYesUI(_termTarget.split(':')[0]); });
+            syncAutoYesState().then(() => { if (_termTarget) updateAutoYesUI(sessionOf(_termTarget)); });
         }
     }
 });
@@ -1095,10 +1111,10 @@ function updateConnIndicator() {
 async function captureTerminal() {
     if (!_termTarget) return;
     try {
-        const resp = await fetch(`/terminal/capture?target=${encodeURIComponent(_termTarget)}&lines=${_termLines}${_tuiQuery(_termTarget)}`);
+        const resp = await fetch(`/terminal/capture?${new URLSearchParams(wireTarget(_termTarget))}&lines=${_termLines}${_tuiQuery(_termTarget)}`);
         const data = await resp.json();
         if (!data.ok) return;
-        _applyTerminalContent(data.content || '', data.info, data.target || _termTarget);
+        _applyTerminalContent(data.content || '', data.info, displayOf(data.target) || _termTarget);
     } catch(e) {}
 }
 
@@ -1146,7 +1162,7 @@ function resumeTerminal() {
 }
 
 async function loadMore() {
-    _termLines = Math.min(_termLines + 2000, 20000);
+    _termLines = Math.min(_termLines + 2000, maxTermLines());
     if (!_termTarget) return;
     // Re-subscribe the WS with the new line count so the next streamed
     // frame doesn't erase the longer history we're about to render.
@@ -1154,10 +1170,10 @@ async function loadMore() {
         _termWs.send(_tuiSubscribeFrame(_termTarget, _termLines));
     }
     try {
-        const resp = await fetch(`/terminal/capture?target=${encodeURIComponent(_termTarget)}&lines=${_termLines}${_tuiQuery(_termTarget)}`);
+        const resp = await fetch(`/terminal/capture?${new URLSearchParams(wireTarget(_termTarget))}&lines=${_termLines}${_tuiQuery(_termTarget)}`);
         const data = await resp.json();
         if (!data.ok) return;
-        if (data.target && data.target !== _termTarget) return;
+        if (data.target && displayOf(data.target) !== _termTarget) return;
         const content = data.content || '';
         // Render directly, bypassing the paused check — the user is scrolled
         // up (that's always the case when tapping Load more). Anchor the
@@ -1180,7 +1196,7 @@ async function loadMore() {
 
 async function killSession() {
     if (!_termTarget) return;
-    const session = _termTarget.split(':')[0];
+    const session = sessionOf(_termTarget);
     if (!confirm(`End session "${session}"?`)) return;
     try {
         const resp = await fetch('/terminal/kill', {
@@ -1206,7 +1222,7 @@ async function killSession() {
                     }
                 }
             }
-            _termTarget = null;
+            setTermTarget(null);
             _termPaused = false;
             _termHasNew = false;
             stopPolling();
@@ -1291,7 +1307,7 @@ async function fitTuiToScreen(target) {
     if (typeof SplitView !== 'undefined' && SplitView.enabled) return SplitView.fit(SplitView.active);
     target = target || _termTarget;
     if (!target || !_paneTui[target]) return;
-    const session = target.split(':')[0];
+    const session = sessionOf(target);
     const { cols, rows } = _calcTuiSize();
     const targetCols = Math.max(40, Math.min(cols, 400));
     const targetRows = Math.max(10, Math.min(rows, 600));
@@ -1322,7 +1338,7 @@ function _tuiSendKey(keys) {
     fetch('/key', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ keys: keys, target: _termTarget, ...(typeof inputIdentity === 'function' ? inputIdentity() : {}) }),
+        body: JSON.stringify({ keys: keys, ...wireRoute(_termTarget, typeof inputIdentity === 'function' ? inputIdentity() : {}) }),
     }).catch(function() {});
 }
 
@@ -1367,7 +1383,7 @@ async function tuiJumpEnd() {
             await fetch('/key', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ keys: 'Page_Down', target: _termTarget }),
+                body: JSON.stringify({ keys: 'Page_Down', ...wireRoute(_termTarget) }),
             });
         } catch (e) { return; }
     }
@@ -1466,7 +1482,7 @@ function _openCodeCanPan(display, dx, dy) {
 async function termFitToScreen(cols = null, rows = null, opts = {}) {
     if (typeof SplitView !== 'undefined' && SplitView.enabled) return SplitView.fit(SplitView.active,cols,rows,opts);
     if (!_termTarget) return;
-    const session = _termTarget.split(':')[0];
+    const session = sessionOf(_termTarget);
     const calc = _calcTermSize();
     const targetCols = cols == null ? calc.cols : Math.max(40, Math.min(parseInt(cols), 400));
     const targetRows = rows == null ? calc.rows : Math.max(10, Math.min(parseInt(rows), 600));
@@ -1483,6 +1499,43 @@ async function termFitToScreen(cols = null, rows = null, opts = {}) {
     } catch(e) {}
 }
 
+const _FIT_PRESETS_DEFAULT = 'Phone:58, Compact:100, Wide:160, Desktop:200';
+
+/** Parse terminal.fit_presets ("Name:COLS" or "Name:COLSxROWS", comma separated;
+ *  shared/state.py:parse_fit_presets is the server's copy) into
+ *  [{name, cols, rows}]. A malformed entry is skipped. */
+function parseFitPresets(value) {
+    const out = [];
+    for (const entry of String(value || '').split(',')) {
+        const m = /^\s*([^:,]{1,24}?)\s*:\s*(\d{2,3})(?:\s*[x×]\s*(\d{2,3}))?\s*$/.exec(entry);
+        if (!m || !m[1].trim()) continue;
+        const cols = parseInt(m[2]);
+        const rows = m[3] ? parseInt(m[3]) : null;
+        if (cols < 40 || cols > 400 || (rows !== null && (rows < 10 || rows > 600))) continue;
+        out.push({ name: m[1].trim(), cols, rows });
+    }
+    return out.slice(0, 8);
+}
+
+/** Rebuild the Fit menu's preset buttons from Settings. */
+function renderFitPresets() {
+    const box = document.getElementById('fit-presets');
+    if (!box) return;
+    const raw = SETTINGS && SETTINGS.terminal && typeof SETTINGS.terminal.fit_presets === 'string'
+        ? SETTINGS.terminal.fit_presets : _FIT_PRESETS_DEFAULT;
+    box.textContent = '';
+    for (const p of parseFitPresets(raw)) {
+        const choice = p.rows ? `${p.cols}x${p.rows}` : String(p.cols);
+        const btn = document.createElement('button');
+        btn.className = 'fit-item';
+        btn.dataset.cols = choice;
+        btn.dataset.action = 'fitMenuPick';
+        btn.dataset.arg = JSON.stringify(choice);
+        btn.textContent = `${p.name} ${p.rows ? p.cols + '×' + p.rows : p.cols}`;
+        box.appendChild(btn);
+    }
+}
+
 /** Toggle the Fit preset menu. */
 function toggleFitMenu() {
     const menu = document.getElementById('fit-menu');
@@ -1491,28 +1544,39 @@ function toggleFitMenu() {
     menu.classList.toggle('visible', !visible);
     btn.classList.toggle('active', !visible);
     if (!visible) {
-        // Pre-fill custom inputs with last values, highlight last preset
+        renderFitPresets();
+        // Pre-fill custom inputs with last values, highlight last preset.
+        // No stored height means auto: the rows box stays blank.
         const last = localStorage.getItem('assist_fit_last') || 'auto';
         const input = document.getElementById('fit-custom-input');
         if (input && /^\d+$/.test(last)) input.value = last;
         const lastRows = localStorage.getItem('assist_fit_rows');
         const rowsInput = document.getElementById('fit-custom-rows');
-        if (rowsInput && lastRows && /^\d+$/.test(lastRows)) rowsInput.value = lastRows;
+        if (rowsInput) rowsInput.value = lastRows && /^\d+$/.test(lastRows) ? lastRows : '';
         document.querySelectorAll('.fit-item').forEach(el => {
             el.classList.toggle('active', el.dataset.cols === String(last));
         });
     }
 }
 
-/** Apply a preset choice from the Fit menu. */
+/** Apply a preset choice from the Fit menu: 'auto', COLS, or 'COLSxROWS'.
+ *  A preset without a height fits the height to the screen and forgets any
+ *  custom height, so the rows box reopens on auto. */
 function fitMenuPick(choice) {
-    localStorage.setItem('assist_fit_last', String(choice));
-    if (choice === 'auto') {
-        termFitToScreen();
-    } else {
-        termFitToScreen(choice);
-    }
+    choice = String(choice);
+    localStorage.setItem('assist_fit_last', choice);
+    const m = /^(\d+)(?:x(\d+))?$/.exec(choice);
+    if (m && m[2]) localStorage.setItem('assist_fit_rows', m[2]);
+    else localStorage.removeItem('assist_fit_rows');
+    if (!m) termFitToScreen();
+    else termFitToScreen(parseInt(m[1]), m[2] ? parseInt(m[2]) : null);
     toggleFitMenu();
+}
+
+/** Clear the custom height so the next Apply fits it to the screen. */
+function fitMenuRowsAuto() {
+    const rowsInput = document.getElementById('fit-custom-rows');
+    if (rowsInput) rowsInput.value = '';
 }
 
 /** Apply the custom width and/or height from the Fit menu inputs.
@@ -1531,7 +1595,6 @@ function fitMenuApplyCustom() {
             showFlash('error', 'Width must be 40–400');
             return;
         }
-        localStorage.setItem('assist_fit_last', String(cols));
     }
     if (rowsRaw) {
         rows = parseInt(rowsRaw);
@@ -1539,8 +1602,10 @@ function fitMenuApplyCustom() {
             showFlash('error', 'Height must be 10–600');
             return;
         }
-        localStorage.setItem('assist_fit_rows', String(rows));
     }
+    localStorage.setItem('assist_fit_last', cols ? String(cols) : 'auto');
+    if (rows) localStorage.setItem('assist_fit_rows', String(rows));
+    else localStorage.removeItem('assist_fit_rows');
     termFitToScreen(cols, rows);
     toggleFitMenu();
 }
@@ -1555,7 +1620,7 @@ async function fitMenuUnpin() {
         toggleFitMenu();
         return;
     }
-    const session = _termTarget.split(':')[0];
+    const session = sessionOf(_termTarget);
     try {
         const resp = await fetch('/terminal/unpin', {
             method: 'POST',

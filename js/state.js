@@ -49,9 +49,24 @@ let _filterText = '';
 // Terminal state
 let _termOpen = true;           // always open in drawer layout
 let _termTarget = null;         // active tmux target
+let _termKey = null;            // its durable key (js/pane-ref.js); setTermTarget() writes both
 let _termExpectedIdentity = null; // server-selected identity from bare launch
 let _termPaused = false;        // scroll-freeze
-let _termLines = 2000;          // scrollback depth (10x default)
+let _termLines = 2000;          // scrollback depth; defaultTermLines() once settings load
+
+/** The server's capture cap (limits.max_capture_lines). */
+function maxTermLines() {
+    const v = SETTINGS && SETTINGS.limits && SETTINGS.limits.max_capture_lines;
+    return v > 0 ? v : 20000;
+}
+
+/** Scrollback a tab opens with: terminal.capture_lines, where 0 means all
+ *  (the server cap). */
+function defaultTermLines() {
+    const v = SETTINGS && SETTINGS.terminal ? SETTINGS.terminal.capture_lines : undefined;
+    if (v === 0) return maxTermLines();
+    return v > 0 ? Math.min(v, maxTermLines()) : 2000;
+}
 let _termPollTimer = null;
 let _termLatestContent = '';    // stored when paused
 let _termHasNew = false;
@@ -76,13 +91,29 @@ function _getSmartState(target) {
 }
 let _layoutShifting = false;    // true during smart-actions show/hide to suppress scroll-freeze
 
+// The session a pane belongs to, from `session:w.p`, `%N` or a durable key
+// `<16 hex>:%N`. A display target names its session itself (and a session name
+// may hold ':' or '.', so this is not a split on ':'); a key or `%N` is looked
+// up in the last /poll's pane list. The client twin of shared/tmux.py:session_of.
+function sessionOf(target) {
+    if (!target) return '';
+    const m = /^(.*):(\d+)\.(\d+)$/.exec(target);
+    if (m) return m[1];
+    const panes = typeof _sessionPanes !== 'undefined' ? _sessionPanes : [];
+    const pane = panes.find(p => p.key === target || p.pane_id === target);
+    if (pane) return pane.session || '';
+    if (/^[0-9a-f]{16}:%\d+$/.test(target) || /^%\d+$/.test(target)) return '';
+    const colon = target.indexOf(':');
+    return colon < 0 ? target : target.slice(0, colon);
+}
+
 // Input routing: when true, keyboard input goes to split pane instead of main
 let _inputToSplit = false;
 
 function getInputTarget() {
     if (typeof SplitView !== 'undefined' && SplitView.enabled) return SplitView.inputTarget();
     if (_inputToSplit) {
-        const session = _termTarget ? _termTarget.split(':')[0] : '';
+        const session = _termTarget ? sessionOf(_termTarget) : '';
         const state = _splitPanes[session];
         if (state) return state.target;
     }

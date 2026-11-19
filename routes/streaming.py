@@ -11,8 +11,13 @@ import shared.state as state
 from shared import devices
 from shared.security import origin_allowed
 from shared.tmux import (
+    bind_pane_key,
+    bind_pane_key_status,
     capture_pane,
+    pane_key_binding_current,
+    capture_pane_by_key,
     capture_pane_if_changed,
+    parse_pane_key,
     set_ws_send_timeout,
 )
 
@@ -24,6 +29,14 @@ _sock = None  # Set by register_streaming()
 # Default scrollback lines for a stream when the client doesn't specify.
 # Used both before the first message arrives and as the parse fallback.
 _DEFAULT_LINES = 2000
+
+
+
+def _clamp_lines(raw):
+    """A subscribe's line count, capped by limits.max_capture_lines (0 = that cap)."""
+    cap = state.get_setting("limits", "max_capture_lines")
+    lines = int(raw)
+    return cap if lines <= 0 else min(lines, cap)
 
 # A pane whose change marker (activity, history size, cursor, size) has not
 # moved is not re-captured, except once per this many seconds, which catches a
@@ -43,28 +56,61 @@ def _tui_flag(msg):
     return None if v is None else bool(v)
 
 
-def _full_frame(target, lines, tui=None):
+def _stream_subscription(value):
+    """(target, binding) for a subscribe target, or None for a dead key.
+
+    `session:w.p` and `%N` stream as sent, as before. A durable pane key
+    (shared/tmux.py:PaneRef.key) keeps itself as the subscription's name and
+    carries its PaneKeyBinding: the streamer captures the key's `%N` and checks
+    the binding before every frame, so a key never streams another pane — not
+    after its pane moves (it follows it), is replaced at its old address, or
+    its tmux server restarts (it expires with the not-found frame).
+    """
+    if isinstance(value, str) and parse_pane_key(value.strip()):
+        binding = bind_pane_key(value.strip())
+        return (binding.key, binding) if binding else None
+    return value, None
+
+
+def _not_found_frame(target):
+    return json.dumps({"type": "error", "error": "Target not found", "target": target})
+
+
+def _key_capture(binding, lines, tui, prev=None, max_age=2.0, min_interval=0.0):
+    """capture_pane_by_key, plus one re-bind when the capture failed: a
+    transient tmux failure is not the key expiring. Returns (content, info,
+    prev_next, expired)."""
+    content, info, prev_next = capture_pane_by_key(
+        binding, lines, tui=tui, prev=prev, max_age=max_age, min_interval=min_interval,
+    )
+    if info is not None:
+        return content, info, prev_next, False
+    if not pane_key_binding_current(binding):
+        return None, None, None, True  # the server or its socket is gone
+    rebound, status = bind_pane_key_status(binding.key)
+    # A timeout or a tmux that cannot be asked is not the key expiring.
+    return None, None, None, status == "gone" or (status == "bound" and rebound != binding)
+
+
+def _frame(target, content, info, ts, binding=None):
+    msg = {"type": "full", "content": content, "target": target, "info": info, "ts": ts}
+    if binding is not None:
+        # Where the pane sat when the key was bound: presentation only.
+        msg["display_target"] = binding.display_target
+    return json.dumps(msg)
+
+
+def _full_frame(target, lines, tui=None, binding=None):
     """Capture `target` and return the JSON 'full' frame, or an 'error' frame
     when the capture fails (dead/unknown target) so the client doesn't sit on
     a healthy-looking but frozen terminal. Returns (frame_json, info)."""
-    content, info = capture_pane(target, lines, tui=tui)
+    if binding is not None:
+        content, info, _prev, _expired = _key_capture(binding, lines, tui)
+    else:
+        content, info = capture_pane(target, lines, tui=tui)
     if content is None:
-        return (
-            json.dumps({"type": "error", "error": "Target not found", "target": target}),
-            None,
-        )
-    return (
-        json.dumps(
-            {
-                "type": "full",
-                "content": content,
-                "target": target,
-                "info": info,
-                "ts": time.time(),
-            }
-        ),
-        info,
-    )
+        return _not_found_frame(target), None
+    return _frame(target, content, info, time.time(), binding), info
 
 
 def _close(ws):
@@ -115,7 +161,7 @@ def terminal_stream_handler(ws):
         if raw:
             msg = json.loads(raw)
             target = msg.get("target", state.tmux_target)
-            lines = min(int(msg.get("lines", _DEFAULT_LINES)), 20000)
+            lines = _clamp_lines(msg.get("lines", _DEFAULT_LINES))
             tui = _tui_flag(msg)
     except Exception:
         target = state.tmux_target
@@ -141,6 +187,18 @@ def terminal_stream_handler(ws):
             pass
         return
 
+    requested = target
+    subscription = _stream_subscription(target)
+    if subscription is None:
+        try:
+            _send_to(client, _not_found_frame(requested))
+        except Exception:
+            pass
+        return
+    target, binding = subscription
+    client["target"] = target
+    client["binding"] = binding
+
     def _add():
         with state.ws_lock:
             state.ws_last_content.pop(f"{target}:{lines}:{tui}", None)
@@ -157,7 +215,7 @@ def terminal_stream_handler(ws):
             if not devices.stream_device_active(device_id):
                 _close(ws)
                 return
-            frame, _info = _full_frame(target, lines, tui)
+            frame, _info = _full_frame(target, lines, tui, binding)
             _send_to(client, frame)
         except Exception:
             return
@@ -176,20 +234,28 @@ def terminal_stream_handler(ws):
                         _send_to(client, json.dumps({"type": "pong"}))
                         continue
                     if msg.get("type") == "subscribe":
-                        new_target = msg.get("target", target)
-                        new_lines = min(int(msg.get("lines", lines)), 20000)
+                        subscription = _stream_subscription(msg.get("target", target))
+                        if subscription is None:
+                            # A key naming no live pane: say so, keep streaming
+                            # what this socket already watches.
+                            _send_to(client, _not_found_frame(msg.get("target")))
+                            continue
+                        new_target, new_binding = subscription
+                        new_lines = _clamp_lines(msg.get("lines", lines))
                         new_tui = _tui_flag(msg)
                         with state.ws_lock:
                             cache_key = f"{new_target}:{new_lines}:{new_tui}"
                             state.ws_last_content.pop(cache_key, None)
                             client["target"] = new_target
+                            client["binding"] = new_binding
                             client["lines"] = new_lines
                             client["tui"] = new_tui
                         target = new_target
+                        binding = new_binding
                         lines = new_lines
                         tui = new_tui
                         _ensure_streamer()
-                        frame, _info = _full_frame(target, lines, tui)
+                        frame, _info = _full_frame(target, lines, tui, binding)
                         _send_to(client, frame)
                 except Exception:
                     pass
@@ -227,7 +293,7 @@ def _terminal_streamer():
                         # Snapshot (entry, target, lines, tui) under the lock —
                         # subscribe mutates entries in place.
                         clients = [
-                            (c, c["target"], c["lines"], c.get("tui"))
+                            (c, c["target"], c["lines"], c.get("tui"), c.get("binding"))
                             for c in state.ws_clients
                         ]
 
@@ -242,22 +308,40 @@ def _terminal_streamer():
                 # Grouped by TUI override too: two clients on the same pane with
                 # different overrides need different capture ranges, so they
                 # can't share a capture or a dedup entry.
+                # A key subscription is named by its key (never an address),
+                # so its group holds only clients bound to that pane.
                 targets = {}
-                for client, target, lines, tui in clients:
+                bindings = {}
+                for client, target, lines, tui, binding in clients:
+                    if target is None:
+                        continue  # an expired key: heartbeats only
                     key = (target, lines, tui)
                     if key not in targets:
                         targets[key] = []
+                        bindings[key] = binding
                     targets[key].append(client)
 
                 for (target, lines, tui), group in targets.items():
                     cache_key = f"{target}:{lines}:{tui}"
+                    binding = bindings[(target, lines, tui)]
                     try:
-                        content, info, prev = capture_pane_if_changed(
-                            target, lines, tui=tui,
-                            prev=last_capture.get(cache_key),
-                            max_age=STREAM_FORCED_REFRESH_SEC,
-                            min_interval=STREAM_MIN_RECAPTURE_SEC,
-                        )
+                        if binding is not None:
+                            content, info, prev, expired = _key_capture(
+                                binding, lines, tui,
+                                prev=last_capture.get(cache_key),
+                                max_age=STREAM_FORCED_REFRESH_SEC,
+                                min_interval=STREAM_MIN_RECAPTURE_SEC,
+                            )
+                            if expired:
+                                _expire(group, target, binding)
+                                continue
+                        else:
+                            content, info, prev = capture_pane_if_changed(
+                                target, lines, tui=tui,
+                                prev=last_capture.get(cache_key),
+                                max_age=STREAM_FORCED_REFRESH_SEC,
+                                min_interval=STREAM_MIN_RECAPTURE_SEC,
+                            )
                     except Exception:
                         continue
                     if prev:
@@ -271,19 +355,11 @@ def _terminal_streamer():
                     if prev_content == content:
                         continue
 
-                    msg_data = {
-                        "type": "full",
-                        "content": content,
-                        "target": target,
-                        "info": info,
-                        "ts": now,
-                    }
-
                     with state.ws_lock:
                         state.ws_last_content[cache_key] = content
 
                     try:
-                        msg = json.dumps(msg_data)
+                        msg = _frame(target, content, info, now, binding)
                     except Exception:
                         continue
 
@@ -297,7 +373,7 @@ def _terminal_streamer():
                 # still needs traffic inside the frontend's 8s inactivity
                 # window even while OTHER targets are busy — a global
                 # sent_any flag starves it into a reconnect loop.
-                for client, _t, _l, _tui in clients:
+                for client, _t, _l, _tui, _b in clients:
                     if now - client["last_send"] >= state.WS_HEARTBEAT_INTERVAL:
                         try:
                             _send_to(client, json.dumps({"type": "heartbeat", "ts": now}))
@@ -329,6 +405,22 @@ def _terminal_streamer():
             # lets _ensure_streamer spawn a successor before this runs).
             if state.ws_streamer_thread is threading.current_thread():
                 state.ws_streamer_running = False
+
+
+def _expire(group, target, binding):
+    """A key's pane or server is gone: say so once and stop that
+    subscription. The socket stays open for the client to subscribe anew."""
+    frame = _not_found_frame(target)
+    for client in group:
+        with state.ws_lock:
+            if client.get("binding") is not binding:
+                continue  # resubscribed meanwhile
+            client["target"] = None
+            client["binding"] = None
+        try:
+            _send_to(client, frame)
+        except Exception:
+            _remove_ws_client(client["ws"])
 
 
 def _send_to(client, msg):

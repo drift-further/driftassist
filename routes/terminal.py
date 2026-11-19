@@ -20,13 +20,19 @@ import shared.state as state
 import shared.tab_state as tab_state
 from shared.agent_identity import resolve_process
 from shared.auth import client_ip
+from shared.utils import resolve_target
 from shared.tmux import (
     ExpectedTargetIdentity,
+    TmuxListError,
     activate_venv,
+    bind_pane_key_status,
     capture_pane,
+    capture_pane_by_key,
+    parse_pane_key,
     create_tmux_session,
     detect_venv,
     expected_target_identity,
+    list_panes,
     pane_tab_target,
     prettify_command,
     record_tmux_adoption,
@@ -409,19 +415,9 @@ def enrich_panes_with_agents(panes):
 @terminal_bp.route("/terminal/sessions")
 def terminal_sessions():
     """List active tmux sessions and panes."""
-    proc = subprocess.run(
-        [
-            "tmux",
-            "list-panes",
-            "-a",
-            "-F",
-            "#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_current_command}\t#{pane_width}\t#{pane_height}\t#{session_activity}\t#{pane_pid}\t#{pane_id}\t#{session_created}\t#{@assist_parent}",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    if proc.returncode != 0:
+    try:
+        refs = list_panes()
+    except (TmuxListError, OSError, subprocess.TimeoutExpired):
         return jsonify({"sessions": [], "active_target": state.tmux_target})
 
     panes = []
@@ -435,45 +431,41 @@ def terminal_sessions():
     # renders empty.
     with state._activity_lock:
         model_memo = {key: dict(value) for key, value in state.pane_model.items()}
-    for line in proc.stdout.strip().split("\n"):
-        if not line:
-            continue
-        parts = line.split("\t")
-        if len(parts) >= 6:
-            target = f"{parts[0]}:{parts[1]}.{parts[2]}"
-            activity = int(parts[6]) if len(parts) >= 7 and parts[6].isdigit() else 0
-            idle_seconds = int(time.time()) - activity if activity else 0
-            pane_pid = parts[7] if len(parts) >= 8 else ""
-            pane_id = parts[8] if len(parts) >= 9 else ""
-            # Epoch seconds the tmux session was opened — the key behind
-            # "sort by opened date" in the tab strip.
-            created = int(parts[9]) if len(parts) >= 10 and parts[9].isdigit() else 0
-            is_subpane = parts[0] in seen_sessions
-            seen_sessions.add(parts[0])
-            agent_kind = resolve_process(target, pane_pid, parts[3])
-            memo = model_memo.get(target) or {}
-            panes.append(
-                {
-                    "target": target,
-                    "session": parts[0],
-                    "created": created,
-                    "_assist_parent": parts[10] if len(parts) > 10 else "",
-                    "window": int(parts[1]),
-                    "pane": int(parts[2]),
-                    "command": parts[3],
-                    "width": int(parts[4]),
-                    "height": int(parts[5]),
-                    "idle_seconds": idle_seconds,
-                    "pane_pid": pane_pid,
-                    "pane_id": pane_id,
-                    "is_subpane": is_subpane,
-                    "command_display": prettify_command(parts[3]),
-                    "agent_kind": agent_kind or "unknown",
-                    "model": memo.get("model"),
-                    "model_effort": memo.get("effort"),
-                    "model_changed_at": memo.get("changed_at", 0.0),
-                }
-            )
+    for ref in refs:
+        target = ref.display_target
+        activity = ref.session_activity
+        idle_seconds = int(time.time()) - activity if activity else 0
+        is_subpane = ref.session in seen_sessions
+        seen_sessions.add(ref.session)
+        agent_kind = resolve_process(target, ref.pane_pid, ref.command)
+        memo = model_memo.get(target) or {}
+        panes.append(
+            {
+                "target": target,
+                "key": ref.key,
+                "session": ref.session,
+                # Epoch seconds the tmux session was opened — the key behind
+                # "sort by opened date" in the tab strip.
+                "created": ref.session_created,
+                "_assist_parent": ref.assist_parent,
+                "window": ref.window,
+                "pane": ref.pane,
+                "command": ref.command,
+                "width": ref.width,
+                "height": ref.height,
+                "idle_seconds": idle_seconds,
+                "pane_pid": ref.pane_pid,
+                "pane_id": ref.pane_id,
+                "is_subpane": is_subpane,
+                "command_display": prettify_command(ref.command),
+                "agent_kind": agent_kind or "unknown",
+                "model": memo.get("model"),
+                "model_effort": memo.get("effort"),
+                "model_changed_at": memo.get("changed_at", 0.0),
+                "permission_mode": memo.get("permission_mode"),
+                "context_pct": memo.get("context_pct"),
+            }
+        )
 
     enrich_panes_with_agents(panes)
     # Use the same watcher snapshot as /poll; never clear marks on a list refresh.
@@ -968,30 +960,44 @@ def _terminal_run_init_effect(session, init_cmd):
 @terminal_bp.route("/terminal/capture")
 def terminal_capture():
     """Capture text content from a tmux pane (HTTP fallback for WebSocket)."""
-    target = request.args.get("target", state.tmux_target or "")
+    raw = request.args.get("target", state.tmux_target or "") or ""
+    # A durable pane key is bound to its pane and tmux server and captured by
+    # its own `%N`, never by the address it sat at (shared/tmux.py:
+    # capture_pane_by_key); a key naming no live pane, or whose pane or server
+    # changes during the capture, is target_absent.
+    binding = None
+    if parse_pane_key(raw.strip()):
+        binding, status = bind_pane_key_status(raw)
+        if status == "unknown":
+            return jsonify({"ok": False, "error": "tmux_unavailable"}), 503
+        if binding is None:
+            return jsonify({"ok": False, "error": "target_absent"}), 404
+        target = binding.key
+    else:
+        target = resolve_target({"target": raw}) if raw.strip() else ""
     if not target:
         return jsonify({"ok": False, "error": "No target specified"}), 400
 
-    lines = min(
-        int(request.args.get("lines", state.get_setting("terminal", "capture_lines"))),
-        state.get_setting("limits", "max_capture_lines"),
-    )
+    # 0 (the "all" setting, or a client asking for all) means the server cap.
+    max_lines = state.get_setting("limits", "max_capture_lines")
+    lines = int(request.args.get("lines", state.get_setting("terminal", "capture_lines")))
+    lines = max_lines if lines <= 0 else min(lines, max_lines)
     # Per-pane TUI override from the chip (absent = auto-detect, as always).
     raw_tui = request.args.get("tui")
     tui = None if raw_tui in (None, "") else raw_tui in ("1", "true", "True")
-    content, info = capture_pane(target, lines, tui=tui)
-    if content is None:
-        return jsonify({"ok": False, "error": "capture-pane failed"}), 500
+    if binding is not None:
+        content, info, _prev = capture_pane_by_key(binding, lines, tui=tui)
+        if content is None:
+            return jsonify({"ok": False, "error": "target_absent"}), 404
+    else:
+        content, info = capture_pane(target, lines, tui=tui)
+        if content is None:
+            return jsonify({"ok": False, "error": "capture-pane failed"}), 500
 
-    return jsonify(
-        {
-            "ok": True,
-            "content": content,
-            "target": target,
-            "info": info,
-            "ts": time.time(),
-        }
-    )
+    body = {"ok": True, "content": content, "target": target, "info": info, "ts": time.time()}
+    if binding is not None:
+        body["display_target"] = binding.display_target
+    return jsonify(body)
 
 
 @terminal_bp.route("/terminal/explore/pick", methods=["POST"])

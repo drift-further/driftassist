@@ -31,7 +31,7 @@ from routes.autoyes import (
 )
 from shared import delegate_signals, pane_scan, resume_line
 from shared.delegate_channel import Channel, SEED_OPTIONS, seed
-from shared.tmux import tmux_exact_target
+from shared.tmux import stderr_means_no_server, tmux_exact_target
 from shared.agent_identity import (
     ROOT_UNKNOWN, identity_refused, observe_process_tree, pane_root_start, refine_with_content,
 )
@@ -310,13 +310,9 @@ def _parse(stdout):
 
 
 def _no_server(stderr):
-    """No tmux server is running: an empty inventory, not an error. A missing
-    socket or a refused connection (a socket left by a dead server) both mean
-    that; anything else, such as a permission error, means cannot tell."""
-    return "no server running" in stderr or (
-        "error connecting to" in stderr
-        and ("(No such file or directory)" in stderr or "(Connection refused)" in stderr)
-    )
+    """No tmux server is running: an empty inventory, not an error. One
+    classifier with the shared listing (shared/tmux.py:stderr_means_no_server)."""
+    return stderr_means_no_server(stderr)
 
 
 def _publish_channel(published, now, settings, rows=None):

@@ -286,9 +286,9 @@ Once installed, `assist` manages everything:
 | `assist doctor` | Check prereqs, venv, .env, server health |
 | `assist ls [--json] [--cwd]` | List sessions and panes, optionally with working directories |
 | `assist view <session> [-n N] [--pane P]` | Capture a session pane |
-| `assist send <session> [<text>\|--file F] [--enter] [--pane P] [--wait] [--timeout N] [--autoyes]` | Send text to a session pane, optionally waiting for it to settle |
+| `assist send <session> [<text>\|--file F] [--enter] [--pane P] [--wait] [--timeout N] [--autoyes]` | Send text (or bare `--enter`) to a session pane, optionally waiting for it to settle |
 | `assist wait <session> [--timeout N] [--pane P] [--autoyes]` | Wait for a session pane to settle |
-| `assist launch --session N [--cwd P] [--wait] [--role R (--family F\|--against F)]` | Create a bare shell; with `--role`, resolve and send its roster command |
+| `assist launch --session N [--cwd P] [--wait] [--role R (--family F\|--against F)] [--brief FILE] [--trust-cwd]` | Create a bare shell; with `--role`, resolve and send its roster command (never arms Auto-Yes); with `--brief`, gate on the agent's banner (model, effort, permissions) before pasting `FILE` as one message and confirming work started (`--trust-cwd` accepts `agy`'s folder-trust dialog only) |
 | `assist kill <session> [--pane P]` | Kill a tmux session |
 | `assist purge --idle 24h [--yes] [--keep NAME ...] [--json]` | Review content-idle sessions; `--yes` kills the checked set after a fresh identity/activity check |
 | `assist autoyes <session> (--on\|--off\|--status) [--delay N]` | Persistently set or inspect auto-yes; enabled delays are clamped to 0.1–30 seconds |
@@ -327,6 +327,7 @@ Session wait commands use these exit codes:
 | Code | State | Meaning |
 |------|-------|---------|
 | `0` | idle | The pane went quiet with no prompt |
+| `3` | no-change | Input was sent via `assist send --wait`, but no visible change was seen |
 | `10` | prompt | The pane is quiet because it is asking something; a summary is printed |
 | `75` | working | The pane is still changing at the deadline; this is not an error, so re-run `assist wait` |
 

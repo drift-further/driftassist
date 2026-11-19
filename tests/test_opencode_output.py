@@ -3,6 +3,7 @@
 import copy
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,8 @@ import shared.auth as auth
 import shared.state as state
 from routes.opencode import opencode_bp
 from shared import opencode as oc
+from shared import tmux
+from tests._tmux_box import TmuxBox
 
 
 SID = "ses_test123"
@@ -401,3 +404,102 @@ class RouteTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(shutil.which("tmux"), "needs a tmux binary")
+class KeyBoundContextTests(unittest.TestCase):
+    """A durable key stays bound to its pane through OpenCode context selection
+    and the route's final revalidation (sign-off M3 F4): the context is read
+    from the key's own `%N` on the key's server, never re-selected by the
+    display address it sat at. Real private tmux, two real processes whose
+    argv[0] is `opencode`; only the export itself is stubbed."""
+
+    def setUp(self):
+        from shared.agent_identity import _get_process_snapshot
+        self.box = TmuxBox(self)
+        self.dirs = [self.box.root / "pane-A", self.box.root / "pane-B"]
+        for path in self.dirs:
+            path.mkdir()
+        self.a = self.box.new_session("dev", f"cd {self.dirs[0]}; exec -a opencode sleep 600")
+        self.b = self.box.split("dev", f"cd {self.dirs[1]}; exec -a opencode sleep 600")
+        panes = {p.pane_id: p for p in tmux.list_panes()}
+        self.kb = panes[self.b].key
+        _get_process_snapshot(force=True)
+        app = Flask(__name__)
+        app.register_blueprint(opencode_bp)
+        self.client = app.test_client()
+
+    def sessions(self, change=None):
+        real = oc.bind_pane_key_status
+        pending = [change] if change is not None else []
+        def bind_then_change(key):
+            bound = real(key)
+            if pending:
+                pending.pop()()  # once: between the first bind and the lookup
+            return bound
+        with patch.object(oc, "bind_pane_key_status", side_effect=bind_then_change), \
+                patch.object(oc, "list_sessions",
+                             side_effect=lambda context: [{"directory_used": context["directory"]}]):
+            return self.client.get("/terminal/opencode/sessions", query_string={"target": self.kb})
+
+    def test_unchanged_key_control_reads_its_own_pane(self):
+        response = self.sessions()
+        self.assertEqual(response.status_code, 200, response.get_json())
+        body = response.get_json()
+        self.assertEqual(body["directory"], str(self.dirs[1]))
+        self.assertEqual(body["sessions"], [{"directory_used": str(self.dirs[1])}])
+        self.assertEqual(body["target"], self.kb)
+
+    def test_swap_after_bind_still_reads_the_keyed_pane(self):
+        def swap():
+            self.box.tmux("swap-pane", "-s", self.a, "-t", self.b)
+        response = self.sessions(swap)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["directory"], str(self.dirs[1]))
+        self.assertEqual(self.box.display(self.b, "#{window_index}.#{pane_index}"), "1.1")
+
+    def test_replacement_after_bind_is_refused(self):
+        def replace():
+            self.box.tmux("kill-pane", "-t", self.b)
+            self.box.split("dev", f"cd {self.dirs[0]}; exec -a opencode sleep 600")
+        response = self.sessions(replace)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["error"], "pane_gone")
+
+    def test_restart_after_bind_is_refused(self):
+        def restart():
+            self.box.kill_server()
+            self.box.new_session("dev", f"cd {self.dirs[0]}; exec -a opencode sleep 600")
+            self.box.split("dev", f"cd {self.dirs[0]}; exec -a opencode sleep 600")
+            self.assertEqual(self.box.display("=dev:1.2", "#{pane_id}"), self.b)
+        response = self.sessions(restart)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["error"], "pane_gone")
+
+    def test_final_revalidation_rebinds_the_key(self):
+        # The pane is swapped between the export and the final check: the
+        # check reads the key's pane again (same generation, 200); a pane
+        # replaced at that point fails the check.
+        def export_then_replace(context):
+            self.box.tmux("kill-pane", "-t", self.b)
+            self.box.split("dev", f"cd {self.dirs[0]}; exec -a opencode sleep 600")
+            return []
+        with patch.object(oc, "list_sessions", side_effect=export_then_replace):
+            response = self.client.get("/terminal/opencode/sessions", query_string={"target": self.kb})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["error"], "pane_gone")
+
+    def test_pane_context_itself_refuses_a_restart_between_bind_and_lookup(self):
+        # Without the route's second check: the new server's own `%N` at the
+        # same address is not the key's pane.
+        real = oc.bind_pane_key_status
+        def bind_then_restart(key):
+            bound = real(key)
+            self.box.kill_server()
+            self.box.new_session("dev", f"cd {self.dirs[0]}; exec -a opencode sleep 600")
+            self.box.split("dev", f"cd {self.dirs[0]}; exec -a opencode sleep 600")
+            return bound
+        with patch.object(oc, "bind_pane_key_status", side_effect=bind_then_restart):
+            with self.assertRaises(oc.OpenCodeError) as caught:
+                oc.pane_context(self.kb)
+        self.assertEqual(caught.exception.code, "pane_gone")

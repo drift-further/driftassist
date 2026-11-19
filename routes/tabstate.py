@@ -48,12 +48,20 @@ def patch_tab_state_api():
 
 @tabstate_bp.route("/api/tab-state/snooze", methods=["POST"])
 def snooze_api():
-    """Snooze or wake one target. The server stamps at/was_busy itself."""
+    """Snooze or wake one pane (display target, `%N` or durable key). The server
+    stamps at/was_busy itself and stores the snooze by the pane's key."""
     data = request.get_json(silent=True) or {}
     target = data.get("target")
     if not isinstance(target, str) or not target:
         return jsonify({"ok": False, "error": "target required"}), 400
-    updated = tab_state.set_snooze(target, bool(data.get("on", True)))
+    if not tab_state.ensure_converted():
+        return jsonify({"ok": False, "error": "tab_state_unavailable"}), 503
+    try:
+        updated = tab_state.set_snooze(target.strip(), bool(data.get("on", True)))
+    except tab_state.SnoozeUnavailable:
+        return jsonify({"ok": False, "error": "tab_state_unavailable"}), 503
+    if updated is None:
+        return jsonify({"ok": False, "error": "target_absent"}), 409
     return jsonify({"ok": True, "tab_state": updated})
 
 

@@ -285,8 +285,11 @@ class CorruptFileTests(_TempState):
     def test_tab_state_and_drafts_are_moved_aside(self):
         from shared import drafts, tab_state
 
-        for module, attr, loader in ((tab_state, "TAB_STATE_FILE", "load_tab_state"),
-                                     (drafts, "DRAFTS_FILE", "load_drafts")):
+        # The files the new code writes (621 Phase 7 step B: the v2 stores; the
+        # pre-7B drafts.json and tab_state.json are only ever read, and are
+        # left as they are even when they do not parse, test_pane_state_cutover).
+        for module, attr, loader in ((tab_state, "TAB_STATE_V2_FILE", "load_tab_state"),
+                                     (drafts, "DRAFTS_V2_FILE", "load_drafts")):
             with self.subTest(module=module.__name__):
                 path = self.dir / (attr.lower() + ".json")
                 path.write_text("{nope")

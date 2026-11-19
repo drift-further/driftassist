@@ -13,6 +13,8 @@ favorites.json
 idle_state.json
 tab_state.json
 drafts.json
+drafts.v2.json
+tab_state.v2.json
 claude_mode.txt
 automate_state.json
 settings.json
@@ -27,6 +29,10 @@ devices.json
 *.part
 # A state file that did not parse, moved aside at load (shared/state.py)
 *.corrupt-*
+# Pre-upgrade copies an early 7B build wrote (no longer written: drafts.json and
+# tab_state.json themselves are left untouched since). They hold draft bodies.
+*.pre-schema2
+*.pre-schema2-*
 
 # Environment
 .env

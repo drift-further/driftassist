@@ -16,13 +16,35 @@ from shared.agent_identity import _ANSI_ESCAPE_RE
 
 UUID = r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}'
 _ROLLOUT = re.compile(r'rollout-.*-(' + UUID + r')\.jsonl$')
-_FAREWELL = re.compile(r'^\s*(?:To continue this session, run:? )?(codex resume|claude --resume) (' + UUID + r')\s*$')
+_AGY_CONV = re.compile(r'^(' + UUID + r')\.db$')
+_AGY_LOCK = re.compile(r'^(' + UUID + r')\.lock$')
+_FAREWELL = re.compile(
+    r'^\s*(?:To continue this session, run:? )?'
+    r'(?:(codex resume|claude --resume) |(?:(agy --conversation)(?:=| )))(' + UUID + r')\s*$'
+)
 _VALUES = {'codex': {'-m','--model','-c','-p','--profile','-s','--sandbox','-a','--ask-for-approval'},
-           'claude': {'--model','--permission-mode','--add-dir'}}
-_FLAGS = {'codex': {'--yolo','--search'}, 'claude': {'--dangerously-skip-permissions'}}
+           'claude': {'--model','--permission-mode','--add-dir'},
+           'gemini': {'--model','--effort','--mode','--agent','--project','--add-dir'}}
+_FLAGS = {'codex': {'--yolo','--search'},
+          'claude': {'--dangerously-skip-permissions'},
+          'gemini': {'--dangerously-skip-permissions','--sandbox','--remote-agent','--remote-control'}}
 # These flags consume a value even though their value is not retained.
-_DROP_VALUES = {'--resume','--session-id','--print','--output-format','--input-format',
-                '--settings','--system-prompt','--append-system-prompt'}
+_DROP_VALUES = {'--resume','--session-id','--conversation','--print','--prompt',
+                '--prompt-interactive','--output-format','--input-format',
+                '--settings','--system-prompt','--append-system-prompt',
+                '--log-file','--json-schema','--print-timeout'}
+
+
+def _is_agy_argv(argv):
+    if not argv:
+        return False
+    exe = os.path.basename(argv[0]).lower()
+    if exe in ('agy', 'antigravity'):
+        return True
+    if exe in ('node', 'nodejs') and len(argv) > 1:
+        script = argv[2] if argv[1] == '--' and len(argv) > 2 else argv[1]
+        return os.path.basename(script).lower() in ('agy', 'agy.js')
+    return False
 
 
 def allowed_args(kind, argv):
@@ -39,7 +61,7 @@ def allowed_args(kind, argv):
                 i += 1
         elif arg in _FLAGS.get(kind, ()):
             kept.append(arg)
-        elif key in _DROP_VALUES or (kind == 'claude' and key == '-p'):
+        elif key in _DROP_VALUES or (kind == 'claude' and key == '-p') or (kind == 'gemini' and key in ('-p', '-i')):
             if not sep:
                 i += 1
         elif arg == '--':
@@ -89,23 +111,27 @@ class Resolver:
     def _owned(self, pane_id, observation, fresh):
         survivors = {}
         preferred = set()
+        pid_locked = set()
         any_rollout = False
+        any_agy_conv = False
+        agy_seen = False
         errors = False
         claude_accepted = 0
         kinds = {a['kind'] for a in observation.agents}
         if kinds == {'claude'} and not self.claude_verified:
             return None, 'unverifiable'
-        if not kinds.intersection({'codex','claude'}):
+        if not kinds.intersection({'codex','claude','gemini'}):
             return None, 'unsupported' if kinds else 'no agent'
         for agent in observation.agents:
             kind, pid = agent['kind'], agent['pid']
-            if kind not in ('codex','claude'):
+            if kind not in ('codex','claude','gemini'):
                 continue
             if kind == 'claude' and not self.claude_verified:
                 continue
             try:
                 argv, cwd = self._process(agent)
                 found = []
+                pid_locks = set()
                 if kind == 'codex':
                     root = (self.home / '.codex/sessions').resolve()
                     for fd in (self.proc / str(pid) / 'fd').iterdir():
@@ -133,6 +159,35 @@ class Resolver:
                     for index, arg in enumerate(argv[:-1]):
                         if arg == 'resume' and re.fullmatch(UUID, argv[index + 1]):
                             preferred.add((kind, argv[index + 1]))
+                elif kind == 'gemini':
+                    if not _is_agy_argv(argv):
+                        continue
+                    agy_seen = True
+                    conv_root = (self.home / '.gemini/antigravity-cli/conversations').resolve()
+                    lock_root = (self.home / '.gemini/antigravity-cli/presence').resolve()
+                    for fd in (self.proc / str(pid) / 'fd').iterdir():
+                        try:
+                            raw_link = os.readlink(fd)
+                        except FileNotFoundError:
+                            continue
+                        if not raw_link.startswith('/'):
+                            continue
+                        link = Path(os.path.realpath(raw_link))
+                        conv_match = _AGY_CONV.fullmatch(link.name)
+                        if conv_match and link.is_relative_to(conv_root):
+                            any_agy_conv = True
+                            found.append((conv_match[1], 'fd'))
+                            continue
+                        lock_match = _AGY_LOCK.fullmatch(link.name)
+                        if lock_match and link.is_relative_to(lock_root):
+                            pid_locks.add(lock_match[1])
+                    for index, arg in enumerate(argv):
+                        if arg == '--conversation' and index + 1 < len(argv) and re.fullmatch(UUID, argv[index + 1]):
+                            preferred.add((kind, argv[index + 1]))
+                        elif arg.startswith('--conversation='):
+                            cid = arg.split('=', 1)[1]
+                            if re.fullmatch(UUID, cid):
+                                preferred.add((kind, cid))
                 else:
                     path = self.home / '.claude/sessions' / f'{pid}.json'
                     data = json.loads(path.read_text())
@@ -156,6 +211,8 @@ class Resolver:
                 for ident, source in found:
                     survivors[(kind, ident)] = dict(agent=kind,id=ident,cwd=cwd,source=source,
                                                      argv=argv,agent_gen=(pid,agent['start']))
+                    if ident in pid_locks:
+                        pid_locked.add((kind, ident))
             except (OSError, ValueError, IndexError, TypeError):
                 errors = True
         if errors:
@@ -168,8 +225,21 @@ class Resolver:
         if len(survivors) == 1:
             return next(iter(survivors.values())), None
         if len(survivors) > 1:
+            # Presence-lock tie-breaking only disambiguates multiple open DBs
+            # owned by ONE agy process, never mixed kinds or distinct PIDs.
+            if (
+                {k for k, _ in survivors} == {'gemini'}
+                and len({v['agent_gen'] for v in survivors.values()}) == 1
+            ):
+                locked = set(survivors).intersection(pid_locked)
+                if len(locked) == 1:
+                    return survivors[next(iter(locked))], None
             return None, 'ambiguous'
-        return None, 'no session yet' if kinds == {'codex'} and not any_rollout else 'unowned'
+        if kinds == {'gemini'} and not agy_seen:
+            return None, 'unsupported'
+        if (kinds == {'codex'} and not any_rollout) or (kinds == {'gemini'} and agy_seen and not any_agy_conv):
+            return None, 'no session yet'
+        return None, 'unowned'
 
     def resolve(self, pane_id, session, observation, now=None, fresh=False, cache_seconds=0, tail='', pane_dead=False):
         now = time.time() if now is None else now
@@ -201,8 +271,13 @@ class Resolver:
             if not previous or (previous['agent'],previous['id']) != (owned['agent'],owned['id']):
                 rev += 1
             kind, ident = owned['agent'], owned['id']
-            command = shlex.join([kind, 'resume' if kind == 'codex' else '--resume', ident]
-                                 + allowed_args(kind, owned['argv']))
+            if kind == 'codex':
+                base_cmd = ['codex', 'resume', ident]
+            elif kind == 'gemini':
+                base_cmd = ['agy', '--conversation', ident]
+            else:
+                base_cmd = ['claude', '--resume', ident]
+            command = shlex.join(base_cmd + allowed_args(kind, owned['argv']))
             record = {k:owned[k] for k in ('agent','id','cwd','source')}
             record.update(command=command,line=_line(session,owned['cwd'],command),live=True,
                           verified=True,conv_rev=rev,verified_at=now)
@@ -220,8 +295,11 @@ class Resolver:
                 for row in _ANSI_ESCAPE_RE.sub('', tail).splitlines()[-20:]:
                     match = _FAREWELL.fullmatch(row)
                     if match:
-                        command = match[1] + ' ' + match[2]
-                        record = dict(agent=match[1].split()[0],id=match[2],cwd=None,command=command,
+                        prefix = match[1] or match[2]
+                        ident = match[3]
+                        command = prefix + ' ' + ident
+                        agent = 'gemini' if prefix.startswith('agy') else prefix.split()[0]
+                        record = dict(agent=agent,id=ident,cwd=None,command=command,
                                       line=_line(session,None,command),source='farewell',live=False,
                                       verified=False,conv_rev=rev,verified_at=now)
                         reason = None

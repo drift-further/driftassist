@@ -19,7 +19,7 @@ function isAutoYes(session) {
 // When ON: picker edits the live delay ("Update") or turns it off ("Off").
 function showAutoYesPicker() {
     const target = _smartActionTarget || _termTarget;
-    const session = target ? target.split(':')[0] : '';
+    const session = target ? sessionOf(target) : '';
     if (!session) return;
 
     const picker = document.getElementById('autoyes-picker');
@@ -66,7 +66,7 @@ function _renderAyShell(session) {
 
 async function ayPickShellToggle() {
     const target = _smartActionTarget || _termTarget;
-    const session = target ? target.split(':')[0] : '';
+    const session = target ? sessionOf(target) : '';
     const el = document.getElementById('ay-pick-shell');
     if (!session || !el) return;
     const next = !_ayShellOk[session];
@@ -123,7 +123,7 @@ function _fmtDelay(d) {
 
 function ayPickConfirm() {
     const target = _smartActionTarget || _termTarget;
-    const session = target ? target.split(':')[0] : '';
+    const session = target ? sessionOf(target) : '';
     document.getElementById('autoyes-picker').classList.remove('visible');
     _autoyesPickerVisible = false;
     if (!session) return;
@@ -136,7 +136,7 @@ function ayPickConfirm() {
 
 function ayPickTurnOff() {
     const target = _smartActionTarget || _termTarget;
-    const session = target ? target.split(':')[0] : '';
+    const session = target ? sessionOf(target) : '';
     document.getElementById('autoyes-picker').classList.remove('visible');
     _autoyesPickerVisible = false;
     if (session) _setAutoYes(session, false, null);
@@ -212,12 +212,12 @@ async function toggleAutoYes() {
     // Global switch on: there is one delay and it is not this session's to
     // pick, so the tap sets the opposite of what the button shows, no picker.
     const target = _smartActionTarget || _termTarget;
-    const session = target ? target.split(':')[0] : '';
+    const session = target ? sessionOf(target) : '';
     if (session) _setAutoYes(session, !isAutoYes(session), null);
 }
 
 function updateAutoYesUI(session) {
-    if (!session && _termTarget) session = _termTarget.split(':')[0];
+    if (!session && _termTarget) session = sessionOf(_termTarget);
     const btn = document.getElementById('btn-autoyes');
     if (btn) {
         const active = session ? isAutoYes(session) : false;
@@ -303,7 +303,7 @@ function handleAutoYesWsMessage(msg) {
 function _syncCountdownReservation() {
     const bar = document.getElementById('autoyes-countdown');
     if (!bar) return;
-    const session = (_smartActionTarget || _termTarget || '').split(':')[0];
+    const session = sessionOf(_smartActionTarget || _termTarget);
     const armed = !!session && typeof isAutoYes === 'function' && isAutoYes(session);
     bar.classList.toggle('reserved', armed);
 }
@@ -608,6 +608,58 @@ const SMART_PATTERNS = [
         ]
     },
     {
+        id: 'agy-trust-menu',
+        desc: 'Antigravity: trust project folder',
+        agents: ['gemini'],
+        attentionKind: 'menu',
+        // Folder-trust dialog (selected or unselected, including 40-col wrap):
+        // attention/asking ONLY, NEVER auto-answered by Auto-Yes.
+        match: (tail) => {
+            const lines = tail.split('\n');
+            const start = Math.max(0, lines.length - Math.max(_detectionDepth, 36));
+            const bottom = lines.slice(start).join('\n');
+            if (!/Do\s+you\s+trust\s+the\s+contents\s+of\s+this\s+project\?/i.test(bottom)) return false;
+            if (!/^\s*(?:[>❯›]\s*)?Yes,\s+I\s+trust\s+this\s+folder\b/im.test(bottom)) return false;
+            if (!/Navigate\s*[·•]\s*enter\s+Confirm/i.test(bottom)) return false;
+            let footerIdx = -1;
+            for (let i = lines.length - 1; i >= start; i--) {
+                if (/Navigate\s*[·•]\s*enter\s+Confirm/i.test(lines[i])) {
+                    footerIdx = i;
+                    break;
+                }
+            }
+            return footerIdx >= 0 && !_composerBelow(lines, footerIdx, 'gemini');
+        },
+        notifyOnly: () => true,
+        actions: []
+    },
+    {
+        id: 'agy-wizard',
+        desc: 'Antigravity: Terms & Data Use',
+        agents: ['gemini'],
+        attentionKind: 'question',
+        // First-run Terms / data-sharing wizard: human-only attention, never Auto-Yes.
+        match: (tail) => {
+            const lines = tail.split('\n');
+            const start = Math.max(0, lines.length - Math.max(_detectionDepth, 36));
+            const wizardRe = /Terms\s+of\s+Service\s+&\s+Data\s+Use|collects\s+usage\s+data\s+to\s+help\s+Google\s+enhance\s+performance|help\s+improve\s+Antigravity\s+CLI\s+by\s+allowing\s+Google|Navigate\s*[·•]\s*enter\s+Toggle/i;
+            const footerRe = /Navigate\s*[·•]\s*enter\s+(?:Confirm|Select|Toggle)|enter\s+Confirm\s*[·•]\s*esc\s+Exit/i;
+            let wizardStart = -1;
+            let wizardEnd = -1;
+            for (let i = start; i < lines.length; i++) {
+                if (wizardRe.test(lines[i])) {
+                    if (wizardStart < 0) wizardStart = i;
+                    wizardEnd = i;
+                } else if (wizardStart >= 0 && footerRe.test(lines[i])) {
+                    wizardEnd = i;
+                }
+            }
+            return wizardEnd >= 0 && !_composerBelow(lines, wizardEnd, 'gemini');
+        },
+        notifyOnly: () => true,
+        actions: []
+    },
+    {
         id: 'package-confirm',
         desc: 'Package manager confirmation',
         // Package and ssh prompts are shell-layer reactions: keep them
@@ -746,6 +798,34 @@ const SMART_PATTERNS = [
             return deduped.slice(0, 5);
         }
     },
+    {
+        id: 'agy-modal',
+        desc: 'Antigravity modal',
+        agents: ['gemini'],
+        attentionKind: 'menu',
+        // Other unnumbered agy startup modals (Color Scheme, Settings Error, etc.):
+        // placed AFTER selected-yes and numbered-options so gemini numbered
+        // permission menus match numbered-options first (mirroring routes/autoyes.py).
+        match: (tail) => {
+            const lines = tail.split('\n');
+            const start = Math.max(0, lines.length - Math.max(_detectionDepth, 36));
+            const footerRe = /Navigate\s*[·•]\s*enter\s+(?:Confirm|Select|Toggle)|enter\s+Confirm\s*[·•]\s*esc\s+Exit/i;
+            let footerIdx = -1;
+            for (let i = lines.length - 1; i >= start; i--) {
+                if (footerRe.test(lines[i])) {
+                    footerIdx = i;
+                    break;
+                }
+            }
+            if (footerIdx < 0 || _composerBelow(lines, footerIdx, 'gemini')) return false;
+            for (let i = start; i < footerIdx; i++) {
+                if (/^\s*[>❯›]\s+\S/.test(lines[i])) return true;
+            }
+            return false;
+        },
+        notifyOnly: () => true,
+        actions: []
+    },
 ];
 
 function _unfreezeAndScroll() {
@@ -769,12 +849,17 @@ function _unfreezeAndScroll() {
 // `› 1. Yes, proceed` are option rows, not composers.
 const _CLAUDE_COMPOSER_RE = /^\s*❯(?:\s|$)(?!\s*(?:\d+[.)]|Yes\b))/;
 const _CODEX_COMPOSER_RE = /^\s*›\s+(?!\d+[.)])/;
+const _AGY_COMPOSER_RE = /^\s*>(?:\s|$)(?!\s*Yes,\s+I trust\b)/i;
 
 function _composerBelow(lines, below, agentKind) {
     for (let i = below + 1; i < lines.length; i++) {
         const ln = lines[i];
         if (agentKind === 'codex') {
             if (_CODEX_COMPOSER_RE.test(ln)) return true;
+        } else if (agentKind === 'gemini' && _AGY_COMPOSER_RE.test(ln)) {
+            const above = i - 1 >= 0 && _OPT_SEP_RE.test(lines[i - 1]);
+            const under = i + 1 < lines.length && _OPT_SEP_RE.test(lines[i + 1]);
+            if (above && under) return true;
         } else if (_CLAUDE_COMPOSER_RE.test(ln)) {
             const above = i - 1 >= 0 && _OPT_SEP_RE.test(lines[i - 1]);
             const under = i + 1 < lines.length && _OPT_SEP_RE.test(lines[i + 1]);
@@ -798,7 +883,7 @@ function observeAttention(content, agentKind) {
         while (below > 0 && !lines[below].trim()) below--;
     }
     if (_composerBelow(lines, below, agentKind)) return null;
-    const kind = r.id === 'numbered-options' ? (r.notifyOnly ? 'question' : 'menu') : 'answerable';
+    const kind = r.attentionKind || (r.id === 'numbered-options' ? (r.notifyOnly ? 'question' : 'menu') : 'answerable');
     return { kind, id: r.id };
 }
 
@@ -823,11 +908,12 @@ function detectSmartActions(content, target, agentKind) {
             // WAITING on the human is a property of the pattern, not of the
             // pane's current text.
             const passive = !!pattern.passive;
+            const attentionKind = pattern.attentionKind || null;
             if (pattern.getActions) {
                 const actions = pattern.getActions(tail, match);
-                if (actions) return { id: pattern.id, desc: pattern.desc, actions, notifyOnly, passive };
+                if (actions) return { id: pattern.id, desc: pattern.desc, actions, notifyOnly, passive, attentionKind };
             } else {
-                return { id: pattern.id, desc: pattern.desc, actions: pattern.actions, notifyOnly, passive };
+                return { id: pattern.id, desc: pattern.desc, actions: pattern.actions, notifyOnly, passive, attentionKind };
             }
         }
     }
@@ -865,7 +951,7 @@ function renderSmartActions(result, targetOverride) {
 
     // Show label with Auto-Yes toggle when applicable
     if (_isAutoYesCandidate(result)) {
-        const session = _smartActionTarget ? _smartActionTarget.split(':')[0] : '';
+        const session = _smartActionTarget ? sessionOf(_smartActionTarget) : '';
         const active = isAutoYes(session);
         label.innerHTML = '';
         label.appendChild(document.createTextNode(result.desc));
@@ -944,7 +1030,7 @@ function dismissSmartActions() {
     // Use the content of whichever pane the actions came from (main or split)
     let content = _termLatestContent;
     if (target && target !== _termTarget) {
-        const session = _termTarget ? _termTarget.split(':')[0] : '';
+        const session = _termTarget ? sessionOf(_termTarget) : '';
         const split = _splitPanes[session];
         if (split && split.target === target) content = split.lastContent;
     }
@@ -967,7 +1053,7 @@ async function sendSmartKeyAction(keys, withEnter) {
             await fetch('/key', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ keys: k, target: target, ...identity }),
+                body: JSON.stringify({ keys: k, ...wireRoute(target, identity) }),
             });
         }
         if (typeof SplitView !== 'undefined' && SplitView.enabled && target !== _termTarget) return;
@@ -984,7 +1070,7 @@ async function sendSmartAction(text, withEnter, pinnedTarget = null, pinnedIdent
         const resp = await fetch('/type', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ text: text, enter: !!withEnter, target: target, ...identity }),
+            body: JSON.stringify({ text: text, enter: !!withEnter, ...wireRoute(target, identity) }),
         });
         const data = await resp.json();
         if (data.ok) {
@@ -1001,7 +1087,7 @@ async function sendSmartAction(text, withEnter, pinnedTarget = null, pinnedIdent
 async function restartClaudeSession(claudeCmd) {
     const target = _smartActionTarget || _termTarget;
     if (!target) { showFlash('error', 'No session'); return; }
-    const session = target.split(':')[0];
+    const session = sessionOf(target);
 
     hideSmartActions();
     showFlash('sent', 'Restarting session\u2026');
@@ -1042,7 +1128,7 @@ async function restartClaudeSession(claudeCmd) {
         }
 
         // Update global target
-        _termTarget = launchData.target;
+        setTermTarget(launchData.target, null);  // a new pane: its key arrives with the next poll
         noteTargetChosen(_termTarget, true);
         _termExpectedIdentity = launchData.expected_target_identity || null;
         _smartActionTarget = launchData.target;

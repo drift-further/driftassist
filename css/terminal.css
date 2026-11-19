@@ -436,7 +436,8 @@ body.tabs-wrap .tabs-scroll-btn { display: none; }
 .fit-custom-input:focus { outline: none; border-color: rgba(112, 174, 249, 0.6); }
 .fit-custom-input::-webkit-outer-spin-button,
 .fit-custom-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
-.fit-apply { flex: 0 0 auto; }
+.fit-apply, .fit-auto-rows { flex: 0 0 auto; min-width: 0; }
+.fit-presets { display: contents; }
 
 /* Context Deck — the single labelled entry point for pane and workspace
    actions. It occupies the same terminal-relative slot as the retired view

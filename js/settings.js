@@ -25,9 +25,12 @@ const _SETTINGS_SECTIONS = [
             { key: 'font_size', label: 'Font Size', type: 'stepper', min: 8, max: 24, suffix: 'px' },
             { key: 'default_cols', label: 'Default Cols', type: 'number', min: 40, max: 400 },
             { key: 'default_rows', label: 'Default Rows', type: 'number', min: 10, max: 200 },
-            { key: 'capture_lines', label: 'Capture Lines', type: 'number', min: 100, max: 50000 },
+            // 0 = all: the server cap (Limits → Max Capture Lines).
+            { key: 'capture_lines', label: 'Scrollback Lines <span class="settings-restart-tag">0 = ALL</span>', type: 'number', min: 0, max: 50000, zeroLabel: 'All' },
             { key: 'tmux_history_limit', label: 'History Limit', type: 'number', min: 1000, max: 100000 },
             { key: 'idle_threshold_sec', label: 'Idle Threshold', type: 'number', min: 30, max: 3600, suffix: 's' },
+            // "Name:COLS" or "Name:COLSxROWS", comma separated (Fit menu presets).
+            { key: 'fit_presets', label: 'Fit Presets', type: 'text' },
         ]
     },
     {
@@ -299,7 +302,7 @@ function _renderStepper(sectionKey, field, current) {
 function _renderTappableValue(sectionKey, field, current, inputType) {
     const span = document.createElement('span');
     span.className = 'settings-value';
-    const displayVal = current + (field.suffix || '');
+    const displayVal = current === 0 && field.zeroLabel ? field.zeroLabel : current + (field.suffix || '');
     span.textContent = displayVal;
     span.onclick = () => _startInlineEdit(span, sectionKey, field, current, inputType);
     return span;
@@ -399,6 +402,11 @@ async function _saveSetting(sectionKey, fieldKey, value) {
                 _termFontSize = value;
                 document.getElementById('term-content').style.fontSize = value + 'px';
                 try { localStorage.setItem('assist_font_size', value); } catch(e) {}
+            }
+            // Scrollback applies to the tab in view now, not just the next one.
+            if (sectionKey === 'terminal' && fieldKey === 'capture_lines' && _termTarget) {
+                _termLines = defaultTermLines();
+                if (_termWs && _termWsConnected) _termWs.send(_tuiSubscribeFrame(_termTarget, _termLines));
             }
             showFlash('ok', fieldKey.replace(/_/g, ' ') + ' updated');
         } else {

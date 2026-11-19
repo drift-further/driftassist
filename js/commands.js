@@ -22,7 +22,7 @@ async function loadSkills() {
         renderSkills();
         return;
     }
-    const session = _termTarget.split(':')[0];
+    const session = sessionOf(_termTarget);
     // Only re-fetch if project changed
     if (session === _currentSkillsProject && _currentSkills.length > 0) {
         renderSkills();
@@ -115,7 +115,7 @@ async function loadCommands() {
         renderCmdPanel();
         return;
     }
-    const session = _termTarget.split(':')[0];
+    const session = sessionOf(_termTarget);
     // Only re-fetch if project changed
     if (session === _currentCommandsProject && _currentCommands.length > 0) {
         renderCmdPanel();
@@ -176,7 +176,7 @@ async function runSavedCommand(index) {
     const cmd = _currentCommands[index];
     if (!cmd || !_termTarget) return;
 
-    const session = _termTarget.split(':')[0];
+    const session = sessionOf(_termTarget);
 
     // Close command panel
     _cmdPanelOpen = false;
@@ -242,7 +242,7 @@ function closeCmdOutput() {
     updateTmuxIndicator();
 
     if (!_termTarget) return;
-    const session = _termTarget.split(':')[0];
+    const session = sessionOf(_termTarget);
     const state = _splitPanes[session];
 
     _cmdOutputOpen = false;
@@ -288,7 +288,7 @@ function connectSplitWs(session) {
             if (data.type !== 'full' && data.type !== 'capture') return;
             state.lastContent = data.content || '';
             state.agentKind = (data.info && data.info.agent_kind) || 'unknown';
-            const currentSession = _termTarget ? _termTarget.split(':')[0] : '';
+            const currentSession = _termTarget ? sessionOf(_termTarget) : '';
             if (_cmdOutputOpen && currentSession === session) {
                 const pre = document.getElementById('cmd-output-pre');
                 const container = document.getElementById('cmd-output-content');
@@ -309,7 +309,7 @@ function connectSplitWs(session) {
         state.wsConnected = false;
         state.ws = null;
         // Mark dot as stopped (pane may have exited)
-        const currentSession = _termTarget ? _termTarget.split(':')[0] : '';
+        const currentSession = _termTarget ? sessionOf(_termTarget) : '';
         if (_cmdOutputOpen && currentSession === session) {
             document.getElementById('cmd-output-dot').classList.add('stopped');
         }
@@ -336,7 +336,7 @@ function disconnectSplitWs(session) {
 
 function toggleInputTarget() {
     if (!_termTarget) return;
-    const session = _termTarget.split(':')[0];
+    const session = sessionOf(_termTarget);
     const state = _splitPanes[session];
     if (!state) return;
 
@@ -430,7 +430,7 @@ async function checkSplitPaneAlive(session) {
             // Pane died — clean up
             disconnectSplitWs(session);
             delete _splitPanes[session];
-            const currentSession = _termTarget ? _termTarget.split(':')[0] : '';
+            const currentSession = _termTarget ? sessionOf(_termTarget) : '';
             if (_cmdOutputOpen && currentSession === session) {
                 // Mark as stopped but keep output visible so user can read it
                 document.getElementById('cmd-output-dot').classList.add('stopped');

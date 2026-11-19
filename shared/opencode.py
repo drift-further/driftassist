@@ -17,7 +17,12 @@ from urllib.parse import urlsplit
 
 import shared.state as state
 from shared.agent_identity import _scan_process_tree
-from shared.tmux import tmux_exact_target
+from shared.tmux import (
+    bind_pane_key_status,
+    pane_key_binding_current,
+    parse_pane_key,
+    tmux_exact_target,
+)
 
 SESSION_ID = re.compile(r"ses_[A-Za-z0-9_-]{1,120}\Z")
 TARGET = re.compile(r"[^:\x00-\x20]{1,200}:\d+\.\d+\Z")
@@ -39,17 +44,45 @@ class OpenCodeError(Exception):
 
 
 def pane_context(target):
-    """Exact local process identity, including an agent restarted in the same shell."""
-    if not isinstance(target, str) or not TARGET.fullmatch(target):
+    """Exact local process identity, including an agent restarted in the same shell.
+
+    `target` is `session:w.p` or a durable pane key (shared/tmux.py:PaneRef.key).
+    A key is bound to its pane and tmux server (bind_pane_key) and the pane is
+    read by its own `%N`, never re-selected by the display address it sat at
+    (sign-off M3 F4): a key naming no live pane, another server generation, or
+    a pane replaced or a server restarted while the context is read, is
+    pane_gone. The returned `target` is what was asked for (the key), so the
+    route's final revalidation binds it again.
+    """
+    binding = None
+    if isinstance(target, str) and parse_pane_key(target):
+        binding, status = bind_pane_key_status(target)
+        if binding is None:
+            if status == "unknown":
+                raise OpenCodeError("pane_unavailable", "Could not verify this OpenCode pane. Use Terminal.")
+            raise OpenCodeError("pane_gone", "This pane is no longer available.", 409)
+        requested = binding.key
+    elif not isinstance(target, str) or not TARGET.fullmatch(target):
         raise OpenCodeError("invalid_target", "Choose an OpenCode pane.", 400)
+    else:
+        requested = target
     try:
+        fmt = "#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}"
+        if binding is not None:
+            command = ["tmux", "display-message", "-p", "-t", binding.pane_id, fmt]
+        else:
+            command = ["tmux", "display-message", "-p", "-t", tmux_exact_target(target), fmt]
         proc = subprocess.run(
-            ["tmux", "display-message", "-p", "-t", tmux_exact_target(target),
-             "#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3,
+            command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3,
         )
         fields = proc.stdout.strip().split("\t")
         if proc.returncode or len(fields) != 4 or not fields[0].startswith("%"):
+            raise OpenCodeError("pane_gone", "This pane is no longer available.", 409)
+        # display-message can answer for another pane when `-t %N` is gone, and
+        # a restarted server can have its own `%N`: the bound pane on the bound
+        # server, or nothing.
+        if binding is not None and (fields[0] != binding.pane_id
+                                    or not pane_key_binding_current(binding)):
             raise OpenCodeError("pane_gone", "This pane is no longer available.", 409)
         pane_id, pid, _command, directory = fields
         scan = _scan_process_tree(target, int(pid))
@@ -78,8 +111,13 @@ def pane_context(target):
             raise OpenCodeError("directory_gone", "The pane's folder is no longer available.", 409)
         identity = [pane_id, pid, scan.get("root_start_time"), agent_pid,
                     scan["agent_start_time"], directory]
+        if binding is not None:
+            # Read after the process facts: the server still owns the socket.
+            if not pane_key_binding_current(binding):
+                raise OpenCodeError("pane_gone", "This pane is no longer available.", 409)
+            identity.append(binding.generation)
         generation = hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:32]
-        return {"target": target, "generation": generation, "directory": directory}
+        return {"target": requested, "generation": generation, "directory": directory}
     except OpenCodeError:
         raise
     except (OSError, ValueError, subprocess.SubprocessError):

@@ -94,7 +94,8 @@ console.log(JSON.stringify({before, after}));
         self.assertIn("_applySessionsData(data.sessions || [], data.active_target || '', requestedAt)", terminal)
         for name, src in (("app.js", app),):
             self.assertIn("targetMissingIsStale(current, requestedAt", src, name)
-            self.assertIn("noteTargetListed(current)", src, name)
+            # The listed pane may have moved under its key (js/pane-ref.js).
+            self.assertIn("noteTargetListed(_termTarget)", src, name)
         self.assertEqual(terminal.count("noteTargetChosen(_termTarget, true)"), 2)
         self.assertIn("noteTargetChosen(_termTarget, true)", actions)
         self.assertIn("noteTargetChosen(target, false)", terminal)
@@ -126,6 +127,8 @@ globalThis.document = {
     activeElement: null,
 };
 globalThis._termTarget = 's:0.0';
+globalThis._termKey = null;
+globalThis._sessionPanes = [];
 globalThis._attachments = [];
 globalThis.renderAttachments = noop;
 globalThis.flashes = [];
@@ -157,14 +160,14 @@ await tick(); await tick();
 
 class DraftStalePollTests(unittest.TestCase):
     def test_poll_snapshot_older_than_our_save_keeps_the_composer(self):
-        result = run_js(["js/drafts.js"], TYPE_AND_SAVE + r"""
+        result = run_js(["js/pane-ref.js", "js/drafts.js"], TYPE_AND_SAVE + r"""
 _applyDraftsData({marks: [], rev: {}, at: 150});    // built before the PUT landed
 console.log(JSON.stringify({text: input.value}));
 """, DRAFTS_PRELUDE)
         self.assertEqual(result["text"], "half a thought")
 
     def test_newer_snapshot_without_the_row_still_clears(self):
-        result = run_js(["js/drafts.js"], TYPE_AND_SAVE + r"""
+        result = run_js(["js/pane-ref.js", "js/drafts.js"], TYPE_AND_SAVE + r"""
 _applyDraftsData({marks: [], rev: {}, at: 250});    // sent from another device
 console.log(JSON.stringify({text: input.value}));
 """, DRAFTS_PRELUDE)
@@ -174,7 +177,7 @@ console.log(JSON.stringify({text: input.value}));
         from shared import drafts
 
         with patch.object(drafts.time, "time", return_value=1234.5):
-            block = drafts.poll_block()
+            block = drafts.poll_block([])  # /poll passes its own pane listing
         self.assertEqual(block["at"], 1234.5)
         self.assertIn("rev", block)
         self.assertIn("marks", block)

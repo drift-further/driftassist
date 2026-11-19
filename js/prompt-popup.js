@@ -86,7 +86,7 @@ function _promotePromptPopups() {
 function _promptPopupWhere(target, session) {
     const pane = (_sessionPanes || []).find(p => p.target === target);
     const agent = pane ? agentDisplayName(pane) : null;
-    return agent || shortName(session || target.split(':')[0]);
+    return agent || shortName(session || sessionOf(target));
 }
 
 // spec: {title, detail, detailTitle, note, sticky, button: {label, color, run}}

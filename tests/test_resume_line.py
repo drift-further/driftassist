@@ -219,7 +219,7 @@ class ResumeCliTests(unittest.TestCase):
     def test_json_merge_columns_and_explicit_resume(self):
         from cli import session
         pane=dict(session='s',target='s:0.0',state='idle',agent_kind='codex',idle_seconds=2,command_display='Codex',cwd='/tmp',delegate={'state':'waiting','reason':'question'})
-        self.assertEqual(session._display_rows([pane],False)[0], ['s','idle','codex','2s','Codex','waiting:question'])
+        self.assertEqual(session._display_rows([pane],False)[0], ['s','idle','codex','-','-','-','-','2s','Codex','waiting:question'])
         self.assertEqual(session._display_rows([pane],True)[0][-2:], ['/tmp','waiting:question'])
         r=dict(line='restore',command='codex resume id')
         with patch.object(session.http,'get',return_value={'resume':r}), redirect_stdout(io.StringIO()) as out:
@@ -306,10 +306,10 @@ class ResumeHttpTests(_RouteHarness):
         result = self.cli('ls')
         import re
         first=next(line for line in result.stdout.splitlines() if not line.startswith('next:'))
-        self.assertEqual(len(re.split(r' {2,}',first)),6,first)
+        self.assertEqual(len(re.split(r' {2,}',first)),10,first)
         result=self.cli('ls','--cwd')
         first=next(line for line in result.stdout.splitlines() if not line.startswith('next:'))
-        self.assertEqual(len(re.split(r' {2,}',first)),7,first)
+        self.assertEqual(len(re.split(r' {2,}',first)),11,first)
 
     def test_verified_fresh_kill_sees_new_id_on_real_fd(self):
         import sys

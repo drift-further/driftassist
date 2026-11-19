@@ -73,6 +73,8 @@ assert.ok(nav.every(u=>u.children.length===0));
         from tests.test_prompt_popup import run_popup_js
         result = run_popup_js(r"""
 vm.runInThisContext(fs.readFileSync('js/target-hold.js','utf8'));
+globalThis._termKey=null; globalThis._sessionPanes=[]; globalThis.sessionOf=t=>t.split(':')[0];
+vm.runInThisContext(fs.readFileSync('js/pane-ref.js','utf8'));
 const app=fs.readFileSync('js/app.js','utf8');
 vm.runInThisContext(app.slice(app.indexOf('function _applySessionsData('),app.indexOf('function _formatIdleTime(')));
 globalThis._termTarget='del_child:0.1'; globalThis._termShowProjects=false;

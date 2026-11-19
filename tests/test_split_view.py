@@ -63,8 +63,8 @@ const fs=require('fs'),vm=require('vm'),assert=require('assert/strict');
 let reply;
 const context={_draftSaveTimer:null,_draftDirtyFor:null,_draftCache:{a:{text:'old'}},_draftSeq:{a:1},
  _draftRev:{},_draftMarks:new Set(),_draftTarget:()=> 'b',_renderDraftMarks(){},clearTimeout(){},
- fetch:()=>new Promise(resolve=>reply=resolve)};
-vm.createContext(context);
+ fetch:()=>new Promise(resolve=>reply=resolve),wireTarget:t=>({target:t})};
+Object.assign(context,{defaultTermLines:()=>2000,maxTermLines:()=>20000});vm.createContext(context);
 const source=fs.readFileSync('js/drafts.js','utf8');
 vm.runInContext(source.slice(source.indexOf('async function flushDraft('),source.indexOf('// `force` says')),context);
 const pending=context.flushDraft('a');
@@ -87,7 +87,7 @@ const context={console,innerWidth:1280,Date,Map,JSON,Math,WebSocket:WS,location:
  setTimeout:()=>1,clearTimeout(){},setInterval:()=>1,clearInterval(){},requestAnimationFrame:fn=>fn(),
  _tuiOverride:{},_termFontSize:12,_paneInfo:{},_paneTui:{},_isTuiInfo:()=>false,ansiToHtml:text=>'escaped:'+text,
  _tuiSubscribeFrame:(target,lines)=>JSON.stringify({target,lines}),syncAutoYesState:async()=>{},_termWsConnected:true};
-vm.createContext(context);vm.runInContext(fs.readFileSync('js/split-view.js','utf8').split('SplitView.init();')[0]+'\nglobalThis.view=SplitView; globalThis.Controller=PaneView;',context);
+Object.assign(context,{defaultTermLines:()=>2000,maxTermLines:()=>20000});vm.createContext(context);vm.runInContext(fs.readFileSync('js/split-view.js','utf8').split('SplitView.init();')[0]+'\nglobalThis.view=SplitView; globalThis.Controller=PaneView;',context);
 context.view.renderCountdowns=()=>{};
 const pane=new context.Controller(element);
 pane.watch({target:'a:0.0',pane_id:'%1',identity:{pane_pid:1}});const old=sockets[0];old.onopen();
@@ -110,7 +110,7 @@ const context={console,innerWidth:1280,Date,Map,JSON,Math,setTimeout,clearTimeou
  document:{hidden:false},window:{},_termTarget:'left:0.0',_attachments:[],_sessionPrompts:{},
  localStorage:{setItem(){},getItem(){return null}},showFlash(){},isAutoYes(){return false},
  fetch:async(url,opts)=>{context.requests.push({url,body:JSON.parse(opts.body)});return {ok:true,json:async()=>({ok:true,cancelled:true})}},requests:[]};
-vm.createContext(context);
+Object.assign(context,{defaultTermLines:()=>2000,maxTermLines:()=>20000});vm.createContext(context);
 const source=fs.readFileSync('js/split-view.js','utf8').split('SplitView.init();')[0];
 vm.runInContext(source+'\nglobalThis.view=SplitView; globalThis.PaneView=PaneView;',context);
 const view=context.view;
@@ -145,7 +145,7 @@ const context={console,innerWidth:1280,Date,Map,JSON,Math,String,setTimeout,clea
  document:{hidden:false},window:{},_termTarget:'left:0.0',_attachments:[],_sessionPrompts:{},_draftCache:{},
  localStorage:{setItem(){},getItem(){return null}},showFlash(){},authLost(){return false},captures:0,captureTerminal(){context.captures++},
  fetch:async url=>{const id=decodeURIComponent(url.split('target=')[1]);return {json:async()=>({ok:true,identity:context.ids[id]})}},ids};
-vm.createContext(context);
+Object.assign(context,{defaultTermLines:()=>2000,maxTermLines:()=>20000});vm.createContext(context);
 const source=fs.readFileSync('js/split-view.js','utf8').split('SplitView.init();')[0];
 vm.runInContext(source+'\nglobalThis.view=SplitView;',context);
 const view=context.view, watched=[];
@@ -191,7 +191,7 @@ const fs=require('fs'),vm=require('vm'),assert=require('assert/strict');
 const panes=[{target:'left:0.0',pane_id:'%1',pane_pid:'1',created:5},{target:'right:1.1',pane_id:'%2',pane_pid:'2',created:5}];
 const context={console,Date,Map,JSON,Math,String,document:{hidden:false},window:{},_termTarget:'left:0.0',_sessionPanes:panes,
  flashes:[],showFlash(k,m){context.flashes.push(m)}};
-vm.createContext(context);
+Object.assign(context,{defaultTermLines:()=>2000,maxTermLines:()=>20000});vm.createContext(context);
 const source=fs.readFileSync('js/split-view.js','utf8').split('SplitView.init();')[0];
 vm.runInContext(source+'\nglobalThis.view=SplitView;',context);
 const view=context.view, chosen=[];

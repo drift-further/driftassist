@@ -69,6 +69,11 @@ globalThis.fetch = async (url, options) => {
     return {json: async () => ({ok: true})};
 };
 
+// The selection and the wire mapping (621 Phase 7 step B); no pane is listed
+// with a key here, so a send goes out by display target, as an older server needs.
+globalThis._termKey = null;
+globalThis._sessionPanes = [];
+vm.runInThisContext(fs.readFileSync('js/pane-ref.js', 'utf8'), {filename: 'js/pane-ref.js'});
 vm.runInThisContext(fs.readFileSync('js/vault.js', 'utf8'), {filename: 'js/vault.js'});
 
 globalThis.vaultMap = {sudo: 'test-secret'};
@@ -365,7 +370,8 @@ console.log(JSON.stringify({reads, first, second}));
         self.assertIn("btn.textContent = '$' + handle", render)
         self.assertIn("getInputTarget() !== _termTarget", send)
         self.assertNotIn("_isPasswordPrompt", send)
-        self.assertIn("target: _termTarget", send)
+        # The tab on screen, by durable key when it has one (js/pane-ref.js).
+        self.assertIn("...wireRoute(_termTarget,", send)
         self.assertIn("fetch('/type'", send)
         self.assertIn("text: value", send)
         self.assertIn("expand: false", send)
